@@ -41,11 +41,11 @@ from pymor.tools import mpi
 from exadg.mor.pymor_binding import mpi_stationary_model
 
 INPUT_FILE = "applications/poisson/thermal_block/input.json"
-N_TRAIN, N_TEST, N_MODES = 20, 5, 8
+N_TRAIN, N_TEST, N_MODES = 100, 5, 8
 
 
 def main():
-    model, space = mpi_stationary_model(INPUT_FILE, degree=2, refinements=4, dim=2)
+    model, space = mpi_stationary_model(INPUT_FILE, degree=2, refinements=4, dim=3)
     n_parameters = model.operator.parameters["mu"]
 
     print(f"ranks              : {mpi.size}")

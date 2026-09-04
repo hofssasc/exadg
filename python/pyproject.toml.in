@@ -11,11 +11,12 @@ description = "Python bindings for ExaDG"
 requires-python = ">=3.9"
 dependencies = ["numpy"]
 
-# The online reduced model reads its operators from HDF5; the offline stage additionally needs
-# pyMOR. Kept optional so that installing the bindings does not drag in a reduction framework.
+# pyMOR is optional so that installing the bindings does not drag in a reduction framework:
+# `exadg.thermal_block` is usable on its own as a full-order model. mpi4py is needed only to run
+# the reduction on more than one rank, and must be built against the same MPI as ExaDG.
 [project.optional-dependencies]
-mor = ["h5py"]
-offline = ["h5py", "pymor>=2024.1"]
+mor = ["pymor>=2025.1"]
+mpi = ["pymor>=2025.1", "mpi4py"]
 
 [tool.setuptools]
 # The extension modules are produced by CMake and already staged in this directory, so
