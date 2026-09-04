@@ -97,6 +97,27 @@ public:
   // interior penalty parameter scaling factor: default value is 1.0
   double IP_factor;
 
+  // Solve -div(a(x) grad(u)) = f with a spatially varying coefficient a(x) instead of the plain
+  // Laplacian. The coefficient is prescribed via Operator::set_coefficient() and may be changed
+  // between solves, which is what a parameter sweep over a piecewise constant coefficient needs.
+  // Currently restricted to continuous elements (CG).
+  bool coefficient_is_variable;
+
+  // Polynomial degree of the finite element space the variable coefficient lives in.
+  //
+  //   0  one value per cell, i.e. a piecewise constant field
+  //   1  a continuous, piecewise multilinear field
+  //
+  // Higher degrees are implemented but rejected by check(), for two independent reasons that are
+  // properties of the Lagrange basis rather than of this code; see there.
+  //
+  // The coefficient gets its own DoFHandler, so its degree is independent of the solution's.
+  unsigned int coefficient_degree;
+
+  // Constant coefficient a, used if coefficient_is_variable == false. The default value of 1.0
+  // recovers the plain Laplacian.
+  double coefficient;
+
   // Use a matrix-based implementation of linear(ized) operators. Note that this parameter only
   // decides about the implementation of the operator in the Krylov solver. This parameter does not
   // affect matrix-based vs. matrix-free implementations within multigrid.

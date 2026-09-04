@@ -8,7 +8,7 @@
 #
 #  ExaDG - High-Order Discontinuous Galerkin for the Exa-Scale
 #
-#  Copyright (C) 2021 by the ExaDG authors
+#  Copyright (C) 2025 by the ExaDG authors
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -25,11 +25,5 @@
 #
 #########################################################################
 
-INCLUDE(macro_print_exadg_header.cmake)
-INCLUDE(macro_target_link_fftw.cmake)
-INCLUDE(macro_exadg_pickup_exe.cmake)
-INCLUDE(macro_exadg_pickup_tests.cmake)
-INCLUDE(macro_subdir_list.cmake)
-INCLUDE(macro_targetname.cmake)
-INCLUDE(macro_dirname.cmake)
-INCLUDE(macro_exadg_add_python_module.cmake)
+SET(TEST_LIBRARIES exadg)
+EXADG_PICKUP_TESTS()

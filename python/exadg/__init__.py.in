@@ -1,0 +1,10 @@
+"""Python bindings for ExaDG.
+
+The extension modules in this package are built by CMake and staged here; the package is then
+installed with pip. Which modules are present depends on which ExaDG applications were built
+with Python bindings enabled (``-D EXADG_WITH_PYTHON=ON``).
+
+Built from ExaDG @EXADG_PYTHON_VERSION@.
+"""
+
+__version__ = "@EXADG_PYTHON_VERSION@"

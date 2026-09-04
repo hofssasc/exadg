@@ -23,10 +23,12 @@
 #define EXADG_POISSON_SPATIAL_DISCRETIZATION_LAPLACE_OPERATOR_H_
 
 // ExaDG
+#include <exadg/functions_and_boundary_conditions/evaluate_functions.h>
 #include <exadg/grid/grid_data.h>
 #include <exadg/operators/interior_penalty_parameter.h>
 #include <exadg/operators/operator_base.h>
 #include <exadg/operators/operator_type.h>
+#include <exadg/operators/variable_coefficients.h>
 #include <exadg/poisson/user_interface/boundary_descriptor.h>
 
 namespace ExaDG
@@ -37,11 +39,27 @@ namespace Operators
 {
 struct LaplaceKernelData
 {
-  LaplaceKernelData() : IP_factor(1.0)
+  LaplaceKernelData() : IP_factor(1.0), coefficient_is_variable(false), coefficient(1.0)
   {
   }
 
   double IP_factor;
+
+  /**
+   * If true, the operator realizes -div(a(x) grad(u)) with a spatially varying coefficient
+   * a(x) stored at the quadrature points. If false, the constant @p coefficient is used, and
+   * the default value of 1.0 recovers the plain Laplacian.
+   *
+   * Currently only supported for continuous elements (CG). For DG the coefficient would in
+   * addition have to enter the gradient and value fluxes and scale the interior penalty
+   * parameter, which is not implemented yet.
+   */
+  bool coefficient_is_variable;
+
+  /**
+   * Constant coefficient, used when @p coefficient_is_variable is false.
+   */
+  double coefficient;
 };
 
 template<int dim, typename Number, int n_components = 1>
@@ -62,7 +80,8 @@ public:
   void
   reinit(dealii::MatrixFree<dim, Number> const & matrix_free,
          LaplaceKernelData const &               data_in,
-         unsigned int const                      dof_index)
+         unsigned int const                      dof_index,
+         unsigned int const                      quad_index)
   {
     data = data_in;
 
@@ -70,6 +89,43 @@ public:
     degree                                = fe.degree;
 
     calculate_penalty_parameter(matrix_free, dof_index);
+
+    if(data.coefficient_is_variable)
+    {
+      // face data is not needed as long as only continuous elements are supported
+      coefficients.initialize(matrix_free,
+                              quad_index,
+                              false /* store_face_data */,
+                              false /* store_cell_based_face_data */);
+      coefficients.set_coefficients(dealii::make_vectorized_array<Number>(data.coefficient));
+    }
+  }
+
+  /**
+   * Returns the coefficient in quadrature point @p q of cell batch @p cell. Falls back to the
+   * constant coefficient if no variable coefficient is in use, so callers do not have to
+   * branch.
+   */
+  inline DEAL_II_ALWAYS_INLINE //
+    scalar
+    get_coefficient_cell(unsigned int const cell, unsigned int const q) const
+  {
+    if(data.coefficient_is_variable)
+      return coefficients.get_coefficient_cell(cell, q);
+
+    return dealii::make_vectorized_array<Number>(data.coefficient);
+  }
+
+  void
+  set_coefficient_cell(unsigned int const cell, unsigned int const q, scalar const & coefficient)
+  {
+    coefficients.set_coefficient_cell(cell, q, coefficient);
+  }
+
+  bool
+  coefficient_is_variable() const
+  {
+    return data.coefficient_is_variable;
   }
 
   void
@@ -104,11 +160,17 @@ public:
 
   static MappingFlags
   get_mapping_flags(bool const compute_interior_face_integrals,
-                    bool const compute_boundary_face_integrals)
+                    bool const compute_boundary_face_integrals,
+                    bool const coefficient_is_variable = false)
   {
     MappingFlags flags;
 
     flags.cells = dealii::update_gradients | dealii::update_JxW_values;
+
+    // set_coefficient() evaluates the coefficient function in the quadrature points, so their
+    // real-space locations have to be available
+    if(coefficient_is_variable)
+      flags.cells |= dealii::update_quadrature_points;
 
     if(compute_interior_face_integrals)
     {
@@ -204,6 +266,9 @@ private:
   dealii::AlignedVector<scalar> array_penalty_parameter;
 
   mutable scalar tau;
+
+  // only allocated if data.coefficient_is_variable
+  VariableCoefficients<scalar> coefficients;
 };
 
 } // namespace Operators
@@ -265,6 +330,92 @@ public:
 
   void
   update_penalty_parameter();
+
+  /**
+   * Fills the variable coefficient a(x) by evaluating @p function in every quadrature point.
+   *
+   * Requires LaplaceKernelData::coefficient_is_variable to be set. The matrix representation
+   * is re-assembled afterwards if the operator is matrix-based, so callers may set a new
+   * coefficient and immediately apply the operator.
+   *
+   * This is the entry point used to realize an affine decomposition: evaluating the operator
+   * once per indicator function of a subdomain yields the affine components A_p of
+   * A(mu) = sum_p exp(mu_p) A_p.
+   */
+  void
+  set_coefficient(dealii::Function<dim> const & function);
+
+  /**
+   * Fills the variable coefficient from one value per active cell.
+   *
+   * The values are indexed by dealii::CellAccessor::active_cell_index(), which is the ordering
+   * a cell-wise field naturally has and which is independent of any geometric structure. That
+   * matters once the mesh is unstructured: a coefficient described by a Function has to be
+   * evaluated at quadrature points and so needs a rule mapping position to value, whereas a
+   * genuinely piecewise constant field on the cells has no such rule and should not be forced
+   * to invent one.
+   *
+   * The coefficient is constant within each cell, so every quadrature point of a cell receives
+   * the same value; no quadrature error is introduced by the coefficient itself.
+   */
+  void
+  set_coefficient_from_cell_values(std::vector<Number> const & cell_values);
+
+  /**
+   * Fills the variable coefficient by evaluating a finite element field at the quadrature points.
+   *
+   * The general form. The coefficient is expanded as ``a = sum_i c_i phi_i`` in a space of its
+   * own, and @p coefficient_values holds the ``c_i``; @p coefficient_dof_index says which of the
+   * matrix-free object's DoFHandlers that space is.
+   *
+   * Written for any degree. The evaluation reads the coefficient at *this operator's* quadrature
+   * points, not the coefficient space's, which is the thing to be careful about: using the wrong
+   * quadrature index gives a smooth, plausible and wrong operator. The two spaces need not share
+   * a degree, and the coefficient's is free to be lower -- which is the usual case, since the
+   * parameter dimension should not be dictated by the solution's resolution.
+   *
+   * The affine decomposition survives at any degree: quadrature is linear in the coefficient, so
+   * ``A(c) = sum_i c_i A[phi_i]`` holds identically at the discrete level whatever rule is used.
+   * Under-integrating changes which continuous operator is being discretised; it does not break
+   * the expansion the reduced model is built on.
+   */
+  void
+  set_coefficient_from_dof_vector(VectorType const & coefficient_values,
+                                  unsigned int const coefficient_dof_index,
+                                  bool const         check_positivity = true);
+
+  /**
+   * Assembles ``g_i = p^T A_i u`` for *every* coefficient degree of freedom in one cell loop.
+   *
+   * The other half of an adjoint. With the coefficient expanded as ``a = sum_i c_i phi_i`` the
+   * operator is affine, ``A(c) = sum_i c_i A_i``, and differentiating ``A(c) u = f`` gives
+   *
+   *     d(p . B u)/dc_i = -p^T A_i u,        A^T p = B^T (dJ/dy).
+   *
+   * Because ``A_i`` is the operator with a *single basis function* as its coefficient,
+   *
+   *     p^T A_i u = integral( phi_i grad(u) . grad(p) ),
+   *
+   * which is a load vector in the coefficient space with the integrand grad(u).grad(p). So the
+   * whole gradient -- all P entries -- is one matrix-free cell loop, not P operator applies.
+   * That is what makes the adjoint route cost ``d`` solves rather than ``d + P`` anything, and
+   * it is the same structure for any affinely parameterised coefficient.
+   *
+   * @p u and @p p are read with the operator's own constraints, exactly as vmult() reads its
+   * argument, so the result is ``p^T A_i u`` for the operator as implemented rather than for an
+   * idealisation of it. With inhomogeneous Dirichlet data the lifting term is *not* included
+   * here -- the constrained read zeroes it -- and has to be added by the caller.
+   *
+   * @param u Solution of the forward problem.
+   * @param p Solution of the adjoint problem, zero on constrained degrees of freedom.
+   * @param coefficient_dof_index The coefficient space, as in set_coefficient_from_dof_vector().
+   * @param dst Overwritten with the sensitivities, one per coefficient degree of freedom.
+   */
+  void
+  compute_coefficient_sensitivity(VectorType const & u,
+                                  VectorType const & p,
+                                  unsigned int const coefficient_dof_index,
+                                  VectorType &       dst) const;
 
   // continuous FE: This function sets the inhomogeneous Dirichlet boundary values for Dirichlet
   // degrees of freedom and optionally enforces hanging node and periodicity constraints.

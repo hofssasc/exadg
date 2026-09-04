@@ -40,6 +40,9 @@ Parameters::Parameters()
     spatial_discretization(SpatialDiscretization::Undefined),
     degree(1),
     IP_factor(1.0),
+    coefficient_is_variable(false),
+    coefficient_degree(0),
+    coefficient(1.0),
     use_matrix_based_operator(false),
     sparse_matrix_type(SparseMatrixType::Undefined),
 
@@ -69,6 +72,60 @@ Parameters::check() const
   {
     AssertThrow(sparse_matrix_type != SparseMatrixType::Undefined,
                 dealii::ExcMessage("Parameter must be defined."));
+  }
+
+  if(coefficient_is_variable)
+  {
+    AssertThrow(spatial_discretization == SpatialDiscretization::CG,
+                dealii::ExcMessage(
+                  "A variable coefficient is currently only supported for continuous elements "
+                  "(SpatialDiscretization::CG)."));
+
+    // The multigrid level operators are built from the same LaplaceOperatorData, so each level
+    // allocates its own coefficient table but nothing transfers the fine-level coefficient to
+    // the coarser levels. The solution would still be correct -- a preconditioner built for the
+    // plain Laplacian is a valid preconditioner -- but the iteration count degrades badly for
+    // high coefficient contrast, and silently so. Reject it until coarse-level coefficient
+    // transfer is implemented.
+    AssertThrow(preconditioner != Preconditioner::Multigrid,
+                dealii::ExcMessage(
+                  "Geometric multigrid is not yet coefficient-aware: the coarse-level operators "
+                  "would be built for the plain Laplacian. Use Preconditioner::AMG or "
+                  "Preconditioner::PointJacobi with a variable coefficient."));
+
+    // The coefficient machinery is written for an arbitrary degree; only this check stands in
+    // the way, and it stands there for two independent reasons.
+    //
+    // POSITIVITY. The coefficient is expanded as a = sum_i c_i phi_i with c_i > 0, so a is
+    // positive wherever the basis is non-negative. Lagrange bases are non-negative only up to
+    // degree 1: on the reference cell the minimum basis value is -0.125 at degree 2 and -0.316
+    // at degree 3. A coefficient that dips negative between nodes destroys coercivity, and it
+    // does so invisibly, because every *coefficient* c_i is still positive -- it is the field
+    // that is not. A basis that is non-negative at every degree (Bernstein, for instance) would
+    // lift this, at the price of the coefficient degrees of freedom no longer being point
+    // values of the field.
+    //
+    // QUADRATURE. The integrand a grad(u).grad(v) has per-variable degree 2*degree +
+    // coefficient_degree, while the rule built in Operator::fill_matrix_free_data has degree +
+    // 1 points and is exact to 2*degree + 1. So it is exact exactly while coefficient_degree
+    // <= 1, and under-integrates by a few percent from degree 2 -- measured at 2-4% for
+    // coefficient_degree 2 and 4-7% for 3, independently of the solution degree. Lifting this
+    // needs n = degree + 1 + ceil(coefficient_degree / 2) points, i.e. a second quadrature
+    // index for the operator.
+    AssertThrow(coefficient_degree <= 1,
+                dealii::ExcMessage(
+                  "A variable coefficient of degree " + std::to_string(coefficient_degree) +
+                  " is not admissible. Lagrange bases take negative values from degree 2, so "
+                  "the coefficient could become negative between nodes and the operator would "
+                  "lose coercivity; and the quadrature rule in use is exact only up to "
+                  "coefficient degree 1. See the comment at this assertion for what lifting "
+                  "either restriction would take."));
+  }
+  else
+  {
+    AssertThrow(coefficient > 0.0,
+                dealii::ExcMessage("The coefficient must be positive for the operator to be "
+                                   "coercive."));
   }
 
   // SOLVER
@@ -131,6 +188,16 @@ Parameters::print_parameters_spatial_discretization(dealii::ConditionalOStream c
 
   if(spatial_discretization == SpatialDiscretization::DG)
     print_parameter(pcout, "IP factor", IP_factor);
+
+  // Only report the coefficient if it deviates from the plain Laplacian, so that the output of
+  // existing applications is unchanged.
+  if(coefficient_is_variable)
+  {
+    print_parameter(pcout, "Variable coefficient", coefficient_is_variable);
+    print_parameter(pcout, "Coefficient degree", coefficient_degree);
+  }
+  else if(coefficient != 1.0)
+    print_parameter(pcout, "Coefficient", coefficient);
 
   print_parameter(pcout, "Use matrix-based operator", use_matrix_based_operator);
 

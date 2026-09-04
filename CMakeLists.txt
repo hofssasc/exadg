@@ -251,6 +251,8 @@ ENDIF()
 
 # preCICE
 OPTION(EXADG_WITH_PRECICE "Use preCICE" OFF})
+
+OPTION(EXADG_WITH_PYTHON "Build Python bindings (requires pybind11)." OFF)
 IF(${EXADG_WITH_PRECICE})
     # the environment variable precice_DIR is searched by default
     FIND_PACKAGE(precice 2.0
@@ -284,6 +286,14 @@ DEAL_II_INITIALIZE_CACHED_VARIABLES()
 DEAL_II_SETUP_TARGET(exadg)
 
 ENABLE_TESTING()
+
+IF (EXADG_WITH_PYTHON)
+  # find_package() must run here rather than inside python/: imported targets created in a
+  # subdirectory are scoped to that subtree, so pybind11::module would not be visible to the
+  # applications that build extension modules.
+  FIND_PACKAGE(pybind11 CONFIG REQUIRED)
+  ADD_SUBDIRECTORY(python)
+ENDIF()
 
 ADD_SUBDIRECTORY(applications)
 ADD_SUBDIRECTORY(prototypes)

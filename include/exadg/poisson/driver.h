@@ -69,6 +69,17 @@ public:
                  unsigned int const   n_repetitions_inner,
                  unsigned int const   n_repetitions_outer) const;
 
+  /**
+   * Access to the spatial discretization, needed to build a reduced-order model: the reduced
+   * operators are obtained by applying the full-order operator to the basis vectors, and the
+   * coefficient has to be reset between the affine components.
+   */
+  std::shared_ptr<Operator<dim, 1, Number>>
+  get_pde_operator() const
+  {
+    return pde_operator;
+  }
+
 private:
   // MPI communicator
   MPI_Comm const mpi_comm;

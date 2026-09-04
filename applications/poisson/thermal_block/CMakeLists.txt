@@ -25,11 +25,14 @@
 #
 #########################################################################
 
-INCLUDE(macro_print_exadg_header.cmake)
-INCLUDE(macro_target_link_fftw.cmake)
-INCLUDE(macro_exadg_pickup_exe.cmake)
-INCLUDE(macro_exadg_pickup_tests.cmake)
-INCLUDE(macro_subdir_list.cmake)
-INCLUDE(macro_targetname.cmake)
-INCLUDE(macro_dirname.cmake)
-INCLUDE(macro_exadg_add_python_module.cmake)
+TARGETNAME(TARGET_NAME ${CMAKE_CURRENT_SOURCE_DIR})
+
+PROJECT(${TARGET_NAME})
+
+EXADG_PICKUP_EXE(solver.cpp ${TARGET_NAME} solver)
+
+
+# Python bindings, staged into the exadg package by the shared macro.
+IF (EXADG_WITH_PYTHON)
+  EXADG_ADD_PYTHON_MODULE(thermal_block python_bindings.cpp)
+ENDIF()

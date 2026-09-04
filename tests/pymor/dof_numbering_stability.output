@@ -1,0 +1,8 @@
+  number of degrees of freedom      = 289
+  sum of entries                    = -7.52233680e+00
+  index weighted sum                = -5.53961299e+03
+  entry     0 at (0.0000, 0.0000) = 0.00000000e+00
+  entry    72 at (0.4375, 0.3125) = 4.22007046e-02
+  entry   144 at (0.9375, 0.3125) = 7.59234010e-02
+  entry   216 at (0.4375, 0.8125) = -4.96157649e-01
+  entry   288 at (0.9375, 0.9375) = 2.11683660e-01

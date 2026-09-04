@@ -1,0 +1,10 @@
+
+  dim = 2, degree = 2, sensors = 16
+  quadratic field reproduced (error < 1e-12) = true
+  linear in the field (error < 1e-12)        = true
+  multi-vector layout consistent             = true
+
+  dim = 3, degree = 2, sensors = 27
+  quadratic field reproduced (error < 1e-12) = true
+  linear in the field (error < 1e-12)        = true
+  multi-vector layout consistent             = true

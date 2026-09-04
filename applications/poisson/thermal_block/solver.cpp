@@ -19,30 +19,8 @@
  *  ______________________________________________________________________
  */
 
-#ifndef EXADG_POISSON_USER_INTERFACE_FIELD_FUNCTIONS_H_
-#define EXADG_POISSON_USER_INTERFACE_FIELD_FUNCTIONS_H_
+// solver
+#include <exadg/poisson/solver.h>
 
-namespace ExaDG
-{
-namespace Poisson
-{
-template<int dim>
-struct FieldFunctions
-{
-  std::shared_ptr<dealii::Function<dim>> initial_solution;
-  std::shared_ptr<dealii::Function<dim>> right_hand_side;
-
-  /**
-   * Coefficient a(x) of the operator -div(a(x) grad(u)).
-   *
-   * Only evaluated if Parameters::coefficient_is_variable is set, in which case it must be
-   * provided. It is evaluated once during setup; to change the coefficient afterwards, for
-   * instance when sweeping over parameters, call Operator::set_coefficient() directly.
-   */
-  std::shared_ptr<dealii::Function<dim>> coefficient;
-};
-
-} // namespace Poisson
-} // namespace ExaDG
-
-#endif /* EXADG_POISSON_USER_INTERFACE_FIELD_FUNCTIONS_H_ */
+// application
+#include "application.h"

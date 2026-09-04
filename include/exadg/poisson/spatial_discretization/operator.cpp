@@ -84,6 +84,24 @@ Operator<dim, n_components, Number>::initialize_dof_handler_and_constraints()
 
   dof_handler.distribute_dofs(*fe);
 
+  // The coefficient gets its own space, so its degree is independent of the solution's. Degree 0
+  // is discontinuous by nature -- one value per cell, with no continuity to impose -- while
+  // degree 1 and above are continuous, which is what makes the field a genuine finite element
+  // function rather than a cell-wise table.
+  if(param.coefficient_is_variable)
+  {
+    coefficient_fe = create_finite_element<dim>(param.grid.element_type,
+                                                param.coefficient_degree == 0 /* is_dg */,
+                                                1 /* n_components */,
+                                                param.coefficient_degree);
+
+    coefficient_dof_handler.reinit(dof_handler.get_triangulation());
+    coefficient_dof_handler.distribute_dofs(*coefficient_fe);
+
+    coefficient_constraints.clear();
+    coefficient_constraints.close();
+  }
+
   // Affine constraints are only relevant for continuous Galerkin discretizations.
   if(param.spatial_discretization == SpatialDiscretization::CG)
   {
@@ -151,7 +169,9 @@ Operator<dim, n_components, Number>::fill_matrix_free_data(
   // second argument is always true
   matrix_free_data.append_mapping_flags(
     Operators::LaplaceKernel<dim, Number, n_components>::get_mapping_flags(
-      param.spatial_discretization == SpatialDiscretization::DG, true));
+      param.spatial_discretization == SpatialDiscretization::DG,
+      true,
+      param.coefficient_is_variable));
 
   if(param.right_hand_side)
   {
@@ -169,6 +189,16 @@ Operator<dim, n_components, Number>::fill_matrix_free_data(
   matrix_free_data.insert_constraint(&affine_constraints_periodicity_and_hanging_nodes,
                                      get_dof_name_periodicity_and_hanging_node_constraints());
 
+  if(param.coefficient_is_variable)
+  {
+    matrix_free_data.insert_dof_handler(&coefficient_dof_handler, get_coefficient_dof_name());
+    matrix_free_data.insert_constraint(&coefficient_constraints, get_coefficient_dof_name());
+  }
+
+  // Gauss with degree + 1 points, exact to per-variable degree 2 * degree + 1. The integrand
+  // a grad(u).grad(v) has per-variable degree 2 * degree + coefficient_degree, so this is exact
+  // exactly while coefficient_degree <= 1 -- which Parameters::check() enforces, and where the
+  // reasoning is written out.
   std::shared_ptr<dealii::Quadrature<dim>> quadrature =
     create_quadrature<dim>(param.grid.element_type, param.degree + 1);
   matrix_free_data.insert_quadrature(*quadrature, get_quad_name());
@@ -240,12 +270,23 @@ Operator<dim, n_components, Number>::setup_operators()
   laplace_operator_data.bc                              = boundary_descriptor;
   laplace_operator_data.use_cell_based_loops            = param.enable_cell_based_face_loops;
   laplace_operator_data.kernel_data.IP_factor           = param.IP_factor;
+  laplace_operator_data.kernel_data.coefficient_is_variable = param.coefficient_is_variable;
+  laplace_operator_data.kernel_data.coefficient             = param.coefficient;
   laplace_operator_data.use_matrix_based_operator_level = param.use_matrix_based_operator;
   laplace_operator_data.sparse_matrix_type              = param.sparse_matrix_type;
   laplace_operator.initialize(*matrix_free,
                               affine_constraints,
                               laplace_operator_data,
                               true /* assemble_matrix */);
+
+  if(param.coefficient_is_variable)
+  {
+    AssertThrow(field_functions->coefficient.get() != nullptr,
+                dealii::ExcMessage("FieldFunctions::coefficient has to be provided if "
+                                   "Parameters::coefficient_is_variable is set."));
+
+    laplace_operator.set_coefficient(*field_functions->coefficient);
+  }
 
   // rhs operator
   if(param.right_hand_side)
@@ -427,6 +468,119 @@ void
 Operator<dim, n_components, Number>::vmult(VectorType & dst, VectorType const & src) const
 {
   laplace_operator.vmult(dst, src);
+}
+
+#ifdef DEAL_II_WITH_TRILINOS
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::init_system_matrix(
+  dealii::TrilinosWrappers::SparseMatrix & system_matrix) const
+{
+  laplace_operator.init_system_matrix(system_matrix, mpi_comm);
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::calculate_system_matrix(
+  dealii::TrilinosWrappers::SparseMatrix & system_matrix) const
+{
+  // calculate_system_matrix() adds, so a repeated call at a new coefficient has to start from an
+  // empty matrix. Doing it here rather than at the call site is what keeps a coefficient sweep
+  // from silently accumulating every parameter it has ever seen.
+  system_matrix *= 0.0;
+
+  laplace_operator.calculate_system_matrix(system_matrix);
+}
+#endif
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::set_coefficient(dealii::Function<dim> const & function)
+{
+  laplace_operator.set_coefficient(function);
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::set_coefficient_from_cell_values(
+  std::vector<Number> const & cell_values)
+{
+  laplace_operator.set_coefficient_from_cell_values(cell_values);
+}
+
+template<int dim, int n_components, typename Number>
+dealii::DoFHandler<dim> const &
+Operator<dim, n_components, Number>::get_coefficient_dof_handler() const
+{
+  AssertThrow(param.coefficient_is_variable,
+              dealii::ExcMessage("There is no coefficient space unless the coefficient is "
+                                 "variable; set Parameters::coefficient_is_variable."));
+
+  return coefficient_dof_handler;
+}
+
+template<int dim, int n_components, typename Number>
+unsigned int
+Operator<dim, n_components, Number>::get_coefficient_dof_index() const
+{
+  return matrix_free_data->get_dof_index(get_coefficient_dof_name());
+}
+
+template<int dim, int n_components, typename Number>
+dealii::types::global_dof_index
+Operator<dim, n_components, Number>::n_coefficient_dofs() const
+{
+  return get_coefficient_dof_handler().n_dofs();
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::initialize_coefficient_dof_vector(VectorType & vector) const
+{
+  matrix_free->initialize_dof_vector(vector, get_coefficient_dof_index());
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::set_coefficient_from_dof_vector(
+  VectorType const & coefficient_values,
+  bool const         check_positivity)
+{
+  laplace_operator.set_coefficient_from_dof_vector(coefficient_values,
+                                                   get_coefficient_dof_index(),
+                                                   check_positivity);
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::compute_coefficient_sensitivity(VectorType const & u,
+                                                                     VectorType const & p,
+                                                                     VectorType &       dst) const
+{
+  laplace_operator.compute_coefficient_sensitivity(u, p, get_coefficient_dof_index(), dst);
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::vmult_transpose(VectorType &       dst,
+                                                     VectorType const & src) const
+{
+  vmult(dst, src);
+}
+
+template<int dim, int n_components, typename Number>
+std::string
+Operator<dim, n_components, Number>::get_coefficient_dof_name() const
+{
+  return field + "_coefficient";
+}
+
+template<int dim, int n_components, typename Number>
+void
+Operator<dim, n_components, Number>::update_preconditioner()
+{
+  if(preconditioner.get() != nullptr)
+    preconditioner->update();
 }
 
 template<int dim, int n_components, typename Number>

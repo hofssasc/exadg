@@ -1,0 +1,10 @@
+
+  dim = 2, degree = 2, blocks per direction = 4, n_dofs = 289
+  constant coefficient a = 1.0000e+00: reproduces constant-coefficient operator exactly = true
+  constant coefficient a = 2.5000e+00: reproduces constant-coefficient operator exactly = true
+  affine decomposition over 16 blocks: exact to round-off = true
+
+  dim = 3, degree = 2, blocks per direction = 2, n_dofs = 729
+  constant coefficient a = 1.0000e+00: reproduces constant-coefficient operator exactly = true
+  constant coefficient a = 2.5000e+00: reproduces constant-coefficient operator exactly = true
+  affine decomposition over 8 blocks: exact to round-off = true
