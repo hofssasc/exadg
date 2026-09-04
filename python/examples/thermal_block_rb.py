@@ -31,6 +31,7 @@ Paths are relative to the repository root, so run it from there.
 """
 
 import numpy as np
+from pymor.algorithms.error import reduction_error_analysis
 from pymor.algorithms.pod import pod
 from pymor.parameters.base import Mu
 from pymor.parameters.functionals import MinThetaParameterFunctional
@@ -59,19 +60,22 @@ def main():
     for mu in train:
         snapshots.append(model.solve(Mu(mu=mu)))
 
-    # The mass matrix, not the Euclidean product: a POD in the coefficient inner product weights
-    # degrees of freedom by the local mesh size and is not the L2-optimal basis.
-    basis, singular_values = pod(snapshots, product=model.mass_product, modes=N_MODES)
+    # A product, not the Euclidean one: a POD in the coefficient inner product weights degrees
+    # of freedom by the local mesh size and is not an optimal basis in any norm of interest.
+    # The energy product is used here because it is also the norm the error estimator below
+    # bounds, so basis and certificate speak about the same quantity.
+    basis, singular_values = pod(snapshots, product=model.energy_product, modes=N_MODES)
     print(f"POD modes          : {len(basis)}")
     print(f"singular values    : {np.array2string(singular_values[:4], precision=10)}")
 
-    # Every affine component is exp(mu_p) times a positive semi-definite operator, so the
-    # smallest coefficient bounds the coercivity constant from below and no successive-constraint
-    # method is needed.
+    # A(mu) >= min_p exp(mu_p) * A(0) in the energy inner product, so the smallest coefficient
+    # is an exact lower bound on the coercivity constant and no successive-constraint method is
+    # needed. This bound holds *relative to the energy product* and not relative to the mass
+    # product, which is why the reductor is given the former.
     reductor = CoerciveRBReductor(
         model,
         RB=basis,
-        product=model.mass_product,
+        product=model.energy_product,
         coercivity_estimator=MinThetaParameterFunctional(
             model.operator.coefficients, np.ones(n_parameters)
         ),
@@ -84,8 +88,8 @@ def main():
         u_fom = model.solve(parameter)
         u_rom = reductor.reconstruct(rom.solve(parameter))
 
-        norm = u_fom.norm(model.mass_product)[0]
-        errors.append((u_fom - u_rom).norm(model.mass_product)[0] / norm)
+        norm = u_fom.norm(model.energy_product)[0]
+        errors.append((u_fom - u_rom).norm(model.energy_product)[0] / norm)
         estimates.append(rom.estimate_error(parameter)[0])
 
     print(f"max relative error : {max(errors):.12e}")
@@ -97,6 +101,33 @@ def main():
     index, value = u.amax()
     print(f"amax               : index {index[0]} value {value[0]:.12e}")
     print(f"dofs([0, 17, 113]) : {np.array2string(u.dofs([0, 17, 113]).ravel(), precision=12)}")
+
+    # pyMOR's standard convergence table: the error against basis size, with the estimator's
+    # effectivity. plot=False because this normally runs without a display.
+    analysis = reduction_error_analysis(
+        rom,
+        fom=model,
+        reductor=reductor,
+        test_mus=[Mu(mu=mu) for mu in test],
+        basis_sizes=4,
+        error_norms=[model.energy_norm],
+        condition=True,
+        plot=False,
+    )
+    print()
+    print(analysis["summary"])
+
+    # Three fields in one record, which is the comparison worth looking at.
+    worst = Mu(mu=test[int(np.argmax(errors))])
+    u_fom = model.solve(worst)
+    u_rom = reductor.reconstruct(rom.solve(worst))
+    record = model.visualize(
+        (u_fom, u_rom, u_fom - u_rom),
+        legend=("fom", "rom", "error"),
+        filename="output/pymor/thermal_block",
+    )
+    if not mpi.parallel:
+        print(f"\nwrote {record}")
 
 
 if __name__ == "__main__":

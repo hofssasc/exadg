@@ -52,8 +52,10 @@ which is the answer pyMOR expects and handles.
 """
 
 import functools
+from pathlib import Path
 
 import numpy as np
+from pymor.core.base import ImmutableObject
 from pymor.operators.constructions import LincombOperator, VectorOperator
 from pymor.operators.interface import Operator
 from pymor.operators.list import ListVectorArrayOperatorBase
@@ -632,6 +634,71 @@ class ExaDGObservationOperator(ListVectorArrayOperatorBase):
         )
 
 
+class ExaDGVisualizer(ImmutableObject):
+    """Writes vector arrays as VTU/PVTU records, as pyMOR's ``visualizer`` hook.
+
+    A file writer rather than a plot window: the model may be on a compute node, and under MPI
+    each rank holds a piece of the field, so there is nothing for one process to draw. pyMOR's
+    :class:`~pymor.models.mpi.MPIVisualizer` calls this on every rank, and
+    ``write_vtu_with_pvtu_record`` writes one piece per rank plus a ``.pvtu`` that ParaView
+    opens as one field -- so the parallel case needs no separate path.
+
+    ``reductor.reconstruct(rom.solve(mu))`` lands in the same space as ``fom.solve(mu)``, so the
+    usual three-way comparison works::
+
+        fom.visualize((u_fom, u_rom, u_fom - u_rom),
+                      legend=("fom", "rom", "error"), filename="output/compare")
+    """
+
+    def __init__(self, space, directory="output/pymor"):
+        """Write into ``directory`` unless ``visualize`` is given a filename."""
+        self.space = space
+        self.directory = directory
+
+    def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
+        """Write the given fields.
+
+        Args:
+            U: A VectorArray, or a tuple of them to write as separate fields of one record.
+            title: Accepted and ignored; there is no window to title.
+            legend: Field name per entry of ``U``. Defaults to ``field_0``, ``field_1``, ...
+            filename: Path without extension. Defaults to ``<directory>/<title or 'solution'>``.
+            block: Accepted and ignored; nothing blocks.
+
+        Returns:
+            str: Path of the written ``.pvtu``.
+        """
+        arrays = U if isinstance(U, tuple) else (U,)
+
+        vectors, names = [], []
+        for position, array in enumerate(arrays):
+            assert array in self.space
+
+            label = (
+                legend[position]
+                if legend is not None and not isinstance(legend, str)
+                else (legend if isinstance(legend, str) else f"field_{position}")
+            )
+
+            # A time series would be several records rather than several fields; until an
+            # instationary model exists, refusing beats writing only the first vector.
+            if len(array) != 1:
+                raise NotImplementedError(
+                    f"visualize() writes one vector per field, got {len(array)}."
+                )
+
+            vectors.append(array.vectors[0].impl)
+            names.append(label if len(arrays) > 1 or legend is not None else "solution")
+
+        if filename is None:
+            directory, basename = self.directory, (title or "solution")
+        else:
+            path = Path(filename)
+            directory, basename = str(path.parent), path.stem
+
+        return self.space.fom.write_vtu(directory, basename, vectors, names)
+
+
 class ExponentialParameterFunctional(ParameterFunctional):
     """The coefficient functional ``mu -> exp(mu[index])`` of one affine component.
 
@@ -732,7 +799,19 @@ def stationary_model(fom, form="affine"):
             operator=operator,
             rhs=VectorOperator(space.make_array([rhs])),
             output_functional=ExaDGObservationOperator(space),
-            products={"mass": ExaDGMassOperator(space)},
+            products={
+                "mass": ExaDGMassOperator(space),
+                # The operator at unit diffusivities, i.e. the H1 seminorm. This is the product
+                # a coercive residual error estimator has to be taken in: A(mu) >= min_p
+                # exp(mu_p) * A(0) in the A(0) inner product, so MinThetaParameterFunctional
+                # over the coefficients is then an exact lower bound on the coercivity
+                # constant. Against the mass product the same functional is not a bound at all,
+                # and the estimator comes out orders of magnitude too large.
+                "energy": ExaDGAffineOperator(
+                    space, np.ones(space.fom.n_parameters), name="energy"
+                ),
+            },
+            visualizer=ExaDGVisualizer(space),
         ),
         space,
     )

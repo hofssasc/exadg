@@ -59,6 +59,7 @@
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/dofs/dof_tools.h>
 #include <deal.II/fe/fe_values.h>
+#include <deal.II/numerics/data_out.h>
 
 // ExaDG
 #include <exadg/operators/inverse_mass_operator.h>
@@ -66,6 +67,7 @@
 #include <exadg/poisson/driver.h>
 #include <exadg/pymor/block_coefficient.h>
 #include <exadg/pymor/sensor_operator.h>
+#include <exadg/utilities/create_directories.h>
 #include <exadg/utilities/general_parameters.h>
 
 // application
@@ -1069,6 +1071,62 @@ public:
     return solution;
   }
 
+  /**
+   * Writes one or more solution vectors as a VTU/PVTU record.
+   *
+   * This is what pyMOR's ``visualizer`` hook needs. It is a file writer rather than a plot
+   * window because the model may be running on a compute node under mpirun; deal.II's
+   * write_vtu_with_pvtu_record() produces one piece per rank plus a .pvtu that ParaView opens
+   * as a single field, so the parallel case is the normal case rather than a special one.
+   *
+   * @param directory Created if absent.
+   * @param basename File name without extension or rank suffix.
+   * @param vectors One field per entry.
+   * @param names One name per vector, used as the field name in the file.
+   * @return Path of the .pvtu record.
+   */
+  std::string
+  write_vtu(std::string const &                              directory,
+            std::string const &                              basename,
+            std::vector<std::shared_ptr<VectorType>> const & vectors,
+            std::vector<std::string> const &                 names) const
+  {
+    AssertThrow(vectors.size() == names.size(),
+                dealii::ExcMessage("Expected one name per vector, got " +
+                                   std::to_string(names.size()) + " for " +
+                                   std::to_string(vectors.size()) + " vectors."));
+    AssertThrow(not vectors.empty(), dealii::ExcMessage("Nothing to write."));
+
+    // deal.II concatenates directory and file name verbatim, so a missing separator silently
+    // writes "outputsolution_0.pvtu" next to the directory instead of inside it.
+    std::string const path =
+      (directory.empty() or directory.back() == '/') ? directory : directory + "/";
+
+    create_directories(path, mpi_comm);
+
+    dealii::DataOut<dim> data_out;
+    data_out.attach_dof_handler(pde_operator->get_dof_handler());
+
+    // DataOut reads ghost entries, and it keeps a reference rather than a copy -- so the
+    // ghosted vectors have to be sized up front and outlive build_patches().
+    std::vector<VectorType> ghosted(vectors.size());
+    for(unsigned int i = 0; i < vectors.size(); ++i)
+    {
+      pde_operator->initialize_dof_vector(ghosted[i]);
+      ghosted[i] = *vectors[i];
+      ghosted[i].update_ghost_values();
+
+      data_out.add_data_vector(ghosted[i], names[i]);
+    }
+
+    data_out.build_patches(*pde_operator->get_mapping(),
+                           pde_operator->get_dof_handler().get_fe().degree);
+
+    // deal.II returns the record's name relative to the directory; prepend it so the caller
+    // gets a path it can actually open.
+    return path + data_out.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+  }
+
   std::vector<double>
   sensor_coordinates() const
   {
@@ -1283,6 +1341,13 @@ register_model(py::module_ & module, std::string const & name)
          "The observation operator's transpose B^T w. This is Operator.apply_adjoint of the "
          "output functional, which pyMOR's output error estimator requires.")
     .def("sensor_coordinates", &ThermalBlockFOM<dim>::sensor_coordinates)
+    .def("write_vtu",
+         &ThermalBlockFOM<dim>::write_vtu,
+         py::arg("directory"),
+         py::arg("basename"),
+         py::arg("vectors"),
+         py::arg("names"),
+         "Write fields as a VTU/PVTU record and return the path of the .pvtu. Collective.")
     // keep_alive<0, 1> ties the returned object's lifetime to the model's. It holds raw
     // references into the triangulation and the matrix-free data, so a model collected while
     // it is still in use leaves dangling pointers.

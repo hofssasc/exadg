@@ -150,7 +150,13 @@ MPICC=$(which mpicc) python -m pip install --no-binary=mpi4py mpi4py
 ```
 
 `python/examples/thermal_block_rb.py` runs unchanged on any number of ranks and prints
-quantities that must be identical on all of them.
+quantities that must be identical on all of them. It is the parallel regression check as much
+as it is a demo.
+
+Visualization follows the same rule: `model.visualize(...)` writes a VTU per rank plus a `.pvtu`
+record that ParaView opens as one field, so there is no separate serial path. It returns the
+record's path serially; under MPI pyMOR's `MPIVisualizer` discards return values, so the path
+has to be constructed by the caller.
 
 **What is and is not parallel.** Solves, the POD, the projection, the products and the output
 functional are. Empirical interpolation is not: `Operator.restricted()` raises
