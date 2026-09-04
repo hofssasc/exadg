@@ -41,9 +41,17 @@ the constraints by construction, but vectors pyMOR creates itself -- random prob
 interpolation candidates -- do not. This module therefore projects onto the constrained subspace
 whenever it creates a vector, so that pyMOR only ever sees admissible vectors.
 
-Currently single-rank. pyMOR's parallel story is the event loop in :mod:`pymor.tools.mpi`, with
-Python on every rank and rank 0 dispatching; adding it does not change the interfaces here.
+**Running under MPI.** Use :func:`mpi_stationary_model`, which wraps the per-rank model with
+:func:`pymor.models.mpi.mpi_wrap_model`. pyMOR then runs Python on every rank with rank 0
+dispatching, and every method here is executed simultaneously on all of them. Two consequences
+shape the code below: an operation returning a value must return the *global* answer on every
+rank rather than that rank's slice -- ``dofs`` and ``amax`` do their own reductions in C++ --
+and any vector pyMOR hands in arrives whole on every rank, so ``vector_from_numpy`` keeps only
+the part it owns. Empirical interpolation is still serial; :meth:`restricted` raises under MPI,
+which is the answer pyMOR expects and handles.
 """
+
+import functools
 
 import numpy as np
 from pymor.operators.constructions import LincombOperator, VectorOperator
@@ -156,7 +164,21 @@ class ExaDGVectorSpace(ListVectorSpace):
         return ExaDGVector(vector)
 
     def random_vector(self, distribution, random_state=None, **kwargs):
-        """Random vector, projected onto the constrained subspace."""
+        """Random vector, projected onto the constrained subspace.
+
+        Under MPI every rank runs this and keeps the part it owns, so the ranks must agree on
+        the draw. ``random_state`` is therefore not optional there: with ``None`` each rank
+        seeds itself from the OS and the assembled vector is a different field on every rank,
+        which is not an error anywhere -- it just produces a vector that is not a vector.
+        """
+        from pymor.tools import mpi
+
+        if mpi.parallel and random_state is None:
+            raise ValueError(
+                "random_vector() needs an explicit random_state under MPI, so that every rank "
+                "draws the same field."
+            )
+
         rng = np.random.default_rng(random_state)
 
         if distribution == "normal":
@@ -206,6 +228,7 @@ class ExaDGBlockOperator(ListVectorArrayOperatorBase):
         coefficient, which is why the raw-coefficient entry point is used: an indicator is not the
         exponential of any log diffusivity.
         """
+        _require_serial()
         _require_piecewise_constant(self.space.fom)
 
         coefficients = np.zeros(self.space.fom.n_blocks)
@@ -391,10 +414,33 @@ class ExaDGFieldOperator(ListVectorArrayOperatorBase):
 
     def restricted(self, dofs):
         """Restrict to the given output degrees of freedom, keeping the parameter dependence."""
+        _require_serial()
         _require_piecewise_constant(self.space.fom)
 
         return _restricted_operator(
             self.space, None, dofs, f"{self.name}|dofs", parameter=self.parameter
+        )
+
+
+def _require_serial():
+    """Refuse the empirical-interpolation path on more than one rank.
+
+    ``RestrictedLaplace`` collects the cells touching the requested degrees of freedom from the
+    locally owned cells only, so on several ranks each rank would build a different piece of the
+    stencil and none of them the whole operator. Making it parallel means agreeing the cell set
+    across ranks and gathering the restricted evaluation, which is a separate piece of work.
+
+    ``NotImplementedError`` rather than a plain error because that is what pyMOR checks for:
+    :func:`pymor.operators.mpi._MPIOperator_restriced` catches exactly this and reports the
+    operator as having no restriction, so empirical interpolation degrades to evaluating the
+    full operator instead of producing a wrong one.
+    """
+    from pymor.tools import mpi
+
+    if mpi.parallel:
+        raise NotImplementedError(
+            "Operator.restricted() is implemented for a single rank; the stencil is built from "
+            "locally owned cells only."
         )
 
 
@@ -480,6 +526,7 @@ class ExaDGAffineOperator(ListVectorArrayOperatorBase):
 
     def restricted(self, dofs):
         """Restrict the assembled operator to the given output degrees of freedom."""
+        _require_serial()
         _require_piecewise_constant(self.space.fom)
 
         return _restricted_operator(
@@ -689,3 +736,60 @@ def stationary_model(fom, form="affine"):
         ),
         space,
     )
+
+def _local_stationary_model(input_file, degree, refinements, dim, form):
+    """Build the per-rank model. Module level so that it survives pickling to the other ranks."""
+    from exadg import thermal_block
+
+    model_class = getattr(thermal_block, f"ThermalBlockFOM{dim}D")
+    fom = model_class(input_file, degree=degree, refinements=refinements)
+
+    return stationary_model(fom, form=form)[0]
+
+
+def mpi_stationary_model(input_file, degree, refinements, dim=2, form="affine"):
+    """Build the model, wrapped for MPI when the interpreter is running in parallel.
+
+    The full-order model has to be constructed *on every rank*, because each rank owns a piece
+    of the mesh. So the model cannot be built here and shipped -- what is shipped is the recipe,
+    and :func:`pymor.models.mpi.mpi_wrap_model` calls it on every rank and hands rank 0 a
+    :class:`~pymor.models.mpi.MPIModel` that dispatches to all of them.
+
+    Run it as ::
+
+        mpirun -n 4 python -m pymor.tools.mpi reduce.py
+
+    which starts pyMOR's event loop on ranks 1..n-1 and the script on rank 0. Running the script
+    directly under ``mpirun`` without ``-m pymor.tools.mpi`` executes it once per rank instead,
+    and the ranks will deadlock on the first collective call.
+
+    Args:
+        input_file: ExaDG input file, readable from every rank.
+        degree: Polynomial degree of the finite element space.
+        refinements: Number of global refinements.
+        dim: 2 or 3.
+        form: ``"affine"`` or ``"field"``; see :func:`stationary_model`.
+
+    Returns:
+        Tuple ``(model, space)``. Serially these are exactly what :func:`stationary_model`
+        returns; in parallel the model is an MPI-wrapped one and the space is its
+        ``solution_space``, an :class:`~pymor.vectorarrays.mpi.MPIVectorSpace`.
+    """
+    from pymor.tools import mpi
+
+    factory = functools.partial(
+        _local_stationary_model, input_file, degree, refinements, dim, form
+    )
+
+    if not mpi.parallel:
+        model = factory()
+
+        return model, model.solution_space
+
+    from pymor.models.mpi import mpi_wrap_model
+
+    # pickle_local_spaces=False because an ExaDGVectorSpace holds a handle to the C++ model and
+    # cannot be pickled; pyMOR then refers to the local spaces by an id registered on each rank.
+    model = mpi_wrap_model(factory, use_with=True, pickle_local_spaces=False)
+
+    return model, model.solution_space

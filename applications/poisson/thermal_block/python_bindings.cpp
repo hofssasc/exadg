@@ -33,13 +33,15 @@
  *     Space     zero_vector, make_vector (via the model below)
  *     Operator  apply
  *
- * to_numpy() exists for debugging and for the tests that compare against the C++ offline stage.
- * It is not used on the hot path and it is not meaningful once the model runs on more than one
- * MPI rank.
+ * to_numpy() exists for debugging only; it refuses on more than one rank, because gathering the
+ * whole vector onto every rank is exactly what this interface exists to avoid.
  *
- * MPI: this first milestone assumes a single rank. pyMOR's parallel story is the event loop in
- * pymor.tools.mpi, where Python runs on every rank and rank 0 dispatches method calls; wiring
- * that up is a separate step and does not change the interface below.
+ * MPI: supported through pyMOR's event loop (pymor.tools.mpi), where Python runs on every rank
+ * and rank 0 dispatches. Every call below therefore executes simultaneously on all ranks, and
+ * pyMOR keeps rank 0's return value -- so anything that returns data has to return the global
+ * answer rather than this rank's slice. dofs() and amax() do their own reductions accordingly.
+ * RestrictedLaplace is still serial: it collects the stencil from locally owned cells only, so
+ * the Python layer raises NotImplementedError under MPI, which is what pyMOR expects.
  */
 
 // C/C++
@@ -52,6 +54,7 @@
 #include <pybind11/stl.h>
 
 // deal.II
+#include <deal.II/base/init_finalize.h>
 #include <deal.II/base/mpi.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/dofs/dof_tools.h>
@@ -78,9 +81,16 @@ using VectorType = dealii::LinearAlgebra::distributed::Vector<Number>;
 namespace
 {
 /**
- * Initializes MPI exactly once per interpreter.
+ * Initializes deal.II's external libraries exactly once per interpreter, starting MPI only if
+ * nobody else has.
  *
- * The MPI_InitFinalize object is deliberately leaked. Its destructor calls MPI_Finalize, and
+ * Under pyMOR's event loop mpi4py is imported first and has already called MPI_Init by the time
+ * this module loads. deal.II's MPI_InitFinalize asserts MPI_Initialized() == 0 and would abort
+ * with "MPI error. You can only start MPI once!". Kokkos, PETSc, Zoltan and p4est still have to
+ * be brought up, so the fix is to initialize the same set of libraries as MPI_InitFinalize with
+ * the MPI bit cleared -- deal.II guards only the MPI branch with that assertion.
+ *
+ * The object is deliberately leaked. Its destructor finalizes MPI and the libraries, and
  * running that during interpreter teardown -- after an arbitrary amount of other cleanup, and
  * possibly after deal.II statics have gone -- is a reliable source of crashes at exit.
  */
@@ -89,18 +99,29 @@ ensure_mpi_initialized()
 {
   static bool initialized = false;
 
-  if(not initialized)
-  {
-    static char   program_name[] = "exadg";
-    static char * argv_storage[] = {program_name, nullptr};
+  if(initialized)
+    return;
 
-    int     argc = 1;
-    char ** argv = argv_storage;
+  static char   program_name[] = "exadg";
+  static char * argv_storage[] = {program_name, nullptr};
 
-    new dealii::Utilities::MPI::MPI_InitFinalize(argc, argv, 1);
+  int     argc = 1;
+  char ** argv = argv_storage;
 
-    initialized = true;
-  }
+  int mpi_already_started = 0;
+  MPI_Initialized(&mpi_already_started);
+
+  // the set MPI_InitFinalize uses, so that behaviour is identical either way
+  auto libraries = dealii::InitializeLibrary::Kokkos | dealii::InitializeLibrary::SLEPc |
+                   dealii::InitializeLibrary::PETSc | dealii::InitializeLibrary::Zoltan |
+                   dealii::InitializeLibrary::P4EST | dealii::InitializeLibrary::PSBLAS;
+
+  if(not mpi_already_started)
+    libraries = libraries | dealii::InitializeLibrary::MPI;
+
+  new dealii::InitFinalize(argc, argv, libraries, 1);
+
+  initialized = true;
 }
 
 /**
@@ -440,12 +461,6 @@ public:
     ensure_mpi_initialized();
 
     SuppressOutput const suppress(not verbose);
-
-    AssertThrow(dealii::Utilities::MPI::n_mpi_processes(mpi_comm) == 1,
-                dealii::ExcMessage(
-                  "The Python bindings currently assume a single MPI rank. Running them under "
-                  "mpirun requires pyMOR's event loop (pymor.tools.mpi), which is not wired up "
-                  "yet."));
 
     application = std::make_shared<Poisson::Application<dim, 1, Number>>(input_file, mpi_comm);
     application->set_parameters_convergence_study(degree, refinements);
@@ -789,9 +804,14 @@ public:
 
     auto vector = zero_vector();
 
+    // Every rank receives the whole array and keeps the slice it owns. That is pyMOR's model
+    // under mpi.call: the same call runs on every rank with the same arguments, so writing a
+    // non-owned entry would be both wrong and a deal.II assertion.
     auto view = data.template unchecked<1>();
-    for(unsigned int i = 0; i < n_dofs(); ++i)
-      (*vector)[i] = view(i);
+    for(auto const index : vector->locally_owned_elements())
+      (*vector)[index] = view(index);
+
+    vector->compress(dealii::VectorOperation::insert);
 
     return vector;
   }
@@ -1370,43 +1390,71 @@ PYBIND11_MODULE(thermal_block, module)
       "amax",
       [](VectorType const & v) {
         // Index and magnitude of the largest entry, which is what empirical interpolation uses
-        // to pick its next interpolation point.
+        // to pick its next interpolation point. The index is *global*, because that is the
+        // index space dofs() is addressed in and the one an interpolation point has to survive
+        // in; returning a local index would be silently wrong on more than one rank.
         //
-        // Single rank only: a distributed version needs an argmax reduction, since the winning
-        // index has to be agreed across ranks rather than reduced componentwise. Asserting here
-        // beats returning a locally-correct and globally-wrong index.
-        AssertThrow(dealii::Utilities::MPI::n_mpi_processes(v.get_mpi_communicator()) == 1,
-                    dealii::ExcMessage("amax requires a distributed argmax, which is not "
-                                       "implemented; empirical interpolation is currently "
-                                       "single rank."));
+        // Two reductions rather than one MPI_MAXLOC: a maximum over the values, then a minimum
+        // over the global indices of the ranks that attain it. That costs one extra allreduce
+        // and buys a deterministic tie-break -- the smallest global index always wins, whatever
+        // the partitioning. MAXLOC would break ties by rank, so the interpolation point chosen
+        // would depend on the number of ranks, and a basis built on two ranks would differ from
+        // one built on four.
+        auto const & partitioner = *v.get_partitioner();
 
-        unsigned int index = 0;
-        double       value = 0.0;
-
+        double local_value = 0.0;
         for(unsigned int i = 0; i < v.locally_owned_size(); ++i)
-          if(std::abs(v.local_element(i)) > value)
+          local_value = std::max(local_value, std::abs(v.local_element(i)));
+
+        double const value = dealii::Utilities::MPI::max(local_value, v.get_mpi_communicator());
+
+        auto local_index = dealii::numbers::invalid_dof_index;
+        for(unsigned int i = 0; i < v.locally_owned_size(); ++i)
+          if(std::abs(v.local_element(i)) == value)
           {
-            value = std::abs(v.local_element(i));
-            index = i;
+            local_index = partitioner.local_to_global(i);
+            break;
           }
+
+        auto const index = dealii::Utilities::MPI::min(local_index, v.get_mpi_communicator());
 
         return py::make_tuple(index, value);
       })
     .def(
       "dofs",
-      [](VectorType const & v, std::vector<unsigned int> const & indices) {
-        std::vector<double> values;
-        values.reserve(indices.size());
-        for(auto const index : indices)
-          values.push_back(v[index]);
+      [](VectorType const & v, std::vector<dealii::types::global_dof_index> const & indices) {
+        // Collective. pyMOR reaches this through mpi.call, which runs the same call on every
+        // rank and keeps rank 0's return value, so every rank has to come back with the whole
+        // answer rather than with its own slice.
+        //
+        // Exactly one rank owns each index, so a sum over ranks with zero from the others
+        // gathers the values without anyone needing to know who owns what.
+        auto const & partitioner = *v.get_partitioner();
 
-        return values;
+        std::vector<double> values(indices.size(), 0.0);
+        for(unsigned int i = 0; i < indices.size(); ++i)
+          if(partitioner.in_local_range(indices[i]))
+            values[i] = v.local_element(partitioner.global_to_local(indices[i]));
+
+        std::vector<double> gathered(indices.size());
+        dealii::Utilities::MPI::sum(values, v.get_mpi_communicator(), gathered);
+
+        return gathered;
       },
       py::arg("indices"),
-      "Selected entries, as pyMOR's empirical interpolation requires.")
+      "Selected entries by global index, as pyMOR's empirical interpolation requires. "
+      "Collective: every rank returns the same values.")
     .def(
       "to_numpy",
       [](VectorType const & v) {
+        // Refuses rather than returning the local slice. pyMOR never calls this on more than
+        // one rank -- MPIVectorArrayImpl.to_numpy raises -- so a caller who gets here in
+        // parallel is a test or a debug print that would otherwise silently compare slices.
+        AssertThrow(dealii::Utilities::MPI::n_mpi_processes(v.get_mpi_communicator()) == 1,
+                    dealii::ExcMessage("to_numpy() would gather the whole vector onto every "
+                                       "rank, which is exactly what this interface exists to "
+                                       "avoid. Use dofs() for selected entries."));
+
         py::array_t<double> array(v.size());
         auto                view = array.mutable_unchecked<1>();
         for(unsigned int i = 0; i < v.size(); ++i)
@@ -1414,7 +1462,7 @@ PYBIND11_MODULE(thermal_block, module)
 
         return array;
       },
-      "Copy into a NumPy array. For debugging and tests only -- not meaningful in parallel.");
+      "Copy into a NumPy array. Single rank only; for debugging and tests.");
 
   register_model<2>(module, "ThermalBlockFOM2D");
   register_model<3>(module, "ThermalBlockFOM3D");

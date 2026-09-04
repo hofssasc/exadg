@@ -131,19 +131,41 @@ operators and evaluates the reduced model, all in one process.
 
 ### MPI
 
-The bindings currently assume a **single rank** and raise otherwise. Running on several ranks
-requires pyMOR's event loop (`pymor.tools.mpi`), in which Python runs on every rank and rank 0
-dispatches the work; that changes how the job is launched (`mpirun -n N python reduce.py`) and
-requires wrapping the model with `pymor.models.mpi`, but not the interfaces here.
+Supported through pyMOR's event loop. Build the model with `mpi_stationary_model` and launch
+with pyMOR's runner, which starts the event loop on ranks 1..n-1 and the script on rank 0:
 
-Two things have to hold before that works, and one of them is already checked:
+```bash
+mpirun -n 4 python -m pymor.tools.mpi reduce.py
+```
 
-- Global degree-of-freedom indices must not depend on the partitioning, because
+`python -m pymor.tools.mpi` is not optional. Running the script directly under `mpirun` executes
+it once per rank instead of once with n workers, and the ranks deadlock on the first collective.
+
+Requires `mpi4py`, built against **the same MPI** ExaDG is linked to. Installing a wheel that
+bundles a different MPI gives a process that starts and then hangs or crashes inside the first
+communication:
+
+```bash
+MPICC=$(which mpicc) python -m pip install --no-binary=mpi4py mpi4py
+```
+
+`python/examples/thermal_block_rb.py` runs unchanged on any number of ranks and prints
+quantities that must be identical on all of them.
+
+**What is and is not parallel.** Solves, the POD, the projection, the products and the output
+functional are. Empirical interpolation is not: `Operator.restricted()` raises
+`NotImplementedError` under MPI, because the stencil is built from locally owned cells only.
+pyMOR handles that gracefully — it falls back to evaluating the full operator, which is correct
+but not a speed-up.
+
+Two invariants make the parallel path meaningful, and both are checked rather than assumed:
+
+- Global degree-of-freedom indices do not depend on the partitioning, since
   `VectorArray.dofs()` and `Operator.restricted()` address entries by global index.
   `tests/pymor/dof_numbering_stability.cc` asserts this for one, two and four ranks.
-- `Vector.amax` needs a distributed argmax. It currently raises on more than one rank, because a
-  componentwise reduction returns a locally correct and globally wrong index. Empirical
-  interpolation is therefore single-rank until that is written.
+- `Vector.amax` returns a global index and breaks ties by the smallest one, so an interpolation
+  point does not depend on the rank count. It is a max-reduction over values followed by a
+  min-reduction over indices, rather than one `MPI_MAXLOC`, which would break ties by rank.
 
 ---
 
