@@ -1,0 +1,27 @@
+{
+    "General": {
+        "Precision": "double",
+        "Dim": "2",
+        "IsTest": "false"
+    },
+    "SpatialResolution": {
+        "DegreeMin": "2",
+        "DegreeMax": "2",
+        "RefineSpaceMin": "4",
+        "RefineSpaceMax": "4"
+    },
+    "TemporalResolution": {
+        "RefineTimeMin": "0",
+        "RefineTimeMax": "0"
+    },
+    "Application": {
+        "Viscosity": "1.0",
+        "ForcingModesPerDim": "2",
+        "ForcingWidth": "0.15"
+    },
+    "Output": {
+        "OutputDirectory": "output/stokes_forced/",
+        "OutputName": "stokes_forced",
+        "WriteOutput": "false"
+    }
+}
