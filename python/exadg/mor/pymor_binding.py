@@ -387,7 +387,17 @@ class ExaDGFieldOperator(ListVectorArrayOperatorBase):
     insensitive* to every parameter outside that stencil. For a forward solve that is the
     intended approximation; for a Jacobian with respect to the parameters it is a statement that
     most of them do not matter, which is false. Whether it is false enough to matter is measured
-    against the affine reference rather than assumed.
+    against the affine reference rather than assumed --
+    ``python/examples/thermal_block_ei.py`` does that.
+
+    **Do not train the interpolation on** ``operator.apply(model.solve(mu), mu)``. That is what
+    :func:`pymor.algorithms.ei.interpolate_operators` builds by default, and it is meaningful for
+    the nonlinear and instationary operators it was written for. Here it is degenerate: this
+    problem is linear and stationary, so ``A(mu) u(mu) = f`` for *every* parameter and the
+    evaluation set is rank one. The greedy then reports convergence to 1e-15 after a handful of
+    points, having learnt the right-hand side and nothing about the operator, and the resulting
+    reduced model is wrong by orders of magnitude. Train on ``A(mu) V`` for the reduced basis
+    ``V`` instead -- those are the vectors the reduced model will actually feed it.
     """
 
     linear = True

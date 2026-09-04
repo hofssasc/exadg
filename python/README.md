@@ -158,6 +158,13 @@ record that ParaView opens as one field, so there is no separate serial path. It
 record's path serially; under MPI pyMOR's `MPIVisualizer` discards return values, so the path
 has to be constructed by the caller.
 
+### Examples
+
+| Script | What it shows |
+|---|---|
+| `python/examples/thermal_block_rb.py` | The whole certified RB pipeline: POD, `CoerciveRBReductor`, `reduction_error_analysis`, VTU output. Runs on any rank count. |
+| `python/examples/thermal_block_ei.py` | The restriction contract, and empirical interpolation measured against the exact affine projection. Serial only. |
+
 **What is and is not parallel.** Solves, the POD, the projection, the products and the output
 functional are. Empirical interpolation is not: `Operator.restricted()` raises
 `NotImplementedError` under MPI, because the stencil is built from locally owned cells only.

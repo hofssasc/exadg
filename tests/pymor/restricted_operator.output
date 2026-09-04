@@ -1,0 +1,35 @@
+
+Restricted operator, i.e. the empirical interpolation contract:
+
+  dim = 2, degree = 2, blocks per direction = 2, n_dofs = 1089
+  output dofs                       = 6
+  of which constrained              = 2
+  reproduces the full operator      = true
+  stencil dofs                      = 66
+  stencil is complete               = true
+  affine decomposition survives     = true
+  cells in stencil                  = 8
+  blocks read                       = 4 of 4
+  stencil fraction of all dofs      = 0.0606
+
+  dim = 2, degree = 3, blocks per direction = 4, n_dofs = 625
+  output dofs                       = 6
+  of which constrained              = 1
+  reproduces the full operator      = true
+  stencil dofs                      = 108
+  stencil is complete               = true
+  affine decomposition survives     = true
+  cells in stencil                  = 7
+  blocks read                       = 7 of 16
+  stencil fraction of all dofs      = 0.1728
+
+  dim = 3, degree = 2, blocks per direction = 2, n_dofs = 729
+  output dofs                       = 6
+  of which constrained              = 4
+  reproduces the full operator      = true
+  stencil dofs                      = 246
+  stencil is complete               = true
+  affine decomposition survives     = true
+  cells in stencil                  = 12
+  blocks read                       = 6 of 8
+  stencil fraction of all dofs      = 0.3374
