@@ -56,7 +56,7 @@
 #include <exadg/matrix_free/matrix_free_data.h>
 #include <exadg/operators/quadrature.h>
 #include <exadg/poisson/spatial_discretization/laplace_operator.h>
-#include <exadg/pymor/block_coefficient.h>
+#include <exadg/operators/block_coefficient.h>
 
 using namespace ExaDG;
 

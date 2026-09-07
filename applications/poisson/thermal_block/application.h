@@ -23,7 +23,7 @@
 #define APPLICATIONS_POISSON_THERMAL_BLOCK_APPLICATION_H_
 
 // ExaDG
-#include <exadg/pymor/block_coefficient.h>
+#include <exadg/operators/block_coefficient.h>
 
 // application
 #include "postprocessor.h"

@@ -56,10 +56,10 @@
 #include <exadg/operators/inverse_mass_operator.h>
 #include <exadg/operators/mass_operator.h>
 #include <exadg/poisson/driver.h>
-#include <exadg/pymor/block_coefficient.h>
+#include <exadg/operators/block_coefficient.h>
 #include <exadg/pymor/interface.h>
 #include <exadg/pymor/restricted_laplace.h>
-#include <exadg/pymor/sensor_operator.h>
+#include <exadg/postprocessor/sensor_operator.h>
 #include <exadg/utilities/create_directories.h>
 #include <exadg/utilities/general_parameters.h>
 

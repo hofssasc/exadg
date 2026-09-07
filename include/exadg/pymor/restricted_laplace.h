@@ -36,7 +36,7 @@
 #include <vector>
 
 // ExaDG
-#include <exadg/pymor/block_coefficient.h>
+#include <exadg/operators/block_coefficient.h>
 
 namespace ExaDG
 {

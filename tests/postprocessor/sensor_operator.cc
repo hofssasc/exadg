@@ -48,7 +48,7 @@
 #include <deal.II/numerics/vector_tools.h>
 
 // ExaDG
-#include <exadg/pymor/sensor_operator.h>
+#include <exadg/postprocessor/sensor_operator.h>
 
 using namespace ExaDG;
 

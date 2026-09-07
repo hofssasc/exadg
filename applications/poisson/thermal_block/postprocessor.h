@@ -28,7 +28,7 @@
 
 // ExaDG
 #include <exadg/poisson/postprocessor/postprocessor.h>
-#include <exadg/pymor/sensor_operator.h>
+#include <exadg/postprocessor/sensor_operator.h>
 #include <exadg/utilities/create_directories.h>
 
 namespace ExaDG

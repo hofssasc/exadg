@@ -19,8 +19,8 @@
  *  ______________________________________________________________________
  */
 
-#ifndef EXADG_REDUCED_ORDER_SENSOR_OPERATOR_H_
-#define EXADG_REDUCED_ORDER_SENSOR_OPERATOR_H_
+#ifndef EXADG_POSTPROCESSOR_SENSOR_OPERATOR_H_
+#define EXADG_POSTPROCESSOR_SENSOR_OPERATOR_H_
 
 // deal.II
 #include <deal.II/base/mpi_remote_point_evaluation.h>
@@ -52,9 +52,9 @@ namespace ExaDG
  * available on every rank. Unlike PointwiseOutputGenerator this does not require deal.II to be
  * configured with HDF5, and it is not tied to a time loop.
  *
- * evaluate_transpose() gives B^T, which pyMOR's output error estimator needs in order to form
- * the Riesz representative of the output functional. Both directions are built from the same set
- * of points, so changing the sensor placement is a call to setup() and nothing else.
+ * evaluate_transpose() gives B^T, the adjoint right-hand side of any functional of the sensor
+ * values. Both directions are built from the same set of points, so changing the placement is a
+ * call to setup() and nothing else.
  */
 template<int dim, typename Number>
 class SensorOperator
@@ -312,4 +312,4 @@ private:
 
 } // namespace ExaDG
 
-#endif /* EXADG_REDUCED_ORDER_SENSOR_OPERATOR_H_ */
+#endif /* EXADG_POSTPROCESSOR_SENSOR_OPERATOR_H_ */

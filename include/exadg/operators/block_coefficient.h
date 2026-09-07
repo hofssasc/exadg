@@ -19,8 +19,8 @@
  *  ______________________________________________________________________
  */
 
-#ifndef EXADG_REDUCED_ORDER_BLOCK_COEFFICIENT_H_
-#define EXADG_REDUCED_ORDER_BLOCK_COEFFICIENT_H_
+#ifndef EXADG_OPERATORS_BLOCK_COEFFICIENT_H_
+#define EXADG_OPERATORS_BLOCK_COEFFICIENT_H_
 
 // deal.II
 #include <deal.II/base/function.h>
@@ -42,15 +42,14 @@ namespace ExaDG
  *
  * corresponds to the block with indices (i_0, ..., i_{dim-1}).
  *
- * This is the parameterization of the thermal block benchmark. Because the coefficient is
- * constant per block, the operator is *exactly* affine in the block values,
+ * Constant per block makes an operator built from it *exactly* affine in the block values,
  *
- *   A(mu) = sum_p exp(mu_p) A_p,
+ *   A(c) = sum_p c_p A_p,
  *
- * where A_p is the operator assembled with the indicator function of block p as coefficient.
- * That exactness is the reason for choosing a piecewise constant parameterization: the error
- * of the reduced-order model is then purely due to basis truncation, with no additional
- * interpolation error of the coefficient confounding it.
+ * where A_p is the operator assembled from indicator(blocks_per_dim, p). That exactness is the
+ * point: a reduced-order model built on it has no coefficient interpolation error confounding
+ * its basis truncation error, which is what makes the thermal block the standard benchmark.
+ * How a parameter maps to the coefficients c_p is a separate, and separately chosen, question.
  */
 template<int dim>
 class BlockCoefficient : public dealii::Function<dim>
@@ -144,4 +143,4 @@ private:
 
 } // namespace ExaDG
 
-#endif /* EXADG_REDUCED_ORDER_BLOCK_COEFFICIENT_H_ */
+#endif /* EXADG_OPERATORS_BLOCK_COEFFICIENT_H_ */
