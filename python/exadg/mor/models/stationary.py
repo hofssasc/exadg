@@ -169,7 +169,13 @@ def stationary_model(
 
         operator = LincombOperator(
             [
-                ExaDGOperator(space, component.op, component=position)
+                ExaDGOperator(
+                    space,
+                    component.op,
+                    component=position,
+                    model=fom,
+                    n_components=len(components),
+                )
                 for position, component in enumerate(components)
             ],
             coefficients,

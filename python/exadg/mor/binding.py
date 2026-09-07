@@ -118,44 +118,32 @@ class ExaDGVector(CopyOnWriteVector):
 
 
 class ExaDGVectorSpace(ListVectorSpace):
-    """The state space of one ExaDG full-order model.
+    """One ExaDG discrete function space.
 
-    Attributes:
-        fom: A ``PyMOR::FullOrderModel`` handle -- any ExaDG application's bound model class.
+    Args:
+        impl: A ``PyMOR::Space`` handle. A ``FullOrderModel`` is one, and a saddle-point model
+            hands out two -- velocity and pressure.
+        id: pyMOR's label for the space; distinct ids keep two spaces of one model apart.
     """
 
-    def __init__(self, fom, id="STATE"):
-        """Create the space belonging to ``fom``."""
-        self.fom = fom
+    def __init__(self, impl, id="STATE"):
+        self.impl = impl
         self.id = id
-        self._n_components = None
 
     @property
     def dim(self):
         """Global number of degrees of freedom."""
-        return self.fom.n_dofs
-
-    @property
-    def n_components(self):
-        """Number of affine components the model declares, cached.
-
-        Needed to assemble a linear combination of them, and worth caching because asking builds
-        one operator handle per component.
-        """
-        if self._n_components is None:
-            self._n_components = len(self.fom.operator_components())
-
-        return self._n_components
+        return self.impl.n_dofs
 
     def __eq__(self, other):
-        # identity of the underlying model, not of the wrapper
-        return type(other) is ExaDGVectorSpace and other.fom is self.fom and other.id == self.id
+        # identity of the underlying space, not of the wrapper
+        return type(other) is ExaDGVectorSpace and other.impl is self.impl and other.id == self.id
 
     def __hash__(self):
-        return hash((id(self.fom), self.id))
+        return hash((id(self.impl), self.id))
 
     def zero_vector(self):
-        return ExaDGVector(self.fom.zero_vector())
+        return ExaDGVector(self.impl.zero_vector())
 
     def make_vector(self, obj):
         """Wrap an existing ExaDG vector handle."""
@@ -167,9 +155,9 @@ class ExaDGVectorSpace(ListVectorSpace):
         pyMOR builds vectors this way for random probes and test data, and a discretisation with
         eliminated Dirichlet rows needs those rows zeroed before its affine decomposition holds.
         """
-        vector = self.fom.zero_vector()
+        vector = self.impl.zero_vector()
         vector.assign_numpy(np.ascontiguousarray(data, dtype=float))
-        self.fom.make_admissible(vector)
+        self.impl.make_admissible(vector)
 
         return ExaDGVector(vector)
 
@@ -235,24 +223,38 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
     """Any ExaDG ``LinearOperator``, wrapped for pyMOR.
 
     Args:
-        space: The :class:`ExaDGVectorSpace` the operator acts on.
+        space: The :class:`ExaDGVectorSpace` the operator maps *from*.
         impl: A ``PyMOR::LinearOperator`` handle.
         name: pyMOR's name for the operator; defaults to the one C++ gives it.
+        range_space: Where it maps *to*, when that is a different space -- the divergence block
+            of a saddle point maps velocity to pressure. Defaults to ``space``.
         component: Index into the model's affine components when this operator *is* one, and
             ``None`` otherwise. What lets :meth:`_assemble_lincomb` recognise a combination the
             application can assemble.
+        model: The model to ask for an assembled operator. Passed rather than reached for through
+            the space, because a space is a space and knows nothing about parameters.
+        n_components: How many affine components the model has in total, which is the length of
+            the coefficient vector ``model.assemble`` expects.
     """
 
     linear = True
 
-    def __init__(self, space, impl, name=None, component=None):
+    def __init__(
+        self, space, impl, name=None, range_space=None, component=None, model=None,
+        n_components=0,
+    ):
         # pyMOR's ImmutableObject requires every __init__ argument to be stored under the same
         # name, so that with_() can reconstruct the object
         self.space = space
-        self.source = self.range = space
         self.impl = impl
         self.name = name or impl.name
+        self.range_space = range_space
         self.component = component
+        self.model = model
+        self.n_components = n_components
+
+        self.source = space
+        self.range = range_space if range_space is not None else space
         self.parameters_own = {}
 
         if impl.has_inverse:
@@ -264,7 +266,7 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
     def _apply_one_vector(self, u, mu=None):
         self._prepare(mu)
 
-        result = self.range.fom.zero_vector()
+        result = self.range.impl.zero_vector()
         self.impl.apply(result, u.impl)
 
         return result
@@ -273,7 +275,7 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
         """``A^T v``. The C++ side refuses unless it can actually do it."""
         self._prepare(mu)
 
-        result = self.source.fom.zero_vector()
+        result = self.source.impl.zero_vector()
         self.impl.apply_transpose(result, v.impl)
 
         return result
@@ -313,6 +315,9 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
         if identity_shift != 0.0:
             return None
 
+        if self.model is None:
+            return None
+
         if not all(
             isinstance(operator, ExaDGOperator)
             and operator.space == self.space
@@ -325,11 +330,11 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
         if np.iscomplexobj(coefficients):
             return None
 
-        weights = np.zeros(self.space.n_components)
+        weights = np.zeros(self.n_components)
         for operator, coefficient in zip(operators, coefficients):
             weights[operator.component] += float(coefficient)
 
-        impl = self.space.fom.assemble(weights.tolist())
+        impl = self.model.assemble(weights.tolist())
         if impl is None:
             return None
 
@@ -354,6 +359,7 @@ class ExaDGParametricOperator(ExaDGOperator):
 
     def __init__(self, space, impl, coefficients, name=None):
         super().__init__(space, impl, name=name)
+
 
         # stored as an __init__ argument so that pyMOR collects the functionals' parameters into
         # this operator's own, exactly as it does for a LincombOperator
@@ -535,4 +541,4 @@ class ExaDGVisualizer(ImmutableObject):
             path = Path(filename)
             directory, basename = str(path.parent), path.stem
 
-        return self.space.fom.write_vtu(directory, basename, vectors, names)
+        return self.space.impl.write_vtu(directory, basename, vectors, names)

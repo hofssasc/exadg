@@ -55,7 +55,7 @@ ENDFOREACH()
 # One module per pyMOR Model type, not per application: what distinguishes them is mathematical
 # structure -- stationary, saddle point, Newton, time stepping -- and two applications sharing a
 # structure share a module.
-FOREACH(_model_source __init__.py stationary.py)
+FOREACH(_model_source __init__.py stationary.py saddle_point.py)
   CONFIGURE_FILE(exadg/mor/models/${_model_source}
                  ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor/models/${_model_source} COPYONLY)
 ENDFOREACH()

@@ -509,15 +509,20 @@ public:
   }
 
   /**
-   * The full-order coupled solve, for snapshots.
+   * The full-order coupled solve for the given right-hand side.
    *
-   * Returns false if this model cannot solve at those coefficients, the way
-   * FullOrderModel::assemble returns nullptr. Kept as a single call rather than composed from
-   * the blocks because the block preconditioner is the application's business, and because for
-   * Navier-Stokes this is where its Newton iteration lives.
+   * Takes the right-hand side rather than the parameters, because that is pyMOR's contract:
+   * apply_inverse may be asked to solve with any vector, not only the one the model assembles at
+   * a parameter. Kept as a single call rather than composed from the blocks because the block
+   * preconditioner is the application's business -- and because for Navier-Stokes this is where
+   * the Newton iteration lives.
+   *
+   * Returns false if this model cannot solve that system, the way FullOrderModel::assemble
+   * returns nullptr.
    */
   virtual bool
-  solve(std::vector<double> const & /*coefficients*/,
+  solve(VectorType const & /*f*/,
+        VectorType const & /*g*/,
         VectorType & /*velocity*/,
         VectorType & /*pressure*/)
   {

@@ -480,43 +480,37 @@ public:
   }
 
   /**
-   * The full-order coupled solve.
+   * The full-order coupled solve for the given right-hand side.
    *
    * Mirrors DriverSteadyProblems::do_solve() rather than calling it, for one reason: that driver
    * keeps its solution between calls and would warm-start the next parameter from the previous
    * one. A snapshot has to be a function of its parameter alone, so the guess is zeroed here.
    */
   bool
-  solve(std::vector<double> const & amplitudes, VectorType & u, VectorType & p) override
+  solve(VectorType const & f, VectorType const & g, VectorType & u, VectorType & p) override
   {
-    if(amplitudes.size() != n_modes())
-      return false;
-
-    application->get_forcing()->set_amplitudes(amplitudes);
-
     BlockVectorType solution;
     pde_operator->initialize_block_vector_velocity_pressure(solution);
     solution = 0.0;
 
     if(application->get_parameters().nonlinear_problem_has_to_be_solved())
     {
-      VectorType body_force(solution.block(0));
-      body_force = 0.0;
-      pde_operator->evaluate_add_body_force_term(body_force, 0.0);
+      // ExaDG's nonlinear solve takes the body force alone; the pressure equation of a steady
+      // incompressible problem has no right-hand side to give it.
+      if(g.l2_norm() != 0.0)
+        return false;
 
-      pde_operator->solve_nonlinear_problem(solution,
-                                            body_force,
-                                            application->get_parameters()
-                                              .update_preconditioner_coupled,
-                                            0.0 /* time */);
+      pde_operator->solve_nonlinear_problem(
+        solution, f, application->get_parameters().update_preconditioner_coupled, 0.0 /* time */);
     }
     else
     {
       BlockVectorType rhs;
       pde_operator->initialize_block_vector_velocity_pressure(rhs);
+      rhs.block(0) = f;
+      rhs.block(1) = g;
 
       VectorType transport_velocity;
-      pde_operator->rhs_linear_problem(rhs, transport_velocity, 0.0);
 
       pde_operator->solve_linear_problem(solution,
                                          rhs,

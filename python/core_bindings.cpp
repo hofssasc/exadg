@@ -298,17 +298,18 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)
     .def(
       "solve",
-      [](SaddlePointModel<V> & m, std::vector<double> const & coefficients) -> py::object {
+      [](SaddlePointModel<V> & m, V const & f, V const & g) -> py::object {
         auto u = m.velocity_space()->zero_vector();
         auto p = m.pressure_space()->zero_vector();
 
-        if(not m.solve(coefficients, *u, *p))
+        if(not m.solve(f, g, *u, *p))
           return py::none();
 
         return py::make_tuple(u, p);
       },
-      py::arg("coefficients"),
-      "Full-order coupled solve; returns (velocity, pressure), or None if declined.");
+      py::arg("f"),
+      py::arg("g"),
+      "Full-order coupled solve for the given right-hand side; returns (velocity, pressure).");
 }
 
 } // namespace PyMOR
