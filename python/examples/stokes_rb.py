@@ -33,6 +33,9 @@ Four things are checked, in the order in which they would break:
     3. a truncated basis is visibly wrong, so the check below has power
     4. the reduced model reproduces the full one once the basis spans the manifold
 
+Serial only, and it says so rather than hanging: the coupled solve is not yet MPI-aware. The
+thermal block examples are the parallel ones.
+
 Run from the repository root::
 
     python python/examples/stokes_rb.py
@@ -42,6 +45,7 @@ import numpy as np
 from pymor.algorithms.pod import pod
 from pymor.parameters.base import Mu
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
+from pymor.tools import mpi
 
 from exadg import forced
 from exadg.mor.models.saddle_point import saddle_point_model
@@ -51,6 +55,19 @@ N_TRAIN, N_TEST, N_MODES = 20, 5, 4
 
 
 def main():
+    # Returning rather than raising, and before anything is built. Under pymor.tools.mpi only
+    # rank 0 runs this script and the others wait in the event loop, which rank 0 shuts down by
+    # calling quit() *after* the script finishes -- so an exception here would leave them waiting
+    # forever. The model constructor is collective, so building it on rank 0 alone hangs too;
+    # that is what this check exists to prevent.
+    if mpi.parallel:
+        print(
+            "stokes_rb.py is serial: the coupled solve is not MPI-aware yet, so a parallel run "
+            "would deadlock inside ExaDG's GMRES. Run it without mpirun; thermal_block_rb.py is "
+            "the parallel example."
+        )
+        return
+
     fom = forced.ForcedFOM2D(INPUT_FILE, degree=2, refinements=3)
     model, (velocity, pressure) = saddle_point_model(fom)
     n_parameters = model.parameters["mu"]

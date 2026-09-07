@@ -149,8 +149,27 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
         Tuple ``(model, (velocity_space, pressure_space))``.
     """
     from pymor.core.logger import set_log_levels
+    from pymor.tools import mpi
 
     set_log_levels({"pymor": "WARNING"})
+
+    # Refusing beats deadlocking. The model has to be built on *every* rank, because each owns a
+    # piece of the mesh and the constructor is collective; called on rank 0 alone while the others
+    # sit in pyMOR's event loop, it hangs with no output at all.
+    #
+    # The stationary models solve this with mpi_wrap_model, and its operator wrapping works here
+    # too -- checked, with mpi_spaces=(ExaDGVectorSpace,). What is missing is the *solve*: the
+    # coupled solver below holds a local model, so under use_with=True only rank 0 would enter
+    # ExaDG's GMRES. pyMOR's own answer to that is use_with=False, which dispatches solve to every
+    # rank, but that path is unreachable in 2025.2.1 -- mpi_wrap_model asserts
+    # isinstance(base_type, Model), an instance, and then does class ...(MPIModel, base_type),
+    # which needs a class. No value satisfies both. So this needs an MPI-aware coupled solver.
+    if mpi.parallel:
+        raise NotImplementedError(
+            "saddle_point_model() is serial for now: the coupled solve is not MPI-aware, so "
+            "running it under pymor.tools.mpi would deadlock rather than fail. Use "
+            "exadg.mor.models.stationary for a parallel model."
+        )
 
     velocity = ExaDGVectorSpace(fom.velocity_space(), id="VELOCITY")
     pressure = ExaDGVectorSpace(fom.pressure_space(), id="PRESSURE")
