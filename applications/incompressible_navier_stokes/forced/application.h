@@ -19,8 +19,8 @@
  *  ______________________________________________________________________
  */
 
-#ifndef APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_STOKES_FORCED_APPLICATION_H_
-#define APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_STOKES_FORCED_APPLICATION_H_
+#ifndef APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_FORCED_APPLICATION_H_
+#define APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_FORCED_APPLICATION_H_
 
 namespace ExaDG
 {
@@ -115,33 +115,44 @@ private:
 };
 
 /**
- * Steady Stokes flow in a box, driven by a parameterised body force.
+ * Steady incompressible flow in a box, driven by a parameterised body force.
  *
- * The first step of the saddle-point reduced-order model, and deliberately the smallest problem
- * that still poses the question. Stokes rather than Navier-Stokes, so there is no nonlinearity
- * and no need for hyper-reduction; steady, so there is no time dimension; coupled rather than
- * split, because only the coupled formulation is a single operator that can be projected.
+ * One application for both halves of the saddle-point reduced-order model. "Equation" selects
+ * Stokes or Navier-Stokes and the convective term is the *only* difference between them, so a
+ * reduced model for one is a controlled comparison for the other: everything that could go wrong
+ * in the block plumbing is shared, and only the nonlinearity is not.
  *
- * Parameters are the viscosity and the forcing amplitudes,
+ * Steady, so there is no time dimension; coupled rather than split, because only the coupled
+ * formulation is a single operator that can be projected.
+ *
+ * Parameters are the viscosity and the forcing amplitudes. For Stokes,
  *
  *     A(nu) = nu K,        rhs(a) = sum_i a_i f_i,
  *
- * both exactly affine. The viscosity is *constant in space*: it is the Reynolds number of the
- * problem and nothing else, which keeps the affine decomposition exact and the physics honest.
- * A blockwise viscosity would be neither -- and would not even be affine here, since the
- * interior-face viscosity is a harmonic mean of the two sides.
+ * both exactly affine. The viscosity is *constant in space*: it is the inverse Reynolds number
+ * of the problem and nothing else, which keeps the affine decomposition exact. A blockwise
+ * viscosity would not even be affine here, since the interior-face viscosity is a harmonic mean
+ * of the two sides.
  *
- * Note that both parameters have analytically known effects, and that is the point at this
- * stage. The solution is linear in the amplitudes, and if (u, p) solves at nu = 1 then
+ * **Stokes is a verification problem, not a benchmark.** Both parameters have analytically known
+ * effects: the solution is linear in the amplitudes, and if (u, p) solves at nu = 1 then
  * (u / nu, p) solves at nu, because the velocity is discretely divergence free. So a reduced
  * basis of P + 1 modes must reproduce the full-order model to machine precision, and anything
- * else is a bug in the saddle-point projection rather than an approximation error. This is a
- * verification problem; the reduction benchmark is the Navier-Stokes step that follows.
+ * else is a bug in the saddle-point projection rather than an approximation error. That exact
+ * answer is what makes it worth running first; the reduction benchmark is Navier-Stokes.
+ *
+ * With the convective term on, neither property survives -- the solution is no longer linear in
+ * the amplitudes and no longer scales with nu -- and the Reynolds number has to be chosen so
+ * that the nonlinearity actually matters while a steady solution still exists.
  *
  * Boundary conditions are homogeneous throughout -- no-slip on three sides and a do-nothing
  * outflow at x = 1 -- for two reasons. There is no Dirichlet lifting, so the right-hand side
  * stays affine in the amplitudes alone; and the outflow pins the pressure level, so the reduced
  * saddle-point system inherits no nullspace. A lid-driven cavity would fail on both counts.
+ *
+ * The velocity space is discontinuous (SpatialDiscretization::L2, ExaDG's default). ExaDG offers
+ * no continuous-Galerkin option for incompressible flow -- the choice is L2 or HDIV -- so this is
+ * a property of the solver rather than of this application.
  */
 template<int dim, typename Number>
 class Application : public ApplicationBase<dim, Number>
@@ -159,6 +170,13 @@ public:
 
     prm.enter_subsection("Application");
     {
+      prm.add_parameter("Equation",
+                        equation,
+                        "Stokes or NavierStokes. The only difference is the convective term, so "
+                        "the two are the same problem with and without the nonlinearity -- which "
+                        "is what makes a reduced model for one a controlled comparison for the "
+                        "other.",
+                        dealii::Patterns::Selection("Stokes|NavierStokes"));
       prm.add_parameter("Viscosity",
                         viscosity,
                         "Kinematic viscosity, constant in space. With a unit box and unit "
@@ -188,13 +206,28 @@ public:
     return viscosity;
   }
 
+  /** "Stokes" or "NavierStokes"; the convective term is the only difference. */
+  std::string
+  get_equation() const
+  {
+    return equation;
+  }
+
 private:
   void
   set_parameters() final
   {
     // MATHEMATICAL MODEL
     this->param.problem_type             = ProblemType::Steady;
-    this->param.equation_type            = EquationType::Stokes;
+    this->param.equation_type            = equation == "Stokes" ?
+                                             EquationType::Stokes :
+                                             EquationType::NavierStokes;
+
+    // A steady solver has no time level to lag the convective term behind, so ExaDG requires it
+    // implicitly. That is also what the reduced model needs: an implicit convective term makes
+    // the (1,1) block depend on the current velocity, which is precisely the Jacobian a Newton
+    // iteration -- full order or reduced -- has to be handed.
+    this->param.treatment_of_convective_term = TreatmentOfConvectiveTerm::Implicit;
     this->param.formulation_viscous_term = FormulationViscousTerm::LaplaceFormulation;
     this->param.right_hand_side          = true;
 
@@ -234,13 +267,27 @@ private:
     // COUPLED SOLVER
     this->param.solver_data_coupled    = SolverData(1e4, 1.e-14, 1.e-10, LinearSolver::GMRES, 100);
     this->param.preconditioner_coupled = PreconditionerCoupled::BlockTriangular;
-    this->param.update_preconditioner_coupled = false;
 
     // Not InverseMassMatrix for the velocity block: that preconditioner scales by the inverse
     // of scaling_factor_mass, which is zero for a steady problem.
     this->param.preconditioner_velocity_block = MomentumPreconditioner::Multigrid;
     // Stokes: the (1,1) block is the viscous operator alone, with no convective part.
+    // The velocity-block preconditioner deliberately ignores convection, for both equations. It
+    // is only a preconditioner, so leaving the convective term out costs iterations rather than
+    // correctness, and it keeps the block symmetric -- which the Chebyshev smoother below
+    // requires. Measured cost of that choice: the average GMRES count per Newton step grows from
+    // 25 at nu = 1 to 520 at nu = 0.005, and no longer converges at nu = 0.002.
+    //
+    // Switching to ReactionConvectionDiffusion is *not* a drop-in improvement and was measured
+    // to be worse: it makes the block non-symmetric, so Chebyshev's CG eigenvalue estimate
+    // divides by zero, and replacing Chebyshev with a GMRES smoother then failed to converge at
+    // nu = 1 where the original settings need 25 iterations. A convection-aware preconditioner
+    // here is a piece of solver tuning in its own right, not a line to change in passing.
     this->param.multigrid_operator_type_velocity_block = MultigridOperatorType::ReactionDiffusion;
+
+    // Pointless while the preconditioner ignores convection: it does not depend on the
+    // linearisation velocity that Newton updates.
+    this->param.update_preconditioner_coupled = false;
     this->param.multigrid_data_velocity_block.smoother_data.smoother = MultigridSmoother::Chebyshev;
     this->param.multigrid_data_velocity_block.coarse_problem.solver =
       MultigridCoarseGridSolver::Chebyshev;
@@ -353,6 +400,9 @@ private:
     return pp;
   }
 
+  // "Stokes" or "NavierStokes": the convective term is the only difference between them
+  std::string  equation      = "Stokes";
+
   double       viscosity     = 1.0;
   unsigned int modes_per_dim = 2;
   double       forcing_width = 0.15;
@@ -365,4 +415,4 @@ private:
 
 #include <exadg/incompressible_navier_stokes/user_interface/implement_get_application.h>
 
-#endif /* APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_STOKES_FORCED_APPLICATION_H_ */
+#endif /* APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_FORCED_APPLICATION_H_ */

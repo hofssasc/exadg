@@ -15,13 +15,14 @@
         "RefineTimeMax": "0"
     },
     "Application": {
+        "Equation": "Stokes",
         "Viscosity": "1.0",
         "ForcingModesPerDim": "2",
         "ForcingWidth": "0.15"
     },
     "Output": {
-        "OutputDirectory": "output/stokes_forced/",
-        "OutputName": "stokes_forced",
+        "OutputDirectory": "output/forced/",
+        "OutputName": "forced",
         "WriteOutput": "false"
     }
 }
