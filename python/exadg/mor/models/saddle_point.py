@@ -39,11 +39,62 @@ from pathlib import Path
 from pymor.core.exceptions import InversionError
 from pymor.models.saddle_point import SaddlePointModel
 from pymor.operators.constructions import LincombOperator, VectorOperator
+from pymor.operators.interface import Operator
 from pymor.parameters.functionals import ConstantParameterFunctional, ProjectionParameterFunctional
 from pymor.solvers.interface import Solver
 
 from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace
 from exadg.mor.models.stationary import parameter_names
+
+
+class ExaDGNonlinearMomentum(Operator):
+    """A(u), the momentum block of a Navier-Stokes system.
+
+    Nonlinear in the velocity through the convective term, which is what makes the whole model
+    nonlinear -- B stays linear, so the Jacobian of the block system is [[A'(u), B*], [B, 0]] and
+    only this block changes with the state.
+
+    A(u) is evaluated as N(u, p = 0). The pressure enters the momentum equation only through
+    B* p, so dropping it leaves exactly the momentum operator; checked at 3e-17 relative rather
+    than assumed, since the whole point of handing pyMOR A and B separately is that it assembles
+    the same residual ExaDG solves.
+    """
+
+    linear = False
+
+    def __init__(self, space, pressure_space, fom, name="A(u)"):
+        self.space = space
+        self.pressure_space = pressure_space
+        self.fom = fom
+        self.name = name
+
+        self.source = self.range = space
+        self.parameters_own = {}
+
+    def apply(self, U, mu=None):
+        assert U in self.source
+
+        zero_pressure = self.pressure_space.impl.zero_vector()
+
+        return self.range.make_array([
+            self.range.make_vector(self.fom.apply_nonlinear(u.impl, zero_pressure)[0])
+            for u in U.vectors
+        ])
+
+    def jacobian(self, U, mu=None):
+        """A'(u), which pyMOR's Newton iteration asks for at each step.
+
+        Not the exact derivative of :meth:`apply`: ExaDG integrates the convective term with an
+        over-integration rule and its linearisation with a cheaper one, so the two differ by
+        about 1e-4 relative at realistic velocities. A Newton iteration on it converges linearly
+        rather than quadratically, which costs iterations and nothing else -- the solution is
+        defined by the residual.
+        """
+        assert len(U) == 1
+
+        return ExaDGOperator(
+            self.space, self.fom.jacobian_momentum(U.vectors[0].impl), name="A'(u)"
+        )
 
 
 class ExaDGCoupledSolver(Solver):
@@ -155,7 +206,10 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
     velocity = ExaDGVectorSpace(fom.velocity_space(), id="VELOCITY")
     pressure = ExaDGVectorSpace(fom.pressure_space(), id="PRESSURE")
 
-    A = ExaDGOperator(velocity, fom.momentum(), name="A")
+    if fom.is_nonlinear:
+        A = ExaDGNonlinearMomentum(velocity, pressure, fom)
+    else:
+        A = ExaDGOperator(velocity, fom.momentum(), name="A")
     B = ExaDGOperator(velocity, fom.divergence(), name="B", range_space=pressure)
 
     shape = list(fom.parameter_shape)

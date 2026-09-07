@@ -1,0 +1,29 @@
+{
+    "General": {
+        "Precision": "double",
+        "Dim": "2",
+        "IsTest": "false"
+    },
+    "SpatialResolution": {
+        "DegreeMin": "2",
+        "DegreeMax": "2",
+        "RefineSpaceMin": "4",
+        "RefineSpaceMax": "4"
+    },
+    "TemporalResolution": {
+        "RefineTimeMin": "0",
+        "RefineTimeMax": "0"
+    },
+    "Application": {
+        "Equation": "NavierStokes",
+        "Viscosity": "0.02",
+        "SolverTolerance": "1.e-12",
+        "ForcingModesPerDim": "2",
+        "ForcingWidth": "0.15"
+    },
+    "Output": {
+        "OutputDirectory": "output/forced_navier_stokes/",
+        "OutputName": "forced_navier_stokes",
+        "WriteOutput": "false"
+    }
+}

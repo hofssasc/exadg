@@ -322,11 +322,18 @@ public:
    * set once when the operator is handed out. pyMOR holds Jacobians at several states during a
    * Newton iteration, and an operator that read whatever ExaDG happened to have installed would
    * quietly become the Jacobian at somebody else's state.
+   *
+   * ExaDG keeps a *pointer* to the linearisation velocity -- set_solution_linearization()
+   * forwards to set_velocity_ptr() -- so the vector has to outlive every use of it. pyMOR
+   * discards a Jacobian as soon as its Newton step is done, so a vector owned by this object
+   * would leave ExaDG dereferencing freed memory, which it does: a segmentation fault inside
+   * update_ghost_values. The model owns it instead, and the model outlives every operator it
+   * hands out.
    */
   class Jacobian : public PyMOR::LinearOperator<VectorType>
   {
   public:
-    Jacobian(std::shared_ptr<ForcedFOM<dim>> fom, VectorType const & velocity)
+    Jacobian(std::shared_ptr<ForcedFOM<dim>> fom, std::shared_ptr<VectorType> velocity)
       : fom(fom), linearization(velocity)
     {
     }
@@ -334,10 +341,10 @@ public:
     void
     apply(VectorType & dst, VectorType const & src) const override
     {
-      auto & momentum = fom->pde_operator->get_momentum_operator();
+      fom->install_linearization(linearization);
 
+      auto & momentum = fom->pde_operator->get_momentum_operator();
       momentum.set_scaling_factor_mass_operator(0.0);
-      momentum.set_solution_linearization(linearization);
       momentum.vmult(dst, src);
     }
 
@@ -357,7 +364,7 @@ public:
   private:
     std::shared_ptr<ForcedFOM<dim>> fom;
 
-    VectorType const linearization;
+    std::shared_ptr<VectorType> const linearization;
   };
 
   /// The velocity mass matrix. Block diagonal for a discontinuous space, so the inverse is
@@ -570,7 +577,7 @@ public:
     if(not is_nonlinear())
       return nullptr;
 
-    return std::make_shared<Jacobian>(shared_self(), velocity);
+    return std::make_shared<Jacobian>(shared_self(), std::make_shared<VectorType>(velocity));
   }
 
   /**
@@ -587,6 +594,12 @@ public:
     pde_operator->initialize_block_vector_velocity_pressure(solution);
     solution = 0.0;
 
+    // A Krylov or Newton failure is an answer, not a crash. deal.II throws
+    // SolverControl::NoConvergence, and letting it escape aborts the interpreter -- which is a
+    // poor way to tell a greedy that one training parameter is out of reach. Declining is what
+    // the interface promises, and what lets a caller skip that parameter and carry on.
+    try
+    {
     if(application->get_parameters().nonlinear_problem_has_to_be_solved())
     {
       // ExaDG's nonlinear solve takes the body force alone; the pressure equation of a steady
@@ -612,6 +625,12 @@ public:
                                          application->get_parameters()
                                            .update_preconditioner_coupled,
                                          0.0 /* scaling_factor_mass: steady */);
+    }
+
+    }
+    catch(dealii::ExceptionBase const &)
+    {
+      return false;
     }
 
     pde_operator->adjust_pressure_level_if_undefined(solution.block(1), 0.0);
@@ -653,6 +672,20 @@ public:
                         {field},
                         {"forcing"},
                         true /* vector valued */);
+  }
+
+  /**
+   * Points ExaDG's momentum operator at a linearisation velocity, and keeps it alive.
+   *
+   * ExaDG stores the pointer, so ownership has to sit somewhere that outlives every Jacobian
+   * pyMOR builds and throws away during a Newton iteration. Here is that somewhere.
+   */
+  void
+  install_linearization(std::shared_ptr<VectorType> const & velocity)
+  {
+    installed_linearization = velocity;
+
+    pde_operator->get_momentum_operator().set_solution_linearization(*installed_linearization);
   }
 
   /// Number of forcing modes, i.e. of parameters.
@@ -750,6 +783,9 @@ private:
   std::shared_ptr<OperatorCoupled<dim, Number>>     pde_operator;
 
   MassOperator<dim, 1, Number> pressure_mass;
+
+  // whatever ExaDG's momentum operator currently points at; see install_linearization()
+  std::shared_ptr<VectorType> installed_linearization;
 };
 
 template<int dim>
