@@ -125,25 +125,30 @@ private:
  * Steady, so there is no time dimension; coupled rather than split, because only the coupled
  * formulation is a single operator that can be projected.
  *
- * Parameters are the viscosity and the forcing amplitudes. For Stokes,
+ * The P parameters are the forcing amplitudes,
  *
- *     A(nu) = nu K,        rhs(a) = sum_i a_i f_i,
+ *     A = nu K (fixed),    rhs(a) = sum_i a_i f_i,
  *
- * both exactly affine. The viscosity is *constant in space*: it is the inverse Reynolds number
- * of the problem and nothing else, which keeps the affine decomposition exact. A blockwise
+ * so the right-hand side is exactly affine and the operator does not depend on the parameter at
+ * all. The viscosity is *constant in space* -- it is the inverse Reynolds number and nothing
+ * else -- and it is a setting rather than a parameter, because ExaDG bakes it into the viscous
+ * kernel at setup together with the interior penalty parameter derived from it. A blockwise
  * viscosity would not even be affine here, since the interior-face viscosity is a harmonic mean
  * of the two sides.
  *
- * **Stokes is a verification problem, not a benchmark.** Both parameters have analytically known
- * effects: the solution is linear in the amplitudes, and if (u, p) solves at nu = 1 then
- * (u / nu, p) solves at nu, because the velocity is discretely divergence free. So a reduced
- * basis of P + 1 modes must reproduce the full-order model to machine precision, and anything
- * else is a bug in the saddle-point projection rather than an approximation error. That exact
- * answer is what makes it worth running first; the reduction benchmark is Navier-Stokes.
+ * **Stokes is a verification problem, not a benchmark.** The solution is linear in the
+ * amplitudes,
  *
- * With the convective term on, neither property survives -- the solution is no longer linear in
- * the amplitudes and no longer scales with nu -- and the Reynolds number has to be chosen so
- * that the nonlinearity actually matters while a steady solution still exists.
+ *     u(a) = sum_i a_i u_i,    p(a) = sum_i a_i p_i,
+ *
+ * so the solution manifold is exactly P-dimensional in each block and a reduced basis of P
+ * velocity and P pressure modes must reproduce the full-order model to machine precision.
+ * Anything else is a bug in the saddle-point projection rather than an approximation error.
+ * That exact answer is what makes it worth running first; the benchmark is Navier-Stokes.
+ *
+ * With the convective term on that property is gone -- the solution is no longer linear in the
+ * amplitudes -- and the Reynolds number has to be chosen so that the nonlinearity actually
+ * matters while a steady solution still exists.
  *
  * Boundary conditions are homogeneous throughout -- no-slip on three sides and a do-nothing
  * outflow at x = 1 -- for two reasons. There is no Dirichlet lifting, so the right-hand side
