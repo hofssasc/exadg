@@ -509,6 +509,49 @@ public:
   }
 
   /**
+   * Whether the operator depends on the state, i.e. whether solving needs a Newton iteration.
+   *
+   * The Python layer builds a different pyMOR model for the two: a linear saddle point is
+   * projected once, a nonlinear one has to carry its residual and Jacobian so that the *reduced*
+   * model can run its own Newton iteration -- which it must, since the reduced Jacobian is a
+   * small dense matrix that ExaDG knows nothing about.
+   */
+  virtual bool
+  is_nonlinear() const
+  {
+    return false;
+  }
+
+  /**
+   * N(u, p), the nonlinear operator, *without* the right-hand side.
+   *
+   * pyMOR's convention is that a model solves operator(U) = rhs, so the forcing is subtracted by
+   * the model rather than by the operator. Returns false for a model that is linear, where the
+   * blocks say everything already.
+   */
+  virtual bool
+  apply_nonlinear(VectorType const & /*u*/,
+                  VectorType const & /*p*/,
+                  VectorType & /*du*/,
+                  VectorType & /*dp*/)
+  {
+    return false;
+  }
+
+  /**
+   * The (1,1) block of the Jacobian, linearised at the given velocity.
+   *
+   * Only that block depends on the state: B is linear, so the Jacobian of the whole system is
+   * [[A'(u), B*], [B, 0]] and the rest is unchanged. Returns nullptr for a linear model, whose
+   * momentum() is already its own Jacobian.
+   */
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  jacobian_momentum(VectorType const & /*velocity*/)
+  {
+    return nullptr;
+  }
+
+  /**
    * The full-order coupled solve for the given right-hand side.
    *
    * Takes the right-hand side rather than the parameters, because that is pyMOR's contract:

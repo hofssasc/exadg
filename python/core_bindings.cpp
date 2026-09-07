@@ -293,6 +293,22 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def("divergence", &SaddlePointModel<V>::divergence)
     .def("velocity_product", &SaddlePointModel<V>::velocity_product)
     .def("pressure_product", &SaddlePointModel<V>::pressure_product)
+    .def_property_readonly("is_nonlinear", &SaddlePointModel<V>::is_nonlinear)
+    .def(
+      "apply_nonlinear",
+      [](SaddlePointModel<V> & m, V const & u, V const & p) -> py::object {
+        auto du = m.velocity_space()->zero_vector();
+        auto dp = m.pressure_space()->zero_vector();
+
+        if(not m.apply_nonlinear(u, p, *du, *dp))
+          return py::none();
+
+        return py::make_tuple(du, dp);
+      },
+      py::arg("u"),
+      py::arg("p"),
+      "N(u, p) without the right-hand side; returns (velocity, pressure), or None if linear.")
+    .def("jacobian_momentum", &SaddlePointModel<V>::jacobian_momentum, py::arg("velocity"))
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)

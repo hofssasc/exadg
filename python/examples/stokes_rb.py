@@ -50,12 +50,13 @@ from pymor.tools import mpi
 from exadg.mor.models.saddle_point import mpi_saddle_point_model
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input.json"
+DEGREE, REFINEMENTS = 2, 3
 N_TRAIN, N_TEST, N_MODES = 20, 5, 4
 
 
 def main():
     model, (velocity, pressure) = mpi_saddle_point_model(
-        "forced", "ForcedFOM2D", INPUT_FILE, degree=2, refinements=3
+        "forced", "ForcedFOM2D", INPUT_FILE, degree=DEGREE, refinements=REFINEMENTS
     )
     n_parameters = model.parameters["mu"]
 
@@ -124,7 +125,9 @@ def main():
         # application object lives on each rank and rank 0 has no handle on the others.
         from exadg import forced
 
-        forcing = forced.ForcedFOM2D(INPUT_FILE, degree=2, refinements=3).write_forcing(
+        forcing = forced.ForcedFOM2D(
+            INPUT_FILE, degree=DEGREE, refinements=REFINEMENTS
+        ).write_forcing(
             "output/pymor", "stokes_forcing", worst_mu["mu"].tolist()
         )
 

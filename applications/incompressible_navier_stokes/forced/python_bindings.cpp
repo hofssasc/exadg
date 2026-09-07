@@ -128,11 +128,6 @@ public:
                 dealii::ExcMessage("This model needs the coupled solver; set "
                                    "TemporalDiscretization::BDFCoupledSolution."));
 
-    // Steady: no mass term in the (1,1) block. ExaDG sets this inside solve_linear_problem(),
-    // which a reduced-order model never calls, so it has to be set once here -- otherwise the
-    // operator that gets projected is not the operator that gets solved.
-    pde_operator->get_momentum_operator().set_scaling_factor_mass_operator(0.0);
-
     // The pressure inner product. ExaDG carries a velocity mass operator but no pressure one,
     // since nothing in a monolithic solve needs it; a POD of pressure snapshots does.
     MassOperatorData<dim, Number> pressure_mass_data;
@@ -248,6 +243,10 @@ public:
     void
     apply(VectorType & dst, VectorType const & src) const override
     {
+      // Set here rather than once at construction: ExaDG's solve_nonlinear_problem() resets the
+      // factor to 1.0 on every call, and a steady residual carries no mass term -- so an operator
+      // that trusted the constructor would silently become A + M after the first solve.
+      fom->pde_operator->get_momentum_operator().set_scaling_factor_mass_operator(0.0);
       fom->pde_operator->get_momentum_operator().vmult(dst, src);
     }
 
@@ -314,6 +313,51 @@ public:
 
   private:
     std::shared_ptr<ForcedFOM<dim>> fom;
+  };
+
+  /**
+   * A'(u), the (1,1) block linearised at a given velocity.
+   *
+   * The linearisation velocity is stored here and re-installed before every apply, rather than
+   * set once when the operator is handed out. pyMOR holds Jacobians at several states during a
+   * Newton iteration, and an operator that read whatever ExaDG happened to have installed would
+   * quietly become the Jacobian at somebody else's state.
+   */
+  class Jacobian : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    Jacobian(std::shared_ptr<ForcedFOM<dim>> fom, VectorType const & velocity)
+      : fom(fom), linearization(velocity)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      auto & momentum = fom->pde_operator->get_momentum_operator();
+
+      momentum.set_scaling_factor_mass_operator(0.0);
+      momentum.set_solution_linearization(linearization);
+      momentum.vmult(dst, src);
+    }
+
+    /// The convective term is not self-adjoint; the transpose would have to be implemented.
+    bool
+    is_symmetric() const override
+    {
+      return false;
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "A'(u)";
+    }
+
+  private:
+    std::shared_ptr<ForcedFOM<dim>> fom;
+
+    VectorType const linearization;
   };
 
   /// The velocity mass matrix. Block diagonal for a discontinuous space, so the inverse is
@@ -478,6 +522,55 @@ public:
   pressure_rhs() override
   {
     return assemble_rhs(std::vector<double>(n_modes(), 0.0)).second;
+  }
+
+  bool
+  is_nonlinear() const override
+  {
+    return application->get_parameters().nonlinear_problem_has_to_be_solved();
+  }
+
+  /**
+   * N(u, p) without the right-hand side.
+   *
+   * ExaDG's steady residual already has the body force subtracted, so it is added back here.
+   * Both terms read the same forcing amplitudes, so they cancel exactly whatever those are --
+   * which is what keeps this a function of (u, p) alone.
+   */
+  bool
+  apply_nonlinear(VectorType const & u, VectorType const & p, VectorType & du, VectorType & dp)
+    override
+  {
+    if(not is_nonlinear())
+      return false;
+
+    BlockVectorType state, residual;
+    pde_operator->initialize_block_vector_velocity_pressure(state);
+    pde_operator->initialize_block_vector_velocity_pressure(residual);
+
+    state.block(0) = u;
+    state.block(1) = p;
+
+    pde_operator->evaluate_nonlinear_residual_steady(residual, state, 0.0 /* time */);
+
+    VectorType body_force(u);
+    body_force = 0.0;
+    pde_operator->evaluate_add_body_force_term(body_force, 0.0);
+
+    du = residual.block(0);
+    du += body_force;
+    dp = residual.block(1);
+
+    return true;
+  }
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  jacobian_momentum(VectorType const & velocity) override
+  {
+    if(not is_nonlinear())
+      return nullptr;
+
+    return std::make_shared<Jacobian>(shared_self(), velocity);
   }
 
   /**
