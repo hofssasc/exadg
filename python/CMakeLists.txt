@@ -34,15 +34,30 @@ SET(EXADG_PYTHON_VERSION "0.1.0")
 
 FILE(MAKE_DIRECTORY ${EXADG_PYTHON_PACKAGE_DIR}/exadg)
 FILE(MAKE_DIRECTORY ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor)
+FILE(MAKE_DIRECTORY ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor/models)
 
 CONFIGURE_FILE(pyproject.toml.in ${EXADG_PYTHON_PACKAGE_DIR}/pyproject.toml @ONLY)
 CONFIGURE_FILE(exadg/__init__.py.in ${EXADG_PYTHON_PACKAGE_DIR}/exadg/__init__.py @ONLY)
 
+# The vector and operator vocabulary, bound once for the whole process. pybind11 registers types
+# in a process-global map, so a second application module binding the same C++ vector type would
+# abort with "type is already registered" as soon as both were imported; every application module
+# therefore imports this one and returns objects of its types.
+EXADG_ADD_PYTHON_MODULE(_core core_bindings.cpp)
+
 # The model order reduction subpackage is plain Python and is copied rather than configured.
 # COPYONLY keeps the build tree in step when a source file changes.
-FOREACH(_mor_source __init__.py pymor_binding.py)
+FOREACH(_mor_source __init__.py binding.py)
   CONFIGURE_FILE(exadg/mor/${_mor_source}
                  ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor/${_mor_source} COPYONLY)
+ENDFOREACH()
+
+# One module per pyMOR Model type, not per application: what distinguishes them is mathematical
+# structure -- stationary, saddle point, Newton, time stepping -- and two applications sharing a
+# structure share a module.
+FOREACH(_model_source __init__.py stationary.py)
+  CONFIGURE_FILE(exadg/mor/models/${_model_source}
+                 ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor/models/${_model_source} COPYONLY)
 ENDFOREACH()
 
 INSTALL(FILES ${EXADG_PYTHON_PACKAGE_DIR}/pyproject.toml

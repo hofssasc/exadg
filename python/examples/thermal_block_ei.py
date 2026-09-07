@@ -51,7 +51,7 @@ from pymor.reductors.basic import StationaryRBReductor
 from pymor.vectorarrays.numpy import NumpyVectorSpace
 
 from exadg import thermal_block
-from exadg.mor.pymor_binding import stationary_model
+from exadg.mor.models.stationary import stationary_model
 
 INPUT_FILE = "applications/poisson/thermal_block/input.json"
 N_TRAIN, N_TEST, N_MODES = 60, 10, 10
@@ -164,7 +164,7 @@ def sweep(field, affine, space, basis, train, test, n_parameters):
             # a rank-deficient collateral basis makes the reduced operator singular
             rom_error = float("nan")
 
-        n_blocks = len(field.operator.restricted(dofs)[0].handle.blocks)
+        n_blocks = len(field.operator.restricted(dofs)[0].handle.active_components)
         print(
             f"  {len(dofs):>6}  {data['errors'][-1]:>11.3e}  {operator_error:>13.3e}  "
             f"{rom_error:>11.3e}  {n_blocks:>3}/{n_parameters}"
@@ -174,7 +174,7 @@ def sweep(field, affine, space, basis, train, test, n_parameters):
         "\nThe interpolated model only reaches the affine reference once the stencil reads every\n"
         "block, i.e. once it has stopped being a reduction of the parameter dependence. The\n"
         "coefficient field here *is* the parameter, so there is no low-dimensional structure for\n"
-        "the greedy to find -- see ExaDGFieldOperator's docstring."
+        "the greedy to find -- see ExaDGParametricOperator's docstring."
     )
 
 

@@ -21,7 +21,7 @@ mpi = ["pymor>=2025.1", "mpi4py"]
 [tool.setuptools]
 # The extension modules are produced by CMake and already staged in this directory, so
 # setuptools only has to package what is here rather than compile anything itself.
-packages = ["exadg", "exadg.mor"]
+packages = ["exadg", "exadg.mor", "exadg.mor.models"]
 include-package-data = true
 
 [tool.setuptools.package-data]

@@ -20,17 +20,23 @@
 
 """pyMOR bindings for ExaDG full-order models.
 
-One module lives here. :mod:`exadg.mor.pymor_binding` dresses the ExaDG vectors and operators
-of the compiled extension in pyMOR's interfaces, so that pyMOR's algorithms run against the
-full-order model without degrees of freedom ever entering Python. All reduction -- basis
-generation, projection, hyper-reduction, error estimation -- is pyMOR's; nothing in this
-package reimplements any of it.
+Two layers live here, and the split is what keeps an application from needing Python at all.
 
-It is imported explicitly rather than re-exported here, so that importing :mod:`exadg.mor`
-does not pull in pyMOR.
+:mod:`exadg.mor.binding` dresses ExaDG's vectors and operators in pyMOR's interfaces. It is
+physics-free: every class wraps one of the abstract types of ``exadg/pymor/interface.h``, so the
+same wrappers serve every application. Degrees of freedom never enter Python.
+
+:mod:`exadg.mor.models` assembles those into pyMOR ``Model`` objects, one module per model type
+rather than per application. A new application therefore costs a ``python_bindings.cpp`` and
+nothing here.
+
+Neither is re-exported, so importing :mod:`exadg.mor` does not pull in pyMOR.
 
 Why this sits in ExaDG rather than in a solver-agnostic package: the binding tracks the C++
-operator API one-for-one. Exposing the linear solve to pyMOR, for instance, meant adding
-``apply_inverse_jacobian`` in C++ and a ``Solver`` in Python in the same change. Keeping the
-two sides in one repository means they are versioned and reviewed together.
+interface one-for-one, and the two sides change together. Exposing the linear solve to pyMOR, for
+instance, meant declaring ``has_inverse`` in C++ and attaching a ``Solver`` in Python in the same
+change. Keeping them in one repository means they are versioned and reviewed together.
+
+All reduction -- basis generation, projection, hyper-reduction, error estimation -- is pyMOR's;
+nothing in this package reimplements any of it.
 """

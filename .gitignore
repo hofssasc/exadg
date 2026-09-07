@@ -6,3 +6,4 @@
 build/
 programs/
 *exadg_revision.h
+output/
