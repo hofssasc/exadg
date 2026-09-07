@@ -34,13 +34,13 @@ independently reduced velocity and pressure spaces would otherwise lose -- leavi
 system that is singular, or a pressure that is noise.
 """
 
-import numpy as np
+from pathlib import Path
+
 from pymor.core.exceptions import InversionError
 from pymor.models.saddle_point import SaddlePointModel
 from pymor.operators.constructions import LincombOperator, VectorOperator
 from pymor.parameters.functionals import ConstantParameterFunctional, ProjectionParameterFunctional
 from pymor.solvers.interface import Solver
-from pymor.vectorarrays.block import BlockVectorSpace
 
 from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace
 from exadg.mor.models.stationary import parameter_names
@@ -90,27 +90,47 @@ class ExaDGSaddlePointVisualizer:
     Separate records rather than one, because velocity and pressure live on different DoF
     handlers -- a mixed-order pair has different polynomial degrees, so there is no single set of
     patches to write them on.
+
+    Takes a tuple of arrays the way :class:`~exadg.mor.binding.ExaDGVisualizer` does, so the usual
+    three-way comparison works and produces two records::
+
+        model.visualize((U_fom, U_rom, U_fom - U_rom),
+                        legend=("fom", "rom", "error"), filename="output/compare")
     """
 
     def __init__(self, directory="output/pymor"):
         self.directory = directory
 
     def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
-        base = filename or f"{self.directory}/{title or 'solution'}"
-        velocity, pressure = U.blocks
+        arrays = U if isinstance(U, tuple) else (U,)
 
-        return tuple(
-            array.space.impl.write_vtu(
-                str(base).rsplit("/", 1)[0],
-                str(base).rsplit("/", 1)[-1] + suffix,
-                [array.vectors[0].impl],
-                [name],
+        names = [
+            legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
+            for i in range(len(arrays))
+        ]
+
+        base = Path(filename) if filename else Path(self.directory) / (title or "solution")
+
+        written = []
+        for position, suffix in enumerate(("velocity", "pressure")):
+            blocks = [array.blocks[position] for array in arrays]
+
+            for array in blocks:
+                if len(array) != 1:
+                    raise NotImplementedError(
+                        f"visualize() writes one vector per field, got {len(array)}."
+                    )
+
+            written.append(
+                blocks[0].space.impl.write_vtu(
+                    str(base.parent),
+                    f"{base.name}_{suffix}",
+                    [array.vectors[0].impl for array in blocks],
+                    names,
+                )
             )
-            for array, suffix, name in (
-                (velocity, "_velocity", "velocity"),
-                (pressure, "_pressure", "pressure"),
-            )
-        )
+
+        return tuple(written)
 
 
 def saddle_point_model(fom, parameters=None, coefficients=None, directory="output/pymor"):

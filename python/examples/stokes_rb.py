@@ -21,11 +21,10 @@
 """Saddle-point reduced basis for the ExaDG forced box, driven entirely by pyMOR.
 
 This is a **verification, not a benchmark**. The Stokes solution is linear in the forcing
-amplitudes, so the P solutions at the unit amplitudes span the whole solution manifold and a
-reduced model built on them has to reproduce the full-order model exactly. There is nothing to
-approximate, which is the point: any error that survives is a defect in the saddle-point
-projection rather than an approximation, and there is no truncation error to hide behind. The
-reduction benchmark is the Navier-Stokes case; this is what has to work before it.
+amplitudes, so the manifold is exactly P-dimensional and a basis of P modes has to reproduce the
+full-order model. There is nothing to approximate, which is the point: any error that survives is
+a defect in the saddle-point projection rather than an approximation, with no truncation error to
+hide behind. The reduction benchmark is the Navier-Stokes case; this is what has to work first.
 
 Four things are checked, in the order in which they would break:
 
@@ -48,51 +47,79 @@ from exadg import forced
 from exadg.mor.models.saddle_point import saddle_point_model
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input.json"
+N_TRAIN, N_TEST, N_MODES = 20, 5, 4
 
 
 def main():
     fom = forced.ForcedFOM2D(INPUT_FILE, degree=2, refinements=3)
     model, (velocity, pressure) = saddle_point_model(fom)
-    n_modes = fom.n_modes
+    n_parameters = model.parameters["mu"]
 
-    print(f"velocity dofs     : {velocity.dim}")
-    print(f"pressure dofs     : {pressure.dim}")
-    print(f"forcing modes     : {n_modes}")
+    print(f"velocity dofs      : {velocity.dim}")
+    print(f"pressure dofs      : {pressure.dim}")
+    print(f"parameters         : {n_parameters}")
 
     check_adjoint(model, velocity, pressure)
-    check_block_system(model, n_modes)
+    check_block_system(model, n_parameters)
 
-    # The P solutions at the unit amplitudes. By linearity these span every solution, so this
-    # is the whole manifold rather than a sample of it.
+    rng = np.random.default_rng(0)
+    train = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (N_TRAIN, n_parameters))]
+    test = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (N_TEST, n_parameters))]
+
     snapshots = model.solution_space.empty()
-    for i in range(n_modes):
-        snapshots.append(model.solve(Mu(mu=np.eye(n_modes)[i])))
+    for mu in train:
+        snapshots.append(model.solve(mu))
 
     velocity_snapshots, pressure_snapshots = snapshots.blocks
 
-    rng = np.random.default_rng(0)
-    test = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (5, n_modes))]
+    # A product, not the Euclidean one, in each block: velocity and pressure are different
+    # physical quantities on different spaces and there is no reason for their coefficient
+    # vectors to be comparable.
+    basis_u, singular_u = pod(velocity_snapshots, product=model.u_product, modes=N_MODES)
+    basis_p, singular_p = pod(pressure_snapshots, product=model.p_product, modes=N_MODES)
+    print(f"velocity singular  : {np.array2string(singular_u[:N_MODES], precision=6)}")
+    print(f"pressure singular  : {np.array2string(singular_p[:N_MODES], precision=6)}")
 
-    print(f"\nreduced model, basis size against error over {len(test)} test parameters")
+    print(f"\nbasis size against error over {N_TEST} test parameters")
     print(f"  {'modes':>5}  {'reduced dim':>11}  {'relative error':>14}")
 
-    for size in range(1, n_modes + 1):
-        error, dim = reduce_and_measure(
-            model, velocity_snapshots[:size], pressure_snapshots[:size], test
+    worst_mu, worst_error, reductor, rom = None, None, None, None
+    for size in range(1, N_MODES + 1):
+        errors, this_reductor, this_rom = reduce_and_measure(
+            model, basis_u[:size], basis_p[:size], test
         )
-        print(f"  {size:>5}  {dim:>11}  {error:>14.3e}")
+        print(f"  {size:>5}  {this_rom.solution_space.dim:>11}  {max(errors):>14.3e}")
+
+        worst_mu = test[int(np.argmax(errors))]
+        worst_error, reductor, rom = max(errors), this_reductor, this_rom
 
     print(
         "\nThe last row is the verification: a basis that spans the manifold reproduces the\n"
         "full-order model, and what is left is the solver tolerance times the condition number of\n"
-        "the saddle point. The rows above it are what gives that meaning -- a truncated basis is\n"
+        "the saddle point. The rows above it are what give that meaning -- a truncated basis is\n"
         "visibly wrong, so the last row is a property of the projection and not of the test.\n"
         "\n"
-        "The reduced dimension is larger than twice the number of modes because the reductor\n"
-        "enriches the velocity space with one supremizer per pressure mode. Without them the\n"
-        "reduced velocity and pressure spaces satisfy no discrete inf-sup condition, and the\n"
-        "reduced saddle point is singular or its pressure is noise."
+        "The reduced dimension is three times the mode count, not two: the reductor adds one\n"
+        "supremizer per pressure mode. Without them the reduced velocity and pressure spaces\n"
+        "satisfy no discrete inf-sup condition, and the reduced saddle point is singular or its\n"
+        "pressure is noise."
     )
+
+    # Two records per call, since velocity and pressure live on different DoF handlers.
+    U_fom = model.solve(worst_mu)
+    U_rom = reductor.reconstruct(rom.solve(worst_mu))
+    records = model.visualize(
+        (U_fom, U_rom, U_fom - U_rom),
+        legend=("fom", "rom", "error"),
+        filename="output/pymor/stokes",
+    )
+
+    # The parameter itself, on the same mesh as the field it drives.
+    forcing = fom.write_forcing("output/pymor", "stokes_forcing", worst_mu["mu"].tolist())
+
+    print(f"\nwrote {records[0]}")
+    print(f"      {records[1]}")
+    print(f"      {forcing}")
 
 
 def check_adjoint(model, velocity, pressure):
@@ -109,9 +136,9 @@ def check_adjoint(model, velocity, pressure):
     assert abs(lhs - rhs) / abs(lhs) < 1.0e-12, "B^T is not the adjoint of B"
 
 
-def check_block_system(model, n_modes):
+def check_block_system(model, n_parameters):
     """pyMOR's assembled block operator must agree with ExaDG's coupled solve."""
-    mu = Mu(mu=np.linspace(1.0, -1.0, n_modes))
+    mu = Mu(mu=np.linspace(1.0, -1.0, n_parameters))
 
     U = model.solve(mu)
     rhs = model.rhs.as_range_array(mu)
@@ -121,15 +148,12 @@ def check_block_system(model, n_modes):
     assert residual < 1.0e-9, "the block system is not the one ExaDG solves"
 
 
-def reduce_and_measure(model, velocity_snapshots, pressure_snapshots, test):
-    """Relative error of the reduced model over the test set, in the mixed product."""
-    RB_u = pod(velocity_snapshots, product=model.u_product)[0]
-    RB_p = pod(pressure_snapshots, product=model.p_product)[0]
-
+def reduce_and_measure(model, basis_u, basis_p, test):
+    """Relative errors of the reduced model over the test set, in the mixed product."""
     reductor = SupremizerGalerkinStokesReductor(
         model,
-        RB_u=RB_u,
-        RB_p=RB_p,
+        RB_u=basis_u,
+        RB_p=basis_p,
         u_product=model.u_product,
         p_product=model.p_product,
     )
@@ -137,14 +161,14 @@ def reduce_and_measure(model, velocity_snapshots, pressure_snapshots, test):
 
     product = model.products["mixed"]
 
-    worst = 0.0
+    errors = []
     for mu in test:
-        u_fom = model.solve(mu)
-        u_rom = reductor.reconstruct(rom.solve(mu))
+        U_fom = model.solve(mu)
+        U_rom = reductor.reconstruct(rom.solve(mu))
 
-        worst = max(worst, (u_fom - u_rom).norm(product)[0] / u_fom.norm(product)[0])
+        errors.append((U_fom - U_rom).norm(product)[0] / U_fom.norm(product)[0])
 
-    return worst, rom.solution_space.dim
+    return errors, reductor, rom
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@
 // deal.II
 #include <deal.II/base/mpi.h>
 #include <deal.II/numerics/data_out.h>
+#include <deal.II/numerics/vector_tools.h>
 
 // ExaDG
 #include <exadg/incompressible_navier_stokes/driver.h>
@@ -528,6 +529,39 @@ public:
     return true;
   }
 
+  /**
+   * Writes the body force of a parameter as its own VTU record.
+   *
+   * The forcing is a smooth function, so interpolating it onto the velocity space loses nothing
+   * and puts it on the same mesh as the field it drives.
+   */
+  std::string
+  write_forcing(std::string const &         directory,
+                std::string const &         basename,
+                std::vector<double> const & amplitudes)
+  {
+    AssertThrow(amplitudes.size() == n_modes(),
+                dealii::ExcMessage("Expected " + std::to_string(n_modes()) +
+                                   " amplitudes, got " + std::to_string(amplitudes.size()) + "."));
+
+    application->get_forcing()->set_amplitudes(amplitudes);
+
+    auto field = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*field);
+
+    dealii::VectorTools::interpolate(*pde_operator->get_mapping(),
+                                     pde_operator->get_dof_handler_u(),
+                                     *application->get_forcing(),
+                                     *field);
+
+    return write_fields(pde_operator->get_dof_handler_u(),
+                        directory,
+                        basename,
+                        {field},
+                        {"forcing"},
+                        true /* vector valued */);
+  }
+
   /// Number of forcing modes, i.e. of parameters.
   unsigned int
   n_modes() const
@@ -637,7 +671,13 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("degree")      = 2,
          py::arg("refinements") = 4,
          py::arg("verbose")     = false)
-    .def_property_readonly("n_modes", &ForcedFOM<dim>::n_modes);
+    .def_property_readonly("n_modes", &ForcedFOM<dim>::n_modes)
+    .def("write_forcing",
+         &ForcedFOM<dim>::write_forcing,
+         py::arg("directory"),
+         py::arg("basename"),
+         py::arg("amplitudes"),
+         "Write the body force of a parameter as a VTU record.");
 }
 
 } // namespace IncNS

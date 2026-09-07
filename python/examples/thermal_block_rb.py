@@ -139,8 +139,17 @@ def main():
         legend=("fom", "rom", "error"),
         filename="output/pymor/thermal_block",
     )
+
     if not mpi.parallel:
+        # The parameter itself, next to the field it produced. One value per cell, since the
+        # diffusivity is piecewise constant per block, and exp(mu) because that is what the
+        # coefficient functionals evaluate to -- the parameter is the logarithm.
+        coefficient = space.impl.write_coefficient(
+            "output/pymor", "thermal_block_diffusivity", np.exp(worst["mu"]).tolist()
+        )
+
         print(f"\nwrote {record}")
+        print(f"      {coefficient}")
 
 
 if __name__ == "__main__":

@@ -644,6 +644,48 @@ public:
   // ===========================================================================================
 
   /**
+   * Writes the diffusivity field of a parameter as its own VTU record.
+   *
+   * One value per cell, sampled at its centre, rather than a nodal field: interpolating the
+   * coefficient onto the continuous solution space would smooth exactly the block edges that
+   * make it what it is. deal.II replicates the value to each patch's vertices, and patches are
+   * independent, so the edges stay sharp. Piecewise constant coefficients only.
+   */
+  std::string
+  write_coefficient(std::string const &         directory,
+                    std::string const &         basename,
+                    std::vector<double> const & diffusivity)
+  {
+    AssertThrow(coefficient_degree() == 0,
+                dealii::ExcMessage("write_coefficient() draws one value per cell, which is the "
+                                   "piecewise constant case."));
+    AssertThrow(diffusivity.size() == n_blocks(),
+                dealii::ExcMessage("Expected " + std::to_string(n_blocks()) + " values, got " +
+                                   std::to_string(diffusivity.size()) + "."));
+
+    auto const & dof_handler = pde_operator->get_dof_handler();
+
+    BlockCoefficient<dim> const coefficient(application->get_blocks_per_dim(), diffusivity);
+
+    dealii::Vector<double> cell_values(dof_handler.get_triangulation().n_active_cells());
+    for(auto const & cell : dof_handler.get_triangulation().active_cell_iterators())
+      if(cell->is_locally_owned())
+        cell_values[cell->active_cell_index()] = coefficient.value(cell->center());
+
+    std::string const path =
+      (directory.empty() or directory.back() == '/') ? directory : directory + "/";
+
+    create_directories(path, mpi_comm);
+
+    dealii::DataOut<dim> data_out;
+    data_out.attach_dof_handler(dof_handler);
+    data_out.add_data_vector(cell_values, "diffusivity");
+    data_out.build_patches(*pde_operator->get_mapping(), 1);
+
+    return path + data_out.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+  }
+
+  /**
    * Number of affine components: the blocks for a piecewise constant coefficient, the
    * coefficient degrees of freedom above degree zero. Bound to Python because a script has to
    * size its parameter vectors; everything else pyMOR needs is inherited from FullOrderModel.
@@ -953,7 +995,13 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("degree")      = 3,
          py::arg("refinements") = 4,
          py::arg("verbose")     = false)
-    .def_property_readonly("n_parameters", &ThermalBlockFOM<dim>::n_parameters);
+    .def_property_readonly("n_parameters", &ThermalBlockFOM<dim>::n_parameters)
+    .def("write_coefficient",
+         &ThermalBlockFOM<dim>::write_coefficient,
+         py::arg("directory"),
+         py::arg("basename"),
+         py::arg("diffusivity"),
+         "Write the diffusivity field of a parameter as a VTU record.");
 }
 
 } // namespace ExaDG
