@@ -33,12 +33,12 @@ Four things are checked, in the order in which they would break:
     3. a truncated basis is visibly wrong, so the check below has power
     4. the reduced model reproduces the full one once the basis spans the manifold
 
-Serial only, and it says so rather than hanging: the coupled solve is not yet MPI-aware. The
-thermal block examples are the parallel ones.
-
-Run from the repository root::
+Runs unchanged on any number of ranks::
 
     python python/examples/stokes_rb.py
+    mpirun -n 4 python -m pymor.tools.mpi python/examples/stokes_rb.py
+
+Run from the repository root.
 """
 
 import numpy as np
@@ -47,37 +47,22 @@ from pymor.parameters.base import Mu
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.tools import mpi
 
-from exadg import forced
-from exadg.mor.models.saddle_point import saddle_point_model
+from exadg.mor.models.saddle_point import mpi_saddle_point_model
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input.json"
 N_TRAIN, N_TEST, N_MODES = 20, 5, 4
 
 
 def main():
-    # Returning rather than raising, and before anything is built. Under pymor.tools.mpi only
-    # rank 0 runs this script and the others wait in the event loop, which rank 0 shuts down by
-    # calling quit() *after* the script finishes -- so an exception here would leave them waiting
-    # forever. The model constructor is collective, so building it on rank 0 alone hangs too;
-    # that is what this check exists to prevent.
-    if mpi.parallel:
-        print(
-            "stokes_rb.py is serial: the coupled solve is not MPI-aware yet, so a parallel run "
-            "would deadlock inside ExaDG's GMRES. Run it without mpirun; thermal_block_rb.py is "
-            "the parallel example."
-        )
-        return
-
-    fom = forced.ForcedFOM2D(INPUT_FILE, degree=2, refinements=3)
-    model, (velocity, pressure) = saddle_point_model(fom)
+    model, (velocity, pressure) = mpi_saddle_point_model(
+        "forced", "ForcedFOM2D", INPUT_FILE, degree=2, refinements=3
+    )
     n_parameters = model.parameters["mu"]
 
+    print(f"ranks              : {mpi.size}")
     print(f"velocity dofs      : {velocity.dim}")
     print(f"pressure dofs      : {pressure.dim}")
     print(f"parameters         : {n_parameters}")
-
-    check_adjoint(model, velocity, pressure)
-    check_block_system(model, n_parameters)
 
     rng = np.random.default_rng(0)
     train = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (N_TRAIN, n_parameters))]
@@ -88,6 +73,9 @@ def main():
         snapshots.append(model.solve(mu))
 
     velocity_snapshots, pressure_snapshots = snapshots.blocks
+
+    check_adjoint(model, pressure_snapshots[:1])
+    check_block_system(model, n_parameters)
 
     # A product, not the Euclidean one, in each block: velocity and pressure are different
     # physical quantities on different spaces and there is no reason for their coefficient
@@ -131,20 +119,30 @@ def main():
         filename="output/pymor/stokes",
     )
 
-    # The parameter itself, on the same mesh as the field it drives.
-    forcing = fom.write_forcing("output/pymor", "stokes_forcing", worst_mu["mu"].tolist())
+    if not mpi.parallel:
+        # The parameter itself, on the same mesh as the field it drives. Serial only: the
+        # application object lives on each rank and rank 0 has no handle on the others.
+        from exadg import forced
 
-    print(f"\nwrote {records[0]}")
-    print(f"      {records[1]}")
-    print(f"      {forcing}")
+        forcing = forced.ForcedFOM2D(INPUT_FILE, degree=2, refinements=3).write_forcing(
+            "output/pymor", "stokes_forcing", worst_mu["mu"].tolist()
+        )
+
+        print(f"\nwrote {records[0]}")
+        print(f"      {records[1]}")
+        print(f"      {forcing}")
 
 
-def check_adjoint(model, velocity, pressure):
-    """B and B^T must be adjoint, or pyMOR's (1,2) block is not ExaDG's."""
+def check_adjoint(model, p):
+    """B and B^T must be adjoint, or pyMOR's (1,2) block is not ExaDG's.
+
+    Probed at u = B^T p rather than at a snapshot. A snapshot velocity is discretely divergence
+    free, so B u is zero to solver tolerance and the relative comparison would be dividing
+    roundoff by roundoff -- it reads 1e-5 and means nothing. B^T p is also the direction the
+    reductor needs the adjoint for, since the supremizer is u_product^-1 B^T p.
+    """
     B = model.operator.blocks[1, 0]
-
-    u = velocity.random(1, distribution="normal", random_state=0)
-    p = pressure.random(1, distribution="normal", random_state=1)
+    u = B.apply_adjoint(p)
 
     lhs = B.apply(u).inner(p)[0, 0]
     rhs = u.inner(B.apply_adjoint(p))[0, 0]

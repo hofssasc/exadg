@@ -149,27 +149,8 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
         Tuple ``(model, (velocity_space, pressure_space))``.
     """
     from pymor.core.logger import set_log_levels
-    from pymor.tools import mpi
 
     set_log_levels({"pymor": "WARNING"})
-
-    # Refusing beats deadlocking. The model has to be built on *every* rank, because each owns a
-    # piece of the mesh and the constructor is collective; called on rank 0 alone while the others
-    # sit in pyMOR's event loop, it hangs with no output at all.
-    #
-    # The stationary models solve this with mpi_wrap_model, and its operator wrapping works here
-    # too -- checked, with mpi_spaces=(ExaDGVectorSpace,). What is missing is the *solve*: the
-    # coupled solver below holds a local model, so under use_with=True only rank 0 would enter
-    # ExaDG's GMRES. pyMOR's own answer to that is use_with=False, which dispatches solve to every
-    # rank, but that path is unreachable in 2025.2.1 -- mpi_wrap_model asserts
-    # isinstance(base_type, Model), an instance, and then does class ...(MPIModel, base_type),
-    # which needs a class. No value satisfies both. So this needs an MPI-aware coupled solver.
-    if mpi.parallel:
-        raise NotImplementedError(
-            "saddle_point_model() is serial for now: the coupled solve is not MPI-aware, so "
-            "running it under pymor.tools.mpi would deadlock rather than fail. Use "
-            "exadg.mor.models.stationary for a parallel model."
-        )
 
     velocity = ExaDGVectorSpace(fom.velocity_space(), id="VELOCITY")
     pressure = ExaDGVectorSpace(fom.pressure_space(), id="PRESSURE")
@@ -245,3 +226,190 @@ def _pressure_rhs(space, fom):
         return None
 
     return _as_operator(space, pressure_rhs)
+
+
+def _local_coupled_solve(model, f, g):
+    """Solve on every rank. Called through mpi.call, so the arguments arrive as local objects."""
+    velocity_space, pressure_space = model.operator.source.subspaces
+    fom = model.operator.solver.fom
+
+    velocities, pressures = [], []
+    for i in range(len(f)):
+        result = fom.solve(f.vectors[i].impl, g.vectors[i].impl)
+
+        if result is None:
+            raise InversionError("the application declined to solve this system")
+
+        u, p = result
+        velocities.append(velocity_space.make_vector(u))
+        pressures.append(pressure_space.make_vector(p))
+
+    return velocity_space.make_array(velocities), pressure_space.make_array(pressures)
+
+
+def _take(pair, index):
+    """Split the solve's result, so each block can be managed as its own MPI object."""
+    return pair[index]
+
+
+class MPIExaDGCoupledSolver(Solver):
+    """The coupled solve, dispatched to every rank.
+
+    :class:`ExaDGCoupledSolver` holds one model, which is rank 0's; calling it in parallel would
+    enter ExaDG's GMRES on rank 0 alone and hang, since that solve is collective. This one holds
+    the :class:`~pymor.tools.mpi.ObjectId` of the local models instead and drives them all through
+    ``mpi.call``.
+
+    The solve happens once and returns both blocks; the two follow-up calls only split that pair,
+    because an MPIVectorArray needs an ObjectId of its own.
+    """
+
+    def __init__(self, models_id):
+        self.models_id = models_id
+
+    def _solve(self, operator, V, mu, initial_guess):
+        from pymor.tools import mpi
+
+        f, g = V.blocks
+        pair = mpi.call(
+            mpi.function_call_manage, _local_coupled_solve, self.models_id,
+            f.impl.obj_id, g.impl.obj_id,
+        )
+
+        velocity_space, pressure_space = operator.source.subspaces
+
+        solution = operator.source.make_array([
+            velocity_space.make_array(mpi.call(mpi.function_call_manage, _take, pair, 0)),
+            pressure_space.make_array(mpi.call(mpi.function_call_manage, _take, pair, 1)),
+        ])
+
+        return solution, {}
+
+
+def _local_write_block(model, position, array_ids, directory, basename, names):
+    """Write one block's fields on every rank. deal.II's pvtu record is collective.
+
+    The ids are resolved here rather than by mpi.function_call, which only maps arguments that
+    are themselves ObjectIds and not lists of them.
+    """
+    from pymor.tools import mpi
+
+    space = model.operator.source.subspaces[position]
+    arrays = [mpi.get_object(array_id) for array_id in array_ids]
+
+    return space.impl.write_vtu(
+        directory, basename, [array.vectors[0].impl for array in arrays], names
+    )
+
+
+class MPIExaDGSaddlePointVisualizer:
+    """The block visualizer, dispatched to every rank.
+
+    pyMOR's own MPIVisualizer cannot wrap this one: it assumes each array is an MPIVectorArray and
+    reads ``u.impl.obj_id``, which a BlockVectorArray does not have. Here the blocks are taken
+    apart first and each is dispatched on its own, which is what deal.II wants anyway -- velocity
+    and pressure go to separate records.
+    """
+
+    def __init__(self, models_id, directory="output/pymor"):
+        self.models_id = models_id
+        self.directory = directory
+
+    def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
+        from pymor.tools import mpi
+
+        arrays = U if isinstance(U, tuple) else (U,)
+        names = [
+            legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
+            for i in range(len(arrays))
+        ]
+
+        base = Path(filename) if filename else Path(self.directory) / (title or "solution")
+
+        return tuple(
+            mpi.call(
+                mpi.function_call,
+                _local_write_block,
+                self.models_id,
+                position,
+                [array.blocks[position].impl.obj_id for array in arrays],
+                str(base.parent),
+                f"{base.name}_{suffix}",
+                names,
+            )
+            for position, suffix in enumerate(("velocity", "pressure"))
+        )
+
+
+def _build_saddle_point_model(module_name, class_name, args, kwargs, model_kwargs):
+    """Construct the per-rank model. Module level so that it survives pickling to the ranks."""
+    import importlib
+
+    module = importlib.import_module(f"exadg.{module_name}")
+    fom = getattr(module, class_name)(*args, **kwargs)
+
+    return saddle_point_model(fom, **model_kwargs)[0]
+
+
+def mpi_saddle_point_model(module_name, class_name, *args, **kwargs):
+    """Build the model, wrapped for MPI when the interpreter is running in parallel.
+
+    The counterpart of :func:`~exadg.mor.models.stationary.mpi_stationary_model`, and it exists
+    for the same reason: the full-order model has to be constructed *on every rank*, because each
+    owns a piece of the mesh and deal.II partitions the triangulation collectively. Called on rank
+    0 alone while the others wait in pyMOR's event loop, the constructor hangs with no output.
+
+    Run it as ::
+
+        mpirun -n 4 python -m pymor.tools.mpi reduce.py
+
+    Args:
+        module_name: Application module inside the ``exadg`` package, e.g. ``"forced"``.
+        class_name: Model class in it, e.g. ``"ForcedFOM2D"``.
+        *args: Passed to that class.
+        **kwargs: Passed to that class, except ``parameters``, ``coefficients`` and
+            ``directory``, which go to :func:`saddle_point_model`.
+
+    Returns:
+        Tuple ``(model, (velocity_space, pressure_space))``.
+    """
+    import functools
+
+    from pymor.tools import mpi
+
+    model_kwargs = {
+        key: kwargs.pop(key)
+        for key in ("parameters", "coefficients", "directory")
+        if key in kwargs
+    }
+
+    factory = functools.partial(
+        _build_saddle_point_model, module_name, class_name, args, kwargs, model_kwargs
+    )
+
+    if not mpi.parallel:
+        model = factory()
+
+        return model, model.solution_space.subspaces
+
+    from pymor.models.mpi import mpi_wrap_model
+
+    # The models are managed first so that the solver below can address them: mpi_wrap_model
+    # accepts the ObjectId as well as a factory, and only the former is reusable afterwards.
+    models_id = mpi.call(mpi.function_call_manage, factory)
+
+    model = mpi_wrap_model(
+        models_id,
+        mpi_spaces=(ExaDGVectorSpace,),
+        use_with=True,
+        pickle_local_spaces=False,
+    )
+
+    model = model.with_(
+        solver=MPIExaDGCoupledSolver(models_id),
+        visualizer=MPIExaDGSaddlePointVisualizer(
+            models_id, directory=model_kwargs.get("directory", "output/pymor")
+        ),
+    )
+
+    return model, model.solution_space.subspaces
