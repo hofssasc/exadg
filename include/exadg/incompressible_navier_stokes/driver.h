@@ -145,6 +145,16 @@ public:
                  unsigned int const   n_repetitions_inner,
                  unsigned int const   n_repetitions_outer) const;
 
+  /**
+   * Access to the spatial discretization, needed to build a reduced-order model: the reduced
+   * operators are obtained by applying the blocks of the full-order operator to basis vectors.
+   */
+  std::shared_ptr<SpatialOperatorBase<dim, Number>>
+  get_pde_operator() const
+  {
+    return pde_operator;
+  }
+
 private:
   using VectorType = dealii::LinearAlgebra::distributed::Vector<Number>;
 

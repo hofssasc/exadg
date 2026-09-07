@@ -30,3 +30,9 @@ TARGETNAME(TARGET_NAME ${CMAKE_CURRENT_SOURCE_DIR})
 PROJECT(${TARGET_NAME})
 
 EXADG_PICKUP_EXE(solver.cpp ${TARGET_NAME} solver)
+
+
+# Python bindings, staged into the exadg package by the shared macro.
+IF (EXADG_WITH_PYTHON)
+  EXADG_ADD_PYTHON_MODULE(forced python_bindings.cpp)
+ENDIF()

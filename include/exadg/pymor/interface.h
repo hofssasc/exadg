@@ -51,8 +51,10 @@ namespace PyMOR
  *   Operator::vmult                    LinearOperator::apply            always
  *   Operator::Tvmult                   LinearOperator::apply_transpose  A != A^T
  *   Krylov solve + preconditioner      LinearOperator::apply_inverse    you want full-order solves
- *   AffineConstraints::set_zero        FullOrderModel::make_admissible  Dirichlet rows are eliminated
- *   MatrixFree + DoFHandler + Driver   FullOrderModel                   always
+ *   AffineConstraints::set_zero        Space::make_admissible           Dirichlet rows are eliminated
+ *   a DoFHandler's function space      Space                            always
+ *   MatrixFree + DoFHandler + Driver   FullOrderModel                   a single-field problem
+ *   OperatorCoupled's block system     SaddlePointModel                 a velocity/pressure problem
  *   cell matrices from FEValues        RestrictedOperator               you want hyper-reduction
  *   a functional of the solution       Functional                       the model has outputs
  *
@@ -245,6 +247,61 @@ public:
 };
 
 /**
+ * A discrete function space -- what one pyMOR VectorArray lives in.
+ *
+ * Split out of FullOrderModel because a saddle-point problem has two of them, velocity and
+ * pressure, and the Python wrapper needs a space rather than a model.
+ */
+template<typename VectorType>
+class Space
+{
+public:
+  virtual ~Space() = default;
+
+  /// Global number of degrees of freedom, summed over ranks.
+  virtual dealii::types::global_dof_index
+  n_dofs() const = 0;
+
+  /// A zero vector with this space's partitioning and ghosting.
+  virtual std::shared_ptr<VectorType>
+  zero_vector() const = 0;
+
+  /**
+   * Project onto the subspace the operators are valid on.
+   *
+   * Called on every vector the Python layer builds that did not come out of a solve: random
+   * probes, interpolation candidates, data read from NumPy. Eliminate Dirichlet rows here if the
+   * discretisation has them, because an affine decomposition holds only on that subspace -- on a
+   * constrained row every component acts as the identity, so summing P of them scales the entry
+   * by the sum of the coefficients instead of leaving it alone.
+   *
+   * The default is a no-op, which is correct for a discretisation that constrains nothing -- a
+   * discontinuous Galerkin velocity space, for instance, imposes its boundary conditions weakly.
+   */
+  virtual void
+  make_admissible(VectorType & /*vector*/) const
+  {
+  }
+
+  /**
+   * Write fields as a VTU/PVTU record and return the record's path.
+   *
+   * A file writer rather than a plot window: the model may be on a compute node, and under MPI
+   * each rank holds a piece of the field.
+   */
+  virtual std::string
+  write_vtu(std::string const & /*directory*/,
+            std::string const & /*basename*/,
+            std::vector<std::shared_ptr<VectorType>> const & /*fields*/,
+            std::vector<std::string> const & /*names*/) const
+  {
+    AssertThrow(false, dealii::ExcMessage("This space does not implement write_vtu()."));
+
+    return {};
+  }
+};
+
+/**
  * One affine component together with the parameter entry its coefficient comes from.
  *
  * A(mu) = sum_i c(mu, slot_i, index_i) A_i, with the coefficient function chosen in Python. slot
@@ -280,36 +337,11 @@ struct AffineVector
  * preconditioner.
  */
 template<typename VectorType>
-class FullOrderModel : public std::enable_shared_from_this<FullOrderModel<VectorType>>
+class FullOrderModel : public Space<VectorType>,
+                       public std::enable_shared_from_this<FullOrderModel<VectorType>>
 {
 public:
   virtual ~FullOrderModel() = default;
-
-  // --- the state space ---------------------------------------------------------------------
-
-  /// Global number of degrees of freedom, summed over ranks.
-  virtual dealii::types::global_dof_index
-  n_dofs() const = 0;
-
-  /// A zero vector with this model's partitioning and ghosting.
-  virtual std::shared_ptr<VectorType>
-  zero_vector() const = 0;
-
-  /**
-   * Project onto the subspace the operators are valid on.
-   *
-   * Called on every vector the Python layer builds that did not come out of a solve: random
-   * probes, interpolation candidates, data read from NumPy. Eliminate Dirichlet rows here if the
-   * discretisation has them, because an affine decomposition holds only on that subspace -- on a
-   * constrained row every component acts as the identity, so summing P of them scales the entry
-   * by the sum of the coefficients instead of leaving it alone.
-   *
-   * The default is a no-op, which is correct for a discretisation that constrains nothing.
-   */
-  virtual void
-  make_admissible(VectorType & /*vector*/) const
-  {
-  }
 
   // --- structure ---------------------------------------------------------------------------
 
@@ -392,21 +424,104 @@ public:
     return nullptr;
   }
 
-  /**
-   * Write fields as a VTU/PVTU record and return the record's path.
-   *
-   * A file writer rather than a plot window: the model may be on a compute node, and under MPI
-   * each rank holds a piece of the field.
-   */
-  virtual std::string
-  write_vtu(std::string const & /*directory*/,
-            std::string const & /*basename*/,
-            std::vector<std::shared_ptr<VectorType>> const & /*fields*/,
-            std::vector<std::string> const & /*names*/) const
-  {
-    AssertThrow(false, dealii::ExcMessage("This model does not implement write_vtu()."));
+};
 
+/**
+ * A velocity/pressure problem, as pyMOR's SaddlePointModel wants it.
+ *
+ *     [ A   B* ] [u]   [f]
+ *     [ B   0  ] [p] = [g]
+ *
+ * pyMOR assembles that block operator itself from A and B, and forms the (1,2) block as
+ * AdjointOperator(B) -- so B::apply_transpose has to reproduce ExaDG's (1,2) block exactly,
+ * sign and scaling included. It is not the same operator as B, and the interface will not
+ * pretend otherwise: divergence() must declare is_symmetric() false and implement the transpose.
+ *
+ * Two spaces rather than one block space, because that is what the reductor needs. Supremizer
+ * enrichment computes velocity_product^-1 B^T p for each pressure basis vector, which is what
+ * restores the inf-sup condition the reduced spaces would otherwise lose.
+ *
+ * A and B are not parametric here. Every parameter this interface carries lives in the
+ * right-hand side, which is what a body force expanded in modes gives. Making the viscosity a
+ * parameter as well would need a setter on ExaDG's viscous kernel -- it bakes the value in at
+ * setup, together with the interior penalty parameter derived from it -- so it is left out until
+ * it buys something.
+ */
+template<typename VectorType>
+class SaddlePointModel : public std::enable_shared_from_this<SaddlePointModel<VectorType>>
+{
+public:
+  virtual ~SaddlePointModel() = default;
+
+  virtual std::shared_ptr<Space<VectorType>>
+  velocity_space() = 0;
+
+  virtual std::shared_ptr<Space<VectorType>>
+  pressure_space() = 0;
+
+  /// Sizes of the parameter groups; see FullOrderModel::parameter_shape.
+  virtual std::vector<unsigned int>
+  parameter_shape() const
+  {
     return {};
+  }
+
+  /// A, the (1,1) block: velocity in, velocity out.
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  momentum() = 0;
+
+  /// B, the (2,1) block: velocity in, pressure out. Its transpose is the (1,2) block.
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  divergence() = 0;
+
+  /// The velocity inner product. Needed for supremizers, so effectively required.
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  velocity_product()
+  {
+    return nullptr;
+  }
+
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  pressure_product()
+  {
+    return nullptr;
+  }
+
+  /// Parameter-independent part of the velocity right-hand side f, or nullptr.
+  virtual std::shared_ptr<VectorType>
+  velocity_rhs()
+  {
+    return nullptr;
+  }
+
+  /// Affine components of f.
+  virtual std::vector<AffineVector<VectorType>>
+  velocity_rhs_components()
+  {
+    return {};
+  }
+
+  /// The pressure right-hand side g, or nullptr for zero.
+  virtual std::shared_ptr<VectorType>
+  pressure_rhs()
+  {
+    return nullptr;
+  }
+
+  /**
+   * The full-order coupled solve, for snapshots.
+   *
+   * Returns false if this model cannot solve at those coefficients, the way
+   * FullOrderModel::assemble returns nullptr. Kept as a single call rather than composed from
+   * the blocks because the block preconditioner is the application's business, and because for
+   * Navier-Stokes this is where its Newton iteration lives.
+   */
+  virtual bool
+  solve(std::vector<double> const & /*coefficients*/,
+        VectorType & /*velocity*/,
+        VectorType & /*pressure*/)
+  {
+    return false;
   }
 };
 

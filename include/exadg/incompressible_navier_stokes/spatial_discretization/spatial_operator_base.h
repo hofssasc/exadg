@@ -149,6 +149,21 @@ public:
   std::string
   get_dof_name_velocity() const;
 
+  /*
+   * The blocks of the saddle-point system, for callers that need to apply them individually
+   * rather than through apply_linearized_problem(). A projection-based reduced-order model is
+   * the motivating case: it projects each block onto its own basis.
+   */
+  /// Non-const because a steady problem has to set its mass scaling factor to zero.
+  MomentumOperator<dim, Number> &
+  get_momentum_operator() const;
+
+  GradientOperator<dim, Number> const &
+  get_gradient_operator() const;
+
+  DivergenceOperator<dim, Number> const &
+  get_divergence_operator() const;
+
   unsigned int
   get_dof_index_velocity() const;
 

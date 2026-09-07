@@ -17,6 +17,7 @@
     "Application": {
         "Equation": "Stokes",
         "Viscosity": "1.0",
+        "SolverTolerance": "1.e-12",
         "ForcingModesPerDim": "2",
         "ForcingWidth": "0.15"
     },

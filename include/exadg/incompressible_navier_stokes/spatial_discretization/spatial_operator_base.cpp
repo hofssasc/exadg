@@ -764,6 +764,27 @@ SpatialOperatorBase<dim, Number>::get_matrix_free() const
 }
 
 template<int dim, typename Number>
+MomentumOperator<dim, Number> &
+SpatialOperatorBase<dim, Number>::get_momentum_operator() const
+{
+  return momentum_operator;
+}
+
+template<int dim, typename Number>
+GradientOperator<dim, Number> const &
+SpatialOperatorBase<dim, Number>::get_gradient_operator() const
+{
+  return gradient_operator;
+}
+
+template<int dim, typename Number>
+DivergenceOperator<dim, Number> const &
+SpatialOperatorBase<dim, Number>::get_divergence_operator() const
+{
+  return divergence_operator;
+}
+
+template<int dim, typename Number>
 std::string
 SpatialOperatorBase<dim, Number>::get_dof_name_velocity() const
 {

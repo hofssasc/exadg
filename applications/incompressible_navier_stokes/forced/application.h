@@ -186,6 +186,12 @@ public:
                         "Body-force modes per coordinate direction; the number of amplitude "
                         "parameters is this to the power dim.",
                         dealii::Patterns::Integer(1, 16));
+      prm.add_parameter("SolverTolerance",
+                        solver_tolerance,
+                        "Relative tolerance of the coupled linear solver. GMRES converges the "
+                        "residual, so the error in the solution is this times the condition "
+                        "number of the saddle point -- which is what sets the floor for any "
+                        "check that a reduced model reproduces the full one exactly.");
       prm.add_parameter("ForcingWidth",
                         forcing_width,
                         "Standard deviation of each forcing mode.");
@@ -265,7 +271,8 @@ private:
     this->param.use_continuity_penalty = false;
 
     // COUPLED SOLVER
-    this->param.solver_data_coupled    = SolverData(1e4, 1.e-14, 1.e-10, LinearSolver::GMRES, 100);
+    this->param.solver_data_coupled =
+      SolverData(1e4, 1.e-14, solver_tolerance, LinearSolver::GMRES, 100);
     this->param.preconditioner_coupled = PreconditionerCoupled::BlockTriangular;
 
     // Not InverseMassMatrix for the velocity block: that preconditioner scales by the inverse
@@ -403,7 +410,8 @@ private:
   // "Stokes" or "NavierStokes": the convective term is the only difference between them
   std::string  equation      = "Stokes";
 
-  double       viscosity     = 1.0;
+  double       viscosity        = 1.0;
+  double       solver_tolerance = 1.e-10;
   unsigned int modes_per_dim = 2;
   double       forcing_width = 0.15;
 

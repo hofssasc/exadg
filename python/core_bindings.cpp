@@ -259,28 +259,56 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def_readonly("slot", &AffineVector<V>::slot)
     .def_readonly("index", &AffineVector<V>::index);
 
-  py::class_<FullOrderModel<V>, std::shared_ptr<FullOrderModel<V>>>(
-    module, (prefix + "FullOrderModel").c_str())
-    .def_property_readonly("n_dofs", &FullOrderModel<V>::n_dofs)
-    .def_property_readonly("parameter_shape", &FullOrderModel<V>::parameter_shape)
-    .def("zero_vector", &FullOrderModel<V>::zero_vector)
+  py::class_<Space<V>, std::shared_ptr<Space<V>>>(module, (prefix + "Space").c_str())
+    .def_property_readonly("n_dofs", &Space<V>::n_dofs)
+    .def("zero_vector", &Space<V>::zero_vector)
     .def(
       "make_admissible",
-      [](FullOrderModel<V> const & m, V & v) { m.make_admissible(v); },
+      [](Space<V> const & space, V & v) { space.make_admissible(v); },
       py::arg("vector"))
+    .def("write_vtu",
+         &Space<V>::write_vtu,
+         py::arg("directory"),
+         py::arg("basename"),
+         py::arg("fields"),
+         py::arg("names"));
+
+  py::class_<FullOrderModel<V>, Space<V>, std::shared_ptr<FullOrderModel<V>>>(
+    module, (prefix + "FullOrderModel").c_str())
+    .def_property_readonly("parameter_shape", &FullOrderModel<V>::parameter_shape)
     .def("operator_components", &FullOrderModel<V>::operator_components)
     .def("parametric_operator", &FullOrderModel<V>::parametric_operator)
     .def("assemble", &FullOrderModel<V>::assemble, py::arg("coefficients"))
     .def("rhs", &FullOrderModel<V>::rhs)
     .def("rhs_components", &FullOrderModel<V>::rhs_components)
     .def("products", &FullOrderModel<V>::products)
-    .def("output_functional", &FullOrderModel<V>::output_functional)
-    .def("write_vtu",
-         &FullOrderModel<V>::write_vtu,
-         py::arg("directory"),
-         py::arg("basename"),
-         py::arg("fields"),
-         py::arg("names"));
+    .def("output_functional", &FullOrderModel<V>::output_functional);
+
+  py::class_<SaddlePointModel<V>, std::shared_ptr<SaddlePointModel<V>>>(
+    module, (prefix + "SaddlePointModel").c_str())
+    .def_property_readonly("parameter_shape", &SaddlePointModel<V>::parameter_shape)
+    .def("velocity_space", &SaddlePointModel<V>::velocity_space)
+    .def("pressure_space", &SaddlePointModel<V>::pressure_space)
+    .def("momentum", &SaddlePointModel<V>::momentum)
+    .def("divergence", &SaddlePointModel<V>::divergence)
+    .def("velocity_product", &SaddlePointModel<V>::velocity_product)
+    .def("pressure_product", &SaddlePointModel<V>::pressure_product)
+    .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
+    .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
+    .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)
+    .def(
+      "solve",
+      [](SaddlePointModel<V> & m, std::vector<double> const & coefficients) -> py::object {
+        auto u = m.velocity_space()->zero_vector();
+        auto p = m.pressure_space()->zero_vector();
+
+        if(not m.solve(coefficients, *u, *p))
+          return py::none();
+
+        return py::make_tuple(u, p);
+      },
+      py::arg("coefficients"),
+      "Full-order coupled solve; returns (velocity, pressure), or None if declined.");
 }
 
 } // namespace PyMOR
