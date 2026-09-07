@@ -18,20 +18,19 @@
 #  along with this program. If not, see <https://www.gnu.org/licenses/>.
 #  ______________________________________________________________________
 
-"""pyMOR ``StationaryModel`` over any ExaDG full-order model that declares an affine operator.
+"""pyMOR ``StationaryModel`` over any ExaDG model that declares an affine operator.
 
     A(mu) u = f(mu),   A(mu) = sum_i c_i(mu) A_i,   f(mu) = f_0 + sum_j d_j(mu) f_j
 
 Everything structural is read from the model: how many affine components there are, which
 parameter entry each belongs to, whether the right-hand side is parametric, which products and
-which output functional exist, and whether the operator can also be presented as a single
-parametric object for empirical interpolation. Nothing about the physics appears here, and no
-application needs a file of its own.
+output functional exist, and whether the operator can also be presented as a single parametric
+object for empirical interpolation. No application needs a file of its own.
 
-What is *not* read from C++ is naming and parameterisation. ``parameter_shape`` says there are
-sixteen coefficients; it does not say they are called ``mu`` or that the operator depends on them
-through an exponential. Those are modelling choices, and keeping them here means changing one
-does not mean a recompile.
+Naming and parameterisation are *not* read from C++. ``parameter_shape`` says there are sixteen
+coefficients; it does not say they are called ``mu`` or that the operator depends on them through
+an exponential. Those are modelling choices, and keeping them here means changing one is not a
+recompile.
 """
 
 import functools
@@ -52,16 +51,10 @@ from exadg.mor.binding import (
 class ExponentialParameterFunctional(ParameterFunctional):
     """The coefficient functional ``mu -> exp(mu[index])``.
 
-    Written out rather than assembled from an expression string, because the expression form does
-    not survive a high-dimensional parameter. ``ExpressionParameterFunctional`` takes the
-    derivatives as one string per parameter component and the second derivatives as one string per
-    pair, so a model with ``P`` components needs ``P`` functionals carrying ``P`` and ``P^2``
-    strings each. At the eight-by-eight thermal block that is a few thousand strings and nobody
-    notices; with one coefficient per cell, ``P`` is the cell count and the same construction asks
-    for ``P^3`` -- a billion at refinement five -- before a single solve has happened.
-
-    Here every derivative is known in closed form and costs nothing to return: the function is its
-    own derivative in its own component, and zero in every other.
+    Written out rather than built from an expression string: ``ExpressionParameterFunctional``
+    carries ``P`` and ``P^2`` derivative strings per functional, so ``P`` components cost ``P^3``
+    strings -- a billion once there is one coefficient per cell. Here every derivative is known
+    in closed form and costs nothing.
     """
 
     def __init__(self, index, size, parameter="mu"):
@@ -120,11 +113,11 @@ def parameter_names(shape, parameters=None):
 
 
 def default_coefficients(components, shape, names):
-    """One coefficient functional per affine component.
+    """One coefficient functional per affine component: ``exp(mu_p)``.
 
-    ``exp(mu_p)`` per component, which is the log parameterisation the thermal block's prior is
-    written in. It is a modelling choice and not a structural one -- an application whose operator
-    is linear in its parameters should pass ``ParameterFunctional``s of its own.
+    The log parameterisation the thermal block's prior is written in -- a modelling choice, not a
+    structural one. An application whose operator is linear in its parameters should pass
+    ``ParameterFunctional``s of its own.
     """
     return [
         ExponentialParameterFunctional(c.index, shape[c.slot], names[c.slot]) for c in components
@@ -211,10 +204,9 @@ def stationary_model(
 def _rhs(fom, space, shape, names):
     """The right-hand side as a pyMOR operator, parametric or not.
 
-    A model may declare a constant part, affine components, or both; the sum of whatever it
-    declares is the right-hand side. An application whose parameters live entirely in the forcing
-    -- a body force expanded in modes, say -- declares no constant part and everything in the
-    components, and lands in the ``LincombOperator`` branch without anything here knowing that.
+    A model may declare a constant part, affine components, or both, and the sum is the
+    right-hand side. An application whose parameters live entirely in the forcing declares no
+    constant part and lands in the ``LincombOperator`` branch without anything here knowing.
     """
     def as_operator(vector):
         return VectorOperator(space.make_array([space.make_vector(vector)]))
@@ -251,11 +243,9 @@ def _build_model(module_name, class_name, args, kwargs, model_kwargs):
 def mpi_stationary_model(module_name, class_name, *args, **kwargs):
     """Build the model, wrapped for MPI when the interpreter is running in parallel.
 
-    The full-order model has to be constructed *on every rank*, because each rank owns a piece of
-    the mesh. So the model cannot be built here and shipped -- what is shipped is the recipe, and
-    :func:`pymor.models.mpi.mpi_wrap_model` calls it on every rank and hands rank 0 an
-    :class:`~pymor.models.mpi.MPIModel` that dispatches to all of them. The application is named
-    by string for the same reason: a recipe has to pickle, and a compiled class does not.
+    The model has to be constructed *on every rank*, because each rank owns a piece of the mesh,
+    so what is shipped is a recipe rather than a model. The application is named by string for
+    the same reason: a recipe has to pickle, and a compiled class does not.
 
     Run it as ::
 

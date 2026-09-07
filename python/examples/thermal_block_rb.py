@@ -25,9 +25,17 @@ Runs unchanged on any number of ranks::
     python python/examples/thermal_block_rb.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/thermal_block_rb.py
 
-Every quantity it prints is a global one, so the output must be identical for every rank count.
-That is the point of the script: it is the parallel regression check as much as it is a demo.
+Every quantity it prints is a global one, so the output is identical for every rank count. That
+is the point of the script: it is the parallel regression check as much as it is a demo. Nine
+significant digits, because that is what is genuinely rank-independent -- a different partitioning
+sums floating-point reductions in a different order, and the iterative solve carries that through
+to about the twelfth digit. Any real defect moves things far more than that.
 Paths are relative to the repository root, so run it from there.
+
+Sized to finish in the time you will actually give it. The certified estimator costs
+O((P*r)^2) full-order applies to assemble -- with P = 64 parameters and r = 8 modes that is half
+an hour -- so the mesh and the basis are kept small here. Raise ``refinements`` and ``N_MODES``
+for a real study; the certificate is what makes this example worth running, not the size.
 """
 
 import numpy as np
@@ -41,12 +49,12 @@ from pymor.tools import mpi
 from exadg.mor.models.stationary import mpi_stationary_model
 
 INPUT_FILE = "applications/poisson/thermal_block/input.json"
-N_TRAIN, N_TEST, N_MODES = 100, 5, 8
+N_TRAIN, N_TEST, N_MODES = 30, 5, 4
 
 
 def main():
     model, space = mpi_stationary_model(
-        "thermal_block", "ThermalBlockFOM3D", INPUT_FILE, degree=2, refinements=4
+        "thermal_block", "ThermalBlockFOM3D", INPUT_FILE, degree=2, refinements=3
     )
     n_parameters = model.operator.parameters["mu"]
 
@@ -90,19 +98,22 @@ def main():
         u_fom = model.solve(parameter)
         u_rom = reductor.reconstruct(rom.solve(parameter))
 
+        # Both relative, and to the same norm. The estimator bounds the *absolute* energy-norm
+        # error, so comparing it with a relative error is comparing two different quantities and
+        # says nothing about whether the bound holds.
         norm = u_fom.norm(model.energy_product)[0]
         errors.append((u_fom - u_rom).norm(model.energy_product)[0] / norm)
-        estimates.append(rom.estimate_error(parameter)[0])
+        estimates.append(rom.estimate_error(parameter)[0] / norm)
 
-    print(f"max relative error : {max(errors):.12e}")
-    print(f"max error estimate : {max(estimates):.12e}")
+    print(f"max relative error : {max(errors):.9e}")
+    print(f"max relative bound : {max(estimates):.9e}")
     print(f"estimator is upper : {all(e >= r for e, r in zip(estimates, errors))}")
 
     # The two operations that had to become collective to work on more than one rank.
     u = model.solve(Mu(mu=test[0]))
     index, value = u.amax()
-    print(f"amax               : index {index[0]} value {value[0]:.12e}")
-    print(f"dofs([0, 17, 113]) : {np.array2string(u.dofs([0, 17, 113]).ravel(), precision=12)}")
+    print(f"amax               : index {index[0]} value {value[0]:.9e}")
+    print(f"dofs([0, 17, 113]) : {np.array2string(u.dofs([0, 17, 113]).ravel(), precision=9)}")
 
     # pyMOR's standard convergence table: the error against basis size, with the estimator's
     # effectivity. plot=False because this normally runs without a display.
@@ -111,7 +122,7 @@ def main():
         fom=model,
         reductor=reductor,
         test_mus=[Mu(mu=mu) for mu in test],
-        basis_sizes=4,
+        basis_sizes=3,
         error_norms=[model.energy_norm],
         condition=True,
         plot=False,

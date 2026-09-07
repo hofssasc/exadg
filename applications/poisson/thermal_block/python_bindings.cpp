@@ -20,27 +20,24 @@
  */
 
 /*
- * The thermal block as a PyMOR::FullOrderModel.
+ * The thermal block as a PyMOR::FullOrderModel -- the template for a new application.
  *
- * All the pyMOR-facing structure is declared through exadg/pymor/interface.h, so this file
- * contains only what is specific to *this* problem: a Poisson operator whose diffusivity is
- * piecewise constant on a Cartesian grid of blocks, point sensors as the quantity of interest,
- * and the caches that keep a parameter sweep from refilling coefficients it already has.
+ * To add one: implement the interface classes of exadg/pymor/interface.h, bind the concrete model
+ * with pybind11, and import exadg._core. Nothing else is needed -- the Python layer builds the
+ * pyMOR model from what is declared here, so no Python is written per application.
  *
- * Nothing here knows about pyMOR. The Python layer wraps the interface classes below without
- * knowing what they discretise, and python/exadg/mor/models/stationary.py assembles them into a
- * pyMOR StationaryModel. Adding an application means writing a file like this one and nothing
- * else.
+ * The problem is -div(a(x; mu) grad u) = f with a piecewise constant on a Cartesian grid of
+ * blocks. Constant per block makes the operator exactly affine in the block values,
+ * A(c) = sum_p c_p A_p with A_p assembled from the indicator of block p, which is what
+ * operator_components() hands to pyMOR and why this is the standard reduced-basis benchmark.
  *
- * The vector type, the operator base classes and MPI initialisation come from exadg._core, which
- * is imported below. They are bound there rather than here because pybind11's type registry is
- * process-global: two application modules binding the same C++ vector type abort on import.
+ * The vector type, the operator base classes and MPI initialisation live in exadg._core, imported
+ * at the bottom of this file. They are bound there rather than here because pybind11's type
+ * registry is process-global: two application modules binding the same C++ type abort on import.
  *
- * MPI: supported through pyMOR's event loop (pymor.tools.mpi), where Python runs on every rank
- * and rank 0 dispatches. Every call below therefore executes simultaneously on all ranks, and
- * pyMOR keeps rank 0's return value -- so anything that returns data has to return the global
- * answer rather than this rank's slice. The restricted operator is the one thing that is serial,
- * and it says so by returning nullptr rather than by being guarded in Python.
+ * MPI: pyMOR runs Python on every rank with rank 0 dispatching, so every call below executes on
+ * all ranks at once and anything returning data must return the global answer. The restricted
+ * operator is the one serial piece, and it says so by returning nullptr.
  */
 
 // C/C++
@@ -48,15 +45,11 @@
 #include <sstream>
 
 // pybind11
-#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 // deal.II
 #include <deal.II/base/mpi.h>
-#include <deal.II/base/quadrature_lib.h>
-#include <deal.II/dofs/dof_tools.h>
-#include <deal.II/fe/fe_values.h>
 #include <deal.II/numerics/data_out.h>
 
 // ExaDG
@@ -115,18 +108,8 @@ private:
 /**
  * A Poisson problem whose diffusivity is piecewise constant on a Cartesian grid of blocks.
  *
- *     -div(a(x; mu) grad u) = f,   a piecewise constant, one value per block
- *
- * Because the coefficient is constant per block, the operator is exactly affine in the block
- * values: A(c) = sum_p c_p A_p with A_p the operator assembled with the indicator of block p.
- * That identity is the reason this problem is the standard reduced-basis benchmark, and it is
- * what operator_components() below hands to pyMOR.
- *
- * **The affine identity holds only on the constrained subspace.** On a Dirichlet-constrained row
- * every component acts as the identity, so summing P of them scales that entry by the sum of the
- * coefficients rather than leaving it alone. Vectors that come out of a solve satisfy the
- * constraints; ones pyMOR builds itself -- random probes, interpolation candidates -- do not,
- * which is what make_admissible() is for.
+ * The affine identity A(c) = sum_p c_p A_p holds on the Dirichlet-constrained subspace, which is
+ * what make_admissible() projects onto.
  */
 template<int dim>
 class ThermalBlockFOM : public PyMOR::FullOrderModel<VectorType>
@@ -191,13 +174,11 @@ public:
   // ===========================================================================================
 
   /**
-   * The restricted Laplace operator, presented through the interface.
+   * RestrictedLaplace behind the interface.
    *
-   * Fixed coefficients unless it came from the parametric operator, in which case the Python
-   * layer re-parameterises it per apply. Refusing in the fixed case rather than ignoring the
-   * argument is deliberate: silently keeping the old coefficient would produce a restricted
-   * operator that disagrees with the full one, and empirical interpolation would then converge
-   * neatly to the wrong operator.
+   * Only a restriction of the parametric operator may be re-parameterised; a fixed one refuses,
+   * because silently ignoring new coefficients would make the restriction disagree with the full
+   * operator and empirical interpolation would converge neatly to the wrong one.
    */
   class Restricted : public PyMOR::RestrictedOperator
   {
@@ -246,10 +227,8 @@ public:
   /**
    * One affine component A_p: the operator assembled with the indicator of parameter p.
    *
-   * Indexed by *parameter*, not by block. At coefficient degree zero those coincide; above it
-   * the parameters are the coefficient's degrees of freedom. Either way the index is the one
-   * parameter_shape() counts, so a caller never has to know which -- and never has to remember
-   * a permutation.
+   * Indexed by parameter, not by block -- they coincide at coefficient degree zero and differ
+   * above it, and parameter_shape() counts the former, so no caller has to remember which.
    */
   class Component : public PyMOR::LinearOperator<VectorType>
   {
@@ -293,13 +272,7 @@ public:
     unsigned int const index;
   };
 
-  /**
-   * The operator at fixed coefficients, carrying this application's solver.
-   *
-   * What makes the model solvable rather than merely multipliable: apply_inverse() hands the
-   * system to ExaDG's preconditioned conjugate gradients, so greedy basis generation, residual
-   * based error estimation and least-squares projection run against the real solver.
-   */
+  /// The operator at fixed coefficients, with ExaDG's preconditioned CG behind apply_inverse().
   class Assembled : public PyMOR::LinearOperator<VectorType>
   {
   public:
@@ -357,18 +330,11 @@ public:
   };
 
   /**
-   * The same operator with its coefficients supplied at apply time.
+   * The same operator with its coefficients supplied at apply time, for empirical interpolation.
    *
-   * Mathematically identical to the affine form; what differs is what pyMOR can do with it.
-   * Given the components, pyMOR projects each one exactly, at a cost of one full-order apply per
-   * component per basis vector -- linear in a parameter dimension that grows with the mesh once
-   * the coefficient is per cell. Given this instead, the parameter dependence is opaque and
-   * pyMOR reaches for empirical interpolation, whose cost is set by the interpolation.
-   *
-   * The exchange is worth measuring rather than assuming: the restricted evaluation reads the
-   * coefficient only on the cells touching its stencil, so the interpolated operator is exactly
-   * insensitive to every parameter outside it. python/examples/thermal_block_ei.py measures that
-   * against the affine reference.
+   * The restricted evaluation reads the coefficient only on the cells touching its stencil, so
+   * the interpolated operator is exactly insensitive to every parameter outside it.
+   * python/examples/thermal_block_ei.py measures what that costs against the affine reference.
    */
   class Field : public PyMOR::ParametricOperator<VectorType>
   {
@@ -436,10 +402,9 @@ public:
   /**
    * The mass matrix, i.e. the L2 inner product of the finite element space.
    *
-   * The product a proper orthogonal decomposition should be taken in: the Euclidean inner
-   * product of coefficient vectors weights degrees of freedom by the local mesh size and is not
-   * an optimal basis in any norm of interest. The inverse is what forms a Riesz representative,
-   * which residual-based error estimation and least-squares projection both need.
+   * The product a proper orthogonal decomposition should be taken in; the Euclidean product of
+   * coefficient vectors weights degrees of freedom by the local mesh size instead. The inverse
+   * forms Riesz representatives, which error estimation and least-squares projection need.
    */
   class Mass : public PyMOR::LinearOperator<VectorType>
   {
@@ -482,12 +447,7 @@ public:
     std::shared_ptr<ThermalBlockFOM<dim>> fom;
   };
 
-  /**
-   * Point sensors as the quantity of interest.
-   *
-   * Evaluated with RemotePointEvaluation, so the sensors may lie anywhere in the domain
-   * irrespective of the mesh partitioning.
-   */
+  /// Point sensors as the quantity of interest, evaluated with RemotePointEvaluation.
   class Sensors : public PyMOR::Functional<VectorType>
   {
   public:
@@ -577,14 +537,11 @@ public:
   }
 
   /**
-   * The operator at these coefficients, or nullptr if it is not one this application can solve.
+   * The operator at these coefficients, or nullptr if this application cannot solve it.
    *
-   * pyMOR reaches here whenever it assembles a linear combination of the affine components, and
-   * the combination may legitimately be signed -- a reductor forming a difference of operators
-   * does exactly that. A diffusivity that changes sign is a broken model rather than an unusual
-   * one, so those combinations are declined and pyMOR falls back to its generic path, which is
-   * correct if slower. Deciding it here is the point: the coefficient means something to this
-   * application and nothing to the Python layer.
+   * The combination may legitimately be signed -- a reductor forming a difference of operators
+   * does exactly that -- but a diffusivity that changes sign is a broken model, so those are
+   * declined and pyMOR falls back to its generic path.
    */
   std::shared_ptr<PyMOR::LinearOperator<VectorType>>
   assemble(std::vector<double> const & coefficients) override
@@ -611,12 +568,10 @@ public:
   /**
    * The mass matrix, and the operator at unit diffusivities.
    *
-   * The second is the H1 seminorm, and it is the product a coercive residual error estimator has
-   * to be taken in: A(mu) >= min_p mu_p * A(1) in the A(1) inner product, so the smallest
-   * coefficient is then an exact lower bound on the coercivity constant. Against the mass
-   * product the same functional is not a bound at all and the estimator comes out orders of
-   * magnitude too large -- measured here at an effectivity of 2.4e-4 before the energy product
-   * was added, against 0.12 to 0.16 after.
+   * The second is the H1 seminorm, and the product a coercive residual error estimator must be
+   * taken in: A(mu) >= min_p mu_p * A(1) holds in the A(1) inner product, so the smallest
+   * coefficient is an exact lower bound on the coercivity constant. Against the mass product the
+   * same functional bounds nothing and the estimator comes out orders of magnitude too large.
    */
   std::map<std::string, std::shared_ptr<PyMOR::LinearOperator<VectorType>>>
   products() override
@@ -685,29 +640,13 @@ public:
   }
 
   // ===========================================================================================
-  //  Thermal-block specifics, exposed to Python for scripting and plots
+  //  Thermal-block specifics
   // ===========================================================================================
 
-  unsigned int
-  n_blocks() const
-  {
-    return application->n_blocks();
-  }
-
   /**
-   * Degree of the diffusivity field: 0 for one value per block, 1 for a nodal field.
-   */
-  unsigned int
-  coefficient_degree() const
-  {
-    return application->get_coefficient_degree();
-  }
-
-  /**
-   * Number of parameters, i.e. of affine components.
-   *
-   * The blocks for a piecewise constant coefficient, the coefficient degrees of freedom
-   * otherwise. This -- not n_blocks -- is what indexes the affine components.
+   * Number of affine components: the blocks for a piecewise constant coefficient, the
+   * coefficient degrees of freedom above degree zero. Bound to Python because a script has to
+   * size its parameter vectors; everything else pyMOR needs is inherited from FullOrderModel.
    */
   unsigned int
   n_parameters() const
@@ -717,10 +656,22 @@ public:
              static_cast<unsigned int>(pde_operator->n_coefficient_dofs());
   }
 
+private:
+  // ===========================================================================================
+  //  Used by the nested operator classes above, which are members and so may reach them
+  // ===========================================================================================
+
   unsigned int
-  blocks_per_dim() const
+  n_blocks() const
   {
-    return application->get_blocks_per_dim();
+    return application->n_blocks();
+  }
+
+  /// 0 for one diffusivity per block, 1 for a nodal field.
+  unsigned int
+  coefficient_degree() const
+  {
+    return application->get_coefficient_degree();
   }
 
   unsigned int
@@ -728,115 +679,6 @@ public:
   {
     return sensors.n_points();
   }
-
-  /**
-   * Support points of the coefficient degrees of freedom, flattened.
-   *
-   * What relates the parameter vector back to geometry when there is no block index to read it
-   * off: an unstructured mesh has no lexicographic ordering, and a nodal field has no cells.
-   */
-  std::vector<double>
-  coefficient_support_points() const
-  {
-    // At degree zero the parameters are blocks, whose centres follow from the lexicographic
-    // indexing rather than from the mesh. Answering at every degree means a caller relating
-    // parameters to geometry -- for a plot, say -- never has to branch, and so never has to
-    // guess an ordering. Guessing it is the standard way to get a silently permuted field.
-    if(coefficient_degree() == 0)
-    {
-      unsigned int const per_dim = application->get_blocks_per_dim();
-
-      std::vector<double> flat(n_blocks() * dim);
-      for(unsigned int block = 0; block < n_blocks(); ++block)
-      {
-        unsigned int remaining = block;
-        for(unsigned int d = 0; d < dim; ++d)
-        {
-          flat[block * dim + d] = (remaining % per_dim + 0.5) / per_dim;
-          remaining /= per_dim;
-        }
-      }
-
-      return flat;
-    }
-
-    std::map<dealii::types::global_dof_index, dealii::Point<dim>> points;
-    dealii::DoFTools::map_dofs_to_support_points(*pde_operator->get_mapping(),
-                                                 pde_operator->get_coefficient_dof_handler(),
-                                                 points);
-
-    std::vector<double> flat(points.size() * dim);
-    for(auto const & entry : points)
-      for(unsigned int d = 0; d < dim; ++d)
-        flat[entry.first * dim + d] = entry.second[d];
-
-    return flat;
-  }
-
-  std::vector<double>
-  sensor_coordinates() const
-  {
-    std::vector<double> flat;
-    for(auto const & point : sensors.get_points())
-      for(unsigned int d = 0; d < dim; ++d)
-        flat.push_back(point[d]);
-
-    return flat;
-  }
-
-  /**
-   * Moves the sensors, rebuilding the point-evaluation pattern.
-   *
-   * The placement is an argument of the study, not a property of the mesh, and both the forward
-   * observation operator and its transpose are built from this one list -- so changing it
-   * changes the adjoint with it, and nothing downstream has to be told.
-   *
-   * @param flat Sensor coordinates, dim entries per point, point index running slowest.
-   */
-  void
-  set_sensor_points(std::vector<double> const & flat)
-  {
-    AssertThrow(flat.size() % dim == 0,
-                dealii::ExcMessage("Expected dim coordinates per sensor point, got " +
-                                   std::to_string(flat.size()) + " entries in " +
-                                   std::to_string(dim) + "D."));
-
-    std::vector<dealii::Point<dim>> points(flat.size() / dim);
-    for(unsigned int i = 0; i < points.size(); ++i)
-      for(unsigned int d = 0; d < dim; ++d)
-        points[i][d] = flat[i * dim + d];
-
-    sensors.setup(pde_operator->get_dof_handler().get_triangulation(),
-                  *pde_operator->get_mapping(),
-                  points);
-  }
-
-  /**
-   * Installs a diffusivity given as one value per active cell.
-   *
-   * The route a coefficient takes when it is not tied to a Cartesian grid of blocks, which is
-   * every unstructured mesh.
-   */
-  void
-  set_cell_diffusivity(std::vector<double> const & values)
-  {
-    AssertThrow(
-      values.size() == pde_operator->get_dof_handler().get_triangulation().n_active_cells(),
-      dealii::ExcMessage(
-        "Expected one value per active cell (" +
-        std::to_string(pde_operator->get_dof_handler().get_triangulation().n_active_cells()) +
-        "), got " + std::to_string(values.size()) + "."));
-
-    pde_operator->set_coefficient_from_cell_values(values);
-
-    // the block caches no longer describe what is installed, and must not be allowed to skip a
-    // later coefficient fill or preconditioner rebuild on the strength of a stale comparison
-    note_coefficient_changed();
-  }
-
-  // ===========================================================================================
-  //  Used by the operators above
-  // ===========================================================================================
 
   /**
    * Installs the diffusivity from its expansion coefficients, at any degree.
@@ -1002,7 +844,6 @@ public:
     return std::make_shared<Restricted>(impl, coefficients, parametric);
   }
 
-private:
   /**
    * This model as a shared pointer of its own type.
    *
@@ -1097,8 +938,8 @@ private:
 /**
  * Registers the model for one space dimension.
  *
- * The pyMOR-facing surface is inherited from PyMOR::FullOrderModel, which exadg._core binds; only
- * the constructor and the thermal-block specifics are added here.
+ * Everything pyMOR uses is inherited from PyMOR::FullOrderModel, which exadg._core binds; only
+ * the constructor and the one size a script needs are added here.
  */
 template<int dim>
 void
@@ -1112,16 +953,7 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("degree")      = 3,
          py::arg("refinements") = 4,
          py::arg("verbose")     = false)
-    .def_property_readonly("n_blocks", &ThermalBlockFOM<dim>::n_blocks)
-    .def_property_readonly("n_parameters", &ThermalBlockFOM<dim>::n_parameters)
-    .def_property_readonly("coefficient_degree", &ThermalBlockFOM<dim>::coefficient_degree)
-    .def_property_readonly("blocks_per_dim", &ThermalBlockFOM<dim>::blocks_per_dim)
-    .def_property_readonly("n_sensors", &ThermalBlockFOM<dim>::n_sensors)
-    .def_property_readonly("dim", [](ThermalBlockFOM<dim> const &) { return dim; })
-    .def("coefficient_support_points", &ThermalBlockFOM<dim>::coefficient_support_points)
-    .def("sensor_coordinates", &ThermalBlockFOM<dim>::sensor_coordinates)
-    .def("set_sensor_points", &ThermalBlockFOM<dim>::set_sensor_points, py::arg("points"))
-    .def("set_cell_diffusivity", &ThermalBlockFOM<dim>::set_cell_diffusivity, py::arg("values"));
+    .def_property_readonly("n_parameters", &ThermalBlockFOM<dim>::n_parameters);
 }
 
 } // namespace ExaDG

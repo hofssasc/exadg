@@ -36,63 +36,67 @@ namespace ExaDG
 {
 namespace PyMOR
 {
-/**
- * The vocabulary a full-order model has to speak to be driven by pyMOR.
+/*
+ * What an application must provide for pyMOR to reduce it.
  *
- * Everything in this file is physics-free on purpose. An application implements these classes;
- * python/exadg/mor/binding.py wraps them in pyMOR's interfaces without knowing what they
- * discretise, and python/exadg/mor/models/ assembles them into a pyMOR Model. Adding an
- * application therefore means writing C++ and nothing else.
+ * Implement these classes in applications/<app>/python_bindings.cpp and bind the concrete model
+ * with pybind11. python/exadg/mor/ then builds a pyMOR model from what is declared here, so no
+ * Python is written per application.
  *
- * Two rules make that possible, and they are the reason for the shape of what follows.
+ * The classes are thin renamings of deal.II's own vocabulary:
  *
- * **Nothing is assumed; capabilities are declared.** Symmetry, invertibility, the existence of
- * a restricted evaluation, the presence of Dirichlet constraints -- each is a virtual method
- * whose default says "not available". A default that guesses would be silently wrong in exactly
- * the cases nobody checks, so the defaults abort or return nullptr instead. Whoever writes the
- * operator knows the answer; whoever writes the Python layer does not.
+ *   deal.II / ExaDG                    this file                        implement it when
+ *   ---------------------------------------------------------------------------------------
+ *   distributed::Vector                (bound in exadg._core)           never
+ *   Operator::vmult                    LinearOperator::apply            always
+ *   Operator::Tvmult                   LinearOperator::apply_transpose  A != A^T
+ *   Krylov solve + preconditioner      LinearOperator::apply_inverse    you want full-order solves
+ *   AffineConstraints::set_zero        FullOrderModel::make_admissible  Dirichlet rows are eliminated
+ *   MatrixFree + DoFHandler + Driver   FullOrderModel                   always
+ *   cell matrices from FEValues        RestrictedOperator               you want hyper-reduction
+ *   a functional of the solution       Functional                       the model has outputs
  *
- * **Structure is declared here, naming is not.** parameter_shape() says how many parameters
- * there are and how they group; it does not say what they are called. Names are a modelling
- * choice that belongs in Python, where changing one does not mean a recompile.
+ * Two rules run through the file.
+ *
+ * **Nothing is assumed.** Symmetry, invertibility, a restricted evaluation, the presence of
+ * constraints -- each is a virtual method whose default says "no", and whose transposed forms
+ * abort rather than improvise. A wrong guess is invisible here: an adjoint solve that quietly
+ * solves the wrong system returns plausible numbers.
+ *
+ * **Structure is declared, naming is not.** parameter_shape() says how many parameters there are
+ * and how they group. What they are called, and how the operator depends on them, are modelling
+ * choices and live in Python, where changing one is not a recompile.
  */
 
 /**
- * An operator evaluated on a small set of output degrees of freedom.
+ * An operator evaluated on a few output degrees of freedom, for empirical interpolation.
  *
- * This is what empirical interpolation needs, and pyMOR's contract on it is
+ * The contract is an identity, not an approximation:
  *
  *     A.apply(U).dofs(output_dofs) == restricted.apply(U.dofs(source_dofs))
  *
- * exactly, not approximately. The source set is the stencil: every degree of freedom sharing a
- * cell with a requested one. Resolving it is a question about the mesh, which is why it is
- * answered here and not in Python -- answering it there would mean exporting a full-order sized
- * sparsity pattern, which is what this whole interface exists to avoid.
+ * The source set is the stencil: every degree of freedom sharing a cell with a requested one.
+ * Resolving it is a question about the mesh, so it is answered here rather than by exporting a
+ * full-order sized sparsity pattern to Python.
  */
 class RestrictedOperator
 {
 public:
   virtual ~RestrictedOperator() = default;
 
-  /**
-   * The stencil: degrees of freedom whose values apply() needs, in the order it expects them.
-   */
+  /// Stencil degrees of freedom, in the order apply() expects their values.
   virtual std::vector<dealii::types::global_dof_index> const &
   get_source_dofs() const = 0;
 
-  /**
-   * Rows of the operator at the output degrees of freedom, given the stencil values.
-   */
+  /// Rows of the operator at the output degrees of freedom, given the stencil values.
   virtual std::vector<double>
   apply(std::vector<double> const & source_values) const = 0;
 
   /**
-   * Which affine components the stencil actually reads, or empty if the notion does not apply.
+   * Affine components the stencil actually reads, or empty if the notion does not apply.
    *
-   * The sparsity hyper-reduction is trading on: an interpolated operator is *exactly*
-   * insensitive to every component outside this set. For a forward solve that is the intended
-   * approximation; for a parameter Jacobian it is a claim that the others do not matter, which
-   * is worth measuring rather than assuming.
+   * An interpolated operator is exactly insensitive to every component outside this set, which
+   * is what hyper-reduction trades on and what makes it worth measuring.
    */
   virtual std::vector<unsigned int>
   active_components() const
@@ -100,39 +104,23 @@ public:
     return {};
   }
 
-  /**
-   * Installs the coefficients of a parametric operator's affine components.
-   *
-   * Only called for a restriction obtained from a ParametricOperator, whose coefficient is not
-   * known until apply time. A restriction of a fixed operator already carries its coefficients
-   * and aborts here rather than silently ignoring an argument that was meant to change the
-   * answer.
-   */
+  /// Re-parameterise. Only a restriction of a ParametricOperator may; the rest refuse.
   virtual void
   set_coefficients(std::vector<double> const &)
   {
-    AssertThrow(false,
-                dealii::ExcMessage("This restricted operator has fixed coefficients. Only a "
-                                   "restriction of a ParametricOperator can be re-parameterised."));
+    AssertThrow(false, dealii::ExcMessage("This restriction has fixed coefficients."));
   }
 };
 
 /**
- * A linear operator on the state space, held by handle.
+ * A linear operator on the state space -- an ExaDG operator's vmult, held by handle.
  *
  * apply() is the only method pyMOR always needs. Each of the others unlocks a capability and
  * costs nothing to leave alone:
  *
  *     apply_transpose            output error estimators, dual-weighted residuals
  *     apply_inverse              full-order solves, greedy basis generation, LSPG, certification
- *     apply_inverse_transpose    adjoint solves
  *     restricted                 empirical interpolation, and hyper-reduction after it
- *
- * The two transposes default to forwarding to their non-transposed counterpart *and abort
- * unless is_symmetric() says that is legitimate*. So a symmetric operator writes nothing extra,
- * a non-symmetric one is told to implement the transpose, and neither gets a wrong answer. This
- * matters at the first non-symmetric operator -- a Navier-Stokes momentum block -- where the
- * old assumption would have produced plausible numbers rather than a failure.
  */
 template<typename VectorType>
 class LinearOperator
@@ -140,54 +128,39 @@ class LinearOperator
 public:
   virtual ~LinearOperator() = default;
 
-  /**
-   * dst = A src.
-   */
+  /// dst = A src.
   virtual void
   apply(VectorType & dst, VectorType const & src) const = 0;
 
-  /**
-   * Whether A == A^T. Opt-in: the default claims nothing.
-   */
+  /// Declare A == A^T. Opt-in: the default claims nothing.
   virtual bool
   is_symmetric() const
   {
     return false;
   }
 
-  /**
-   * dst = A^T src.
-   */
-  virtual void
-  apply_transpose(VectorType & dst, VectorType const & src) const
-  {
-    AssertThrow(is_symmetric(),
-                dealii::ExcMessage("apply_transpose() is not implemented for this operator and "
-                                   "it does not declare is_symmetric()."));
-
-    apply(dst, src);
-  }
-
-  /**
-   * Whether apply_inverse() will do anything. Opt-in, like is_symmetric().
-   *
-   * Declared rather than probed because probing costs a solve, and because pyMOR decides *once*,
-   * when the operator is built, whether to route inversions through this application's solver or
-   * through its own generic path.
-   */
+  /// Declare that apply_inverse() will do something. Opt-in, like is_symmetric().
   virtual bool
   has_inverse() const
   {
     return false;
   }
 
+  /// dst = A^T src. Override unless the operator is symmetric.
+  virtual void
+  apply_transpose(VectorType & dst, VectorType const & src) const
+  {
+    AssertThrow(is_symmetric(),
+                dealii::ExcMessage("Override apply_transpose(), or declare is_symmetric()."));
+
+    apply(dst, src);
+  }
+
   /**
-   * Solves A x = rhs, or returns nullptr if this operator has no solver.
+   * Solve A x = rhs, or return nullptr for an operator with no solver.
    *
-   * nullptr is a legitimate answer and pyMOR handles it: the operator is then one it can
-   * multiply but not invert, and an algorithm needing a solve reports an InversionError rather
-   * than falling back to converting the operator into a dense matrix -- which cannot work for a
-   * vector type whose entries never enter Python.
+   * nullptr is a legitimate answer: pyMOR then reports an InversionError rather than falling
+   * back to building a dense matrix, which cannot work for a vector it never sees the entries of.
    */
   virtual std::shared_ptr<VectorType>
   apply_inverse(VectorType const & /*rhs*/) const
@@ -195,31 +168,25 @@ public:
     return nullptr;
   }
 
-  /**
-   * Solves A^T x = rhs.
-   */
+  /// Solve A^T x = rhs. Override unless the operator is symmetric.
   virtual std::shared_ptr<VectorType>
   apply_inverse_transpose(VectorType const & rhs) const
   {
     AssertThrow(is_symmetric(),
-                dealii::ExcMessage("apply_inverse_transpose() is not implemented for this "
-                                   "operator and it does not declare is_symmetric()."));
+                dealii::ExcMessage(
+                  "Override apply_inverse_transpose(), or declare is_symmetric()."));
 
     return apply_inverse(rhs);
   }
 
-  /**
-   * The operator restricted to these output degrees of freedom, or nullptr if unsupported.
-   */
+  /// The operator on these output degrees of freedom, or nullptr if it cannot be restricted.
   virtual std::shared_ptr<RestrictedOperator>
   restricted(std::vector<dealii::types::global_dof_index> const & /*output_dofs*/) const
   {
     return nullptr;
   }
 
-  /**
-   * A label for diagnostics and for pyMOR's operator names.
-   */
+  /// Label used for pyMOR's operator name and in diagnostics.
   virtual std::string
   get_name() const
   {
@@ -230,29 +197,21 @@ public:
 /**
  * An operator whose coefficients arrive at apply time rather than at construction.
  *
- * The alternative presentation of a parametric operator. Given as a sum of affine components,
- * pyMOR sees the full parametric structure and projects each component exactly -- at a cost of
- * one full-order apply per component per basis vector, which is linear in a parameter dimension
- * that may grow with the mesh. Given as one of these instead, the parameter dependence is opaque
- * and pyMOR reaches for empirical interpolation, whose cost is set by the interpolation rather
- * than by the mesh. An application may offer either, both, or neither.
+ * The alternative to declaring affine components, and an application may offer either, both or
+ * neither. As components, pyMOR projects each one exactly, at one full-order apply per component
+ * per basis vector -- linear in a parameter count that grows with the mesh once the coefficient
+ * is per cell. As one of these, the parameter dependence is opaque and pyMOR reaches for
+ * empirical interpolation, whose cost is set by the interpolation instead.
  */
 template<typename VectorType>
 class ParametricOperator : public LinearOperator<VectorType>
 {
 public:
-  /**
-   * Installs the coefficients used by every subsequent apply().
-   *
-   * Indexed exactly like FullOrderModel::operator_components(), so a caller that can build the
-   * affine form can drive this one with the same vector and get the same operator.
-   */
+  /// Coefficients for every subsequent apply(), indexed like operator_components().
   virtual void
   set_coefficients(std::vector<double> const & coefficients) = 0;
 
-  /**
-   * Which entry of parameter_shape() the coefficients belong to.
-   */
+  /// Which entry of parameter_shape() those coefficients belong to.
   virtual unsigned int
   parameter_slot() const
   {
@@ -261,12 +220,12 @@ public:
 };
 
 /**
- * A linear map from the state space to a fixed number of scalar outputs.
+ * A linear map from the state to a fixed number of scalar outputs: sensor readings, a drag
+ * coefficient, an average over a subdomain.
  *
- * Sensor readings, a drag coefficient, an average over a subdomain -- whatever the quantity of
- * interest is. Used as a pyMOR Model's output functional, so that its projection onto the
- * reduced basis comes out of the reductor along with the operators and the reduced model can
- * predict outputs without ever reconstructing a full field.
+ * Used as the pyMOR model's output functional, so its projection onto the reduced basis comes out
+ * of the reductor with the operators and the reduced model predicts outputs without ever
+ * reconstructing a full field.
  */
 template<typename VectorType>
 class Functional
@@ -280,12 +239,7 @@ public:
   virtual std::vector<double>
   apply(VectorType const & src) const = 0;
 
-  /**
-   * B^T w, mapping output weights back to the state space.
-   *
-   * pyMOR needs this as apply_adjoint: the output error estimator forms the Riesz representative
-   * of B^T and fails without it.
-   */
+  /// B^T w. pyMOR's output error estimator forms the Riesz representative of B^T and needs this.
   virtual std::shared_ptr<VectorType>
   apply_transpose(std::vector<double> const & weights) const = 0;
 };
@@ -293,10 +247,10 @@ public:
 /**
  * One affine component together with the parameter entry its coefficient comes from.
  *
- * A(mu) = sum_i c(mu, slot_i, index_i) * A_i, where the coefficient function c is chosen in
- * Python. slot selects an entry of parameter_shape() and index a position within it, so an
- * application with a scalar viscosity and sixteen forcing amplitudes declares shape {1, 16} and
- * tags its components (0, 0) and (1, 0..15).
+ * A(mu) = sum_i c(mu, slot_i, index_i) A_i, with the coefficient function chosen in Python. slot
+ * selects an entry of parameter_shape() and index a position within it, so a model with a scalar
+ * viscosity and sixteen forcing amplitudes declares shape {1, 16} and tags its components (0, 0)
+ * and (1, 0..15).
  */
 template<typename VectorType>
 struct AffineComponent
@@ -307,9 +261,7 @@ struct AffineComponent
   unsigned int index = 0;
 };
 
-/**
- * One affine component of a parameter-dependent right-hand side.
- */
+/// One affine component of a parameter-dependent right-hand side.
 template<typename VectorType>
 struct AffineVector
 {
@@ -320,16 +272,12 @@ struct AffineVector
 };
 
 /**
- * The full-order model an application exposes to pyMOR.
+ * The model an application exposes: whatever owns the MatrixFree, the DoFHandler and the solver.
  *
- * Implement this, bind the concrete class with pybind11, and the Python layer builds a pyMOR
- * Model from it without further help. Pure virtual methods are the ones no application can
- * avoid; everything else declares a capability and defaults to not having it.
- *
- * The methods handing out operators are deliberately non-const. An operator returned here holds
- * the model and will mutate it -- installing a coefficient, rebuilding a preconditioner -- so
- * producing one is not a const operation, and saying so beats a const method that hands out a
- * mutable reference to itself.
+ * Pure virtuals are what no application can avoid; everything else declares a capability and
+ * defaults to not having it. The methods handing out operators are non-const because an operator
+ * returned here holds the model and will mutate it -- installing a coefficient, rebuilding a
+ * preconditioner.
  */
 template<typename VectorType>
 class FullOrderModel : public std::enable_shared_from_this<FullOrderModel<VectorType>>
@@ -339,26 +287,22 @@ public:
 
   // --- the state space ---------------------------------------------------------------------
 
-  /**
-   * Global number of degrees of freedom, summed over ranks.
-   */
+  /// Global number of degrees of freedom, summed over ranks.
   virtual dealii::types::global_dof_index
   n_dofs() const = 0;
 
-  /**
-   * A zero vector with this model's partitioning and ghosting.
-   */
+  /// A zero vector with this model's partitioning and ghosting.
   virtual std::shared_ptr<VectorType>
   zero_vector() const = 0;
 
   /**
-   * Projects a vector onto the subspace the operators are valid on.
+   * Project onto the subspace the operators are valid on.
    *
-   * Called on every vector the Python layer creates that did not come out of a solve -- random
-   * probes, empirical interpolation candidates, data read from NumPy. A discretisation with
-   * eliminated Dirichlet rows zeroes them here, because an affine decomposition holds only on
-   * that subspace: on a constrained row every component acts as the identity, so summing P of
-   * them scales the entry by the sum of the coefficients rather than leaving it alone.
+   * Called on every vector the Python layer builds that did not come out of a solve: random
+   * probes, interpolation candidates, data read from NumPy. Eliminate Dirichlet rows here if the
+   * discretisation has them, because an affine decomposition holds only on that subspace -- on a
+   * constrained row every component acts as the identity, so summing P of them scales the entry
+   * by the sum of the coefficients instead of leaving it alone.
    *
    * The default is a no-op, which is correct for a discretisation that constrains nothing.
    */
@@ -369,31 +313,21 @@ public:
 
   // --- structure ---------------------------------------------------------------------------
 
-  /**
-   * Sizes of the parameter groups, e.g. {16} for one field of sixteen values, or {1, 16} for a
-   * scalar alongside a field. Empty for a model with no parameters.
-   *
-   * Deliberately shapes and not names: what the parameters are *called* is a modelling choice
-   * and lives in Python, where renaming one does not mean a recompile.
-   */
+  /// Sizes of the parameter groups: {16} for one field, {1, 16} for a scalar beside a field.
   virtual std::vector<unsigned int>
   parameter_shape() const
   {
     return {};
   }
 
-  /**
-   * Affine components of the operator. Empty if the model offers only a parametric operator.
-   */
+  /// Affine components of the operator. Empty if only a parametric operator is offered.
   virtual std::vector<AffineComponent<VectorType>>
   operator_components()
   {
     return {};
   }
 
-  /**
-   * The operator as a single parametric object, or nullptr.
-   */
+  /// The operator as a single parametric object, or nullptr.
   virtual std::shared_ptr<ParametricOperator<VectorType>>
   parametric_operator()
   {
@@ -403,16 +337,13 @@ public:
   /**
    * The operator at fixed component coefficients, or nullptr if it cannot be assembled.
    *
-   * What makes a reduced model solvable rather than merely multipliable. pyMOR collapses a
-   * linear combination of the affine components at a parameter and asks for it here; returning
-   * an operator carrying a solver is what routes full-order solves through this application's
-   * own preconditioned Krylov method.
+   * What makes a model solvable rather than only multipliable: pyMOR collapses a linear
+   * combination of the affine components at a parameter and asks for it here, and an operator
+   * carrying a solver routes full-order solves through this application's own Krylov method.
    *
-   * Coefficients are indexed like operator_components() and may be **signed**: a reductor
-   * legitimately forms differences of operators. Return nullptr for a combination this
-   * application cannot represent -- a negative diffusivity, say -- and pyMOR falls back to its
-   * generic path. Deciding that here is the point: whoever wrote the coefficient knows what it
-   * means, and the Python layer does not.
+   * Coefficients are indexed like operator_components() and may be **signed** -- a reductor
+   * legitimately forms differences of operators. Return nullptr for anything this application
+   * cannot represent, such as a negative diffusivity, and pyMOR falls back to its generic path.
    */
   virtual std::shared_ptr<LinearOperator<VectorType>>
   assemble(std::vector<double> const & /*coefficients*/)
@@ -422,9 +353,7 @@ public:
 
   // --- right-hand side ---------------------------------------------------------------------
 
-  /**
-   * The parameter-independent right-hand side, or nullptr.
-   */
+  /// The parameter-independent right-hand side, or nullptr.
   virtual std::shared_ptr<VectorType>
   rhs()
   {
@@ -434,9 +363,8 @@ public:
   /**
    * Affine components of a parameter-dependent right-hand side.
    *
-   * Both this and rhs() may be present, in which case the right-hand side is their sum. An
-   * application whose parameters live entirely in the forcing declares nothing in rhs() and
-   * everything here.
+   * Both this and rhs() may be present, in which case the right-hand side is their sum. A model
+   * whose parameters live entirely in the forcing declares nothing in rhs() and everything here.
    */
   virtual std::vector<AffineVector<VectorType>>
   rhs_components()
@@ -447,9 +375,9 @@ public:
   // --- optional extras ---------------------------------------------------------------------
 
   /**
-   * Inner products, by name. "mass" is conventionally the L2 product and the one a proper
-   * orthogonal decomposition should be taken in; "energy" the product a coercive error
-   * estimator is certified in.
+   * Inner products by name. "mass" is conventionally the L2 product, and the one a proper
+   * orthogonal decomposition should be taken in; "energy" the product a coercive error estimator
+   * is certified in.
    */
   virtual std::map<std::string, std::shared_ptr<LinearOperator<VectorType>>>
   products()
@@ -457,9 +385,7 @@ public:
     return {};
   }
 
-  /**
-   * The output functional, or nullptr for a model with no quantity of interest.
-   */
+  /// The output functional, or nullptr for a model with no quantity of interest.
   virtual std::shared_ptr<Functional<VectorType>>
   output_functional()
   {
@@ -467,10 +393,10 @@ public:
   }
 
   /**
-   * Writes fields as a VTU/PVTU record and returns the path of the record written.
+   * Write fields as a VTU/PVTU record and return the record's path.
    *
    * A file writer rather than a plot window: the model may be on a compute node, and under MPI
-   * each rank holds a piece of the field, so there is nothing for one process to draw.
+   * each rank holds a piece of the field.
    */
   virtual std::string
   write_vtu(std::string const & /*directory*/,

@@ -233,29 +233,10 @@ public:
   }
 
   /**
-   * Applies the restricted operator.
+   * Applies the restricted operator at the given block coefficients.
    *
-   * @param log_diffusivity One value per block.
-   * @param source_values The vector's entries on the source degrees of freedom.
-   * @return The operator's values on the output degrees of freedom.
-   */
-  std::vector<double>
-  apply(std::vector<double> const & log_diffusivity,
-        std::vector<double> const & source_values) const
-  {
-    std::vector<double> diffusivity(log_diffusivity.size());
-    for(unsigned int p = 0; p < log_diffusivity.size(); ++p)
-      diffusivity[p] = std::exp(log_diffusivity[p]);
-
-    return apply_coefficients(diffusivity, source_values);
-  }
-
-  /**
-   * Applies the restricted operator with the block coefficients given directly.
-   *
-   * Needed because a single affine component is the operator with the indicator of one block as
-   * its coefficient, and an indicator cannot be expressed as the exponential of a log
-   * diffusivity. This is the entry point pyMOR's empirical interpolation uses.
+   * Coefficients, not parameters: a single affine component is the operator with the indicator
+   * of one block, and how a parameter maps to a coefficient is decided in Python.
    */
   std::vector<double>
   apply_coefficients(std::vector<double> const & diffusivity,

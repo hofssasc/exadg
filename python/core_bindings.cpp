@@ -20,21 +20,12 @@
  */
 
 /*
- * exadg._core -- the vector and operator vocabulary, bound exactly once.
+ * exadg._core -- the vector and operator vocabulary of exadg/pymor/interface.h, bound once.
  *
  * Every application module imports this one and returns objects of the types registered here.
- * That is not a convenience: pybind11 keeps a process-global registry keyed by std::type_index,
- * so a second module binding dealii::LinearAlgebra::distributed::Vector would abort with
  *
- *     ImportError: generic_type: type "Vector" is already registered!
- *
- * the moment both were imported into one interpreter -- which any script comparing two
- * applications, and any test suite covering both, does.
- *
- * Nothing here knows any physics. The classes are the abstract interfaces of
- * exadg/pymor/interface.h; applications derive from them and this module makes the base classes
- * visible to Python, so that python/exadg/mor/binding.py can wrap any of them without knowing
- * what it is wrapping.
+ * Nothing here knows any physics; it only makes the abstract base classes visible to Python, so
+ * that python/exadg/mor/binding.py can wrap any of them without knowing what it is wrapping.
  */
 
 // C/C++
@@ -108,11 +99,9 @@ ensure_mpi_initialized()
 }
 
 /**
- * Registers the vector type and everything templated on it, under the given name prefix.
+ * Registers a vector type and everything templated on it, under the given name prefix.
  *
- * Templated so that a second vector type -- a block vector, for the saddle point models -- is one
- * more call rather than a second copy of this file. The prefix keeps the Python names distinct,
- * since pybind11 registers by name within a module.
+ * Templated for other vector types, e.g. a block vector for the saddle-point models.
  */
 template<typename V>
 void
@@ -140,12 +129,11 @@ register_vector_type(py::module_ & module, std::string const & prefix)
       [](V const & v) {
         // Index and magnitude of the largest entry, which is what empirical interpolation uses
         // to pick its next interpolation point. The index is *global*, because that is the
-        // index space dofs() is addressed in and the one an interpolation point has to survive
-        // in; returning a local index would be silently wrong on more than one rank.
+        // index space dofs() is addressed in.
         //
         // Two reductions rather than one MPI_MAXLOC: a maximum over the values, then a minimum
         // over the global indices of the ranks that attain it. That costs one extra allreduce
-        // and buys a deterministic tie-break -- the smallest global index always wins, whatever
+        // but ensures a deterministic tie-break: the smallest global index always wins, whatever
         // the partitioning. MAXLOC would break ties by rank, so the interpolation point chosen
         // would depend on the number of ranks, and a basis built on two ranks would differ from
         // one built on four.
@@ -303,10 +291,9 @@ PYBIND11_MODULE(_core, module)
   using namespace ExaDG::PyMOR;
 
   module.doc() =
-    "ExaDG's vector and operator vocabulary for pyMOR.\n\n"
-    "Bound once for the whole process. Application modules import this one and return objects "
-    "of these types; python/exadg/mor/binding.py wraps them in pyMOR's interfaces without "
-    "knowing what they discretise.";
+    "ExaDG's vector and operator vocabulary for pyMOR, bound once for the whole process.\n\n"
+    "Application modules import this one and return objects of these types; "
+    "exadg.mor.binding wraps them in pyMOR's interfaces without knowing what they discretise.";
 
   ensure_mpi_initialized();
 
@@ -317,14 +304,6 @@ PYBIND11_MODULE(_core, module)
   module.def("mpi_rank",
              [] { return dealii::Utilities::MPI::this_mpi_process(MPI_COMM_WORLD); },
              "This process's rank in MPI_COMM_WORLD.");
-
-  module.def("mpi_initialized",
-             [] {
-               int started = 0;
-               MPI_Initialized(&started);
-
-               return started != 0;
-             });
 
   py::class_<RestrictedOperator, std::shared_ptr<RestrictedOperator>>(module, "RestrictedOperator")
     .def_property_readonly("source_dofs", &RestrictedOperator::get_source_dofs)

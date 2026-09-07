@@ -21,29 +21,29 @@
 """ExaDG's vectors and operators, dressed in pyMOR's interfaces.
 
 Nothing here knows any physics. Every class wraps one of the abstract types of
-``exadg/pymor/interface.h`` -- a ``LinearOperator``, a ``ParametricOperator``, a ``Functional``,
-a ``FullOrderModel`` -- so the same wrappers serve every ExaDG application. What a particular
-problem *is* enters in :mod:`exadg.mor.models`, which assembles these into a pyMOR Model, and in
-the application's C++, which implements the interface.
+``exadg/pymor/interface.h``, so the same wrappers serve every ExaDG application:
+
+    ExaDGVector, ExaDGVectorSpace   distributed::Vector, FullOrderModel
+    ExaDGOperator                   LinearOperator      (an ExaDG operator's vmult)
+    ExaDGParametricOperator         ParametricOperator
+    ExaDGFunctional                 Functional          (the quantity of interest)
+    RestrictedExaDGOperator         RestrictedOperator  (hyper-reduction)
+    ExaDGSolver                     apply_inverse       (the application's Krylov solve)
+
+What a particular problem *is* enters in the application's C++ and in :mod:`exadg.mor.models`,
+which assembles these into a pyMOR Model.
 
 Degrees of freedom never enter Python. Following ``pymor/bindings/fenics.py``, a vector is an
 opaque handle and every operation on it is forwarded to C++; ``to_numpy`` exists for tests and
-debugging only. pyMOR's manual is explicit that this is the intended design: *"direct memory
-access to the vector data from Python is not required to integrate a solver with pyMOR."*
+debugging only.
 
-**Capabilities are declared, never assumed.** Whether an operator is symmetric, can be inverted,
-or can be restricted to a few degrees of freedom is answered by the C++ side, because that is
-where the answer is known. This module asks and reports; it does not guess. A wrong guess here
-would be invisible -- an adjoint solve that silently solves the wrong system produces plausible
-numbers -- so the defaults on the C++ side abort rather than improvise.
+Capabilities are declared by C++, never assumed here: whether an operator is symmetric, can be
+inverted, or can be restricted. This module asks and reports.
 
-**Running under MPI.** Use the model factories' ``mpi=True`` path, which wraps the per-rank model
-with :func:`pymor.models.mpi.mpi_wrap_model`. pyMOR then runs Python on every rank with rank 0
-dispatching, and every method here executes simultaneously on all of them. Two consequences shape
-the code below: an operation returning a value must return the *global* answer on every rank
-rather than that rank's slice -- ``dofs`` and ``amax`` do their own reductions in C++ -- and any
-vector pyMOR hands in arrives whole on every rank, so ``vector_from_numpy`` keeps only the part
-it owns.
+Under MPI pyMOR runs Python on every rank with rank 0 dispatching, so every method here executes
+on all ranks at once. Anything returning a value must return the *global* answer -- ``dofs`` and
+``amax`` reduce in C++ -- and a vector pyMOR hands in arrives whole on every rank, so
+``vector_from_numpy`` keeps only the part it owns.
 """
 
 from pathlib import Path
@@ -164,11 +164,8 @@ class ExaDGVectorSpace(ListVectorSpace):
     def vector_from_numpy(self, data, ensure_copy=False):
         """Build a vector from NumPy data, projected onto the admissible subspace.
 
-        The projection is what ``make_admissible`` is for, and it is deliberate: pyMOR builds
-        vectors this way for random probes and test data, and a discretisation with eliminated
-        Dirichlet rows needs those rows zeroed before its affine decomposition holds. A
-        discretisation that constrains nothing implements ``make_admissible`` as a no-op and
-        pays nothing here.
+        pyMOR builds vectors this way for random probes and test data, and a discretisation with
+        eliminated Dirichlet rows needs those rows zeroed before its affine decomposition holds.
         """
         vector = self.fom.zero_vector()
         vector.assign_numpy(np.ascontiguousarray(data, dtype=float))
@@ -205,13 +202,12 @@ class ExaDGVectorSpace(ListVectorSpace):
 class ExaDGSolver(ListVectorArrayBasedSolver):
     """Hands linear systems to the application's own solver.
 
-    This is pyMOR's intended extension point for an external solver: ``Operator.apply_inverse``
-    delegates to ``operator.solver``, and :class:`ListVectorArrayBasedSolver` supplies the loop
-    over the columns of a vector array, so only the single-vector solve has to be written.
+    pyMOR's extension point for an external solver: ``Operator.apply_inverse`` delegates to
+    ``operator.solver``, and the base class supplies the loop over a vector array's columns.
 
     Attached only to operators whose C++ side declares ``has_inverse``. The adjoint solve is a
-    separate C++ entry point rather than the same solve: it is the same system only for a
-    symmetric operator, and that is the operator's claim to make, not this module's.
+    separate C++ entry point, because it is the same system only for a symmetric operator and
+    that is the operator's claim to make.
     """
 
     def _solve_one_vector(self, operator, v, mu, initial_guess, prepare_data):
@@ -286,11 +282,8 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
         """Restrict to the given output degrees of freedom, for empirical interpolation.
 
         ``NotImplementedError`` when the application declines, because that is what pyMOR checks
-        for: :func:`pymor.operators.mpi._MPIOperator_restricted` catches exactly this and reports
-        the operator as having no restriction, so interpolation degrades to evaluating the full
-        operator instead of producing a wrong one. The reasons for declining -- more than one
-        rank, a coefficient the restriction cannot represent -- belong with the discretisation
-        and are documented there.
+        for: interpolation then degrades to evaluating the full operator instead of producing a
+        wrong one. The reasons for declining belong with the discretisation and live there.
         """
         handle = self.impl.restricted([int(d) for d in dofs])
 
@@ -310,14 +303,12 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
         """Collapse ``sum_i c_i A_i`` into a single operator the application can also invert.
 
         pyMOR calls this when a ``LincombOperator`` is assembled at a parameter. Returning an
-        operator here rather than ``None`` is what gives the model an ``apply_inverse``: without
-        it the assembled object stays a ``LincombOperator``, which pyMOR can only invert by
-        converting to a NumPy matrix, and that is impossible for a vector type whose entries
-        never enter Python.
+        operator rather than ``None`` is what gives the model an ``apply_inverse``: otherwise the
+        assembled object stays a ``LincombOperator``, which pyMOR can only invert by building a
+        NumPy matrix -- impossible for a vector whose entries never enter Python.
 
-        Whether a given combination *can* be assembled is the application's call, not this
-        module's -- the coefficients mean something there and nothing here. ``None`` comes back
-        for anything it declines, and pyMOR's generic path takes over, which is correct if slower.
+        Whether a combination *can* be assembled is the application's call: the coefficients mean
+        something there and nothing here.
         """
         if identity_shift != 0.0:
             return None
@@ -348,23 +339,17 @@ class ExaDGOperator(ListVectorArrayOperatorBase):
 class ExaDGParametricOperator(ExaDGOperator):
     """An ExaDG ``ParametricOperator``: one operator whose coefficients arrive with the parameter.
 
-    The same equation as the affine form, presented so that pyMOR cannot see its structure. Given
-    the affine components, pyMOR projects each exactly, at one full-order apply per component per
-    basis vector -- linear in a parameter dimension that grows with the mesh once the coefficient
-    is per cell. Given this instead, pyMOR reaches for empirical interpolation, whose cost is set
-    by the interpolation rather than by the mesh.
+    The same equation as the affine form, presented so that pyMOR cannot see its structure and
+    reaches for empirical interpolation instead of projecting each component exactly.
 
-    The coefficients are the *same functionals* the affine form would use, evaluated here instead
-    of by pyMOR. That is what keeps the two presentations of one problem in step: a change to the
-    parameterisation is made in one place and both forms follow.
+    The coefficients are the *same functionals* the affine form uses, evaluated here rather than
+    by pyMOR, so a change to the parameterisation is made in one place and both forms follow.
 
-    **Do not train an interpolation on** ``operator.apply(model.solve(mu), mu)``. That is what
-    :func:`pymor.algorithms.ei.interpolate_operators` builds by default, and it is meaningful for
-    the nonlinear and instationary operators it was written for. For a linear stationary problem
-    it is degenerate: ``A(mu) u(mu) = f`` for *every* parameter, so the evaluation set is rank
-    one. The greedy then reports convergence to 1e-15 after a handful of points, having learnt
-    the right-hand side and nothing about the operator. Train on ``A(mu) V`` for the reduced basis
-    ``V`` instead -- those are the vectors the reduced model will actually feed it.
+    **Do not train an interpolation on** ``operator.apply(model.solve(mu), mu)``, which is what
+    :func:`pymor.algorithms.ei.interpolate_operators` builds by default. For a linear stationary
+    problem it is degenerate: ``A(mu) u(mu) = f`` for *every* parameter, so the evaluation set is
+    rank one and the greedy converges to 1e-15 having learnt the right-hand side and nothing
+    about the operator. Train on ``A(mu) V`` for the reduced basis ``V`` instead.
     """
 
     def __init__(self, space, impl, coefficients, name=None):
@@ -402,10 +387,9 @@ class RestrictedExaDGOperator(Operator):
 
         op.apply(U, mu).dofs(dofs) == restricted.apply(source.from_numpy(U.dofs(source_dofs)), mu)
 
-    A violation does not raise. Empirical interpolation simply converges to a slightly different
-    operator than the one being reduced, so the identity is worth checking explicitly --
-    ``tests/pymor/restricted_operator.cc`` does it in C++ and
-    ``python/examples/thermal_block_ei.py`` through pyMOR's own call path.
+    A violation does not raise -- interpolation just converges to a slightly different operator --
+    so it is checked explicitly, in C++ by ``tests/pymor/restricted_operator.cc`` and through
+    pyMOR's own call path by ``python/examples/thermal_block_ei.py``.
     """
 
     linear = True
@@ -439,9 +423,8 @@ class RestrictedExaDGOperator(Operator):
 class ExaDGFunctional(ListVectorArrayOperatorBase):
     """An ExaDG ``Functional``: the map from a state to the quantities of interest.
 
-    Used as a pyMOR Model's output functional, so that its projection onto the reduced basis comes
-    out of the reductor along with the projected operators rather than having to be assembled
-    separately.
+    Used as a pyMOR Model's output functional, so its projection onto the reduced basis comes out
+    of the reductor with the projected operators.
     """
 
     linear = True
@@ -496,10 +479,8 @@ class ExaDGVisualizer(ImmutableObject):
     """Writes vector arrays as VTU/PVTU records, as pyMOR's ``visualizer`` hook.
 
     A file writer rather than a plot window: the model may be on a compute node, and under MPI
-    each rank holds a piece of the field, so there is nothing for one process to draw. pyMOR's
-    :class:`~pymor.models.mpi.MPIVisualizer` calls this on every rank, and deal.II's
-    ``write_vtu_with_pvtu_record`` writes one piece per rank plus a ``.pvtu`` that ParaView opens
-    as one field -- so the parallel case needs no separate path.
+    each rank holds a piece of the field. deal.II writes one piece per rank plus a ``.pvtu`` that
+    ParaView opens as one field, so the parallel case needs no separate path.
 
     ``reductor.reconstruct(rom.solve(mu))`` lands in the same space as ``fom.solve(mu)``, so the
     usual three-way comparison works::

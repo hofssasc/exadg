@@ -52,11 +52,9 @@ namespace ExaDG
  * available on every rank. Unlike PointwiseOutputGenerator this does not require deal.II to be
  * configured with HDF5, and it is not tied to a time loop.
  *
- * The transpose is available as well -- evaluate_transpose(), and evaluate_gradient_transpose()
- * for functionals of the derivative. That is what an adjoint needs, and it is the difference
- * between a parameter gradient costing one solve per *parameter* and one solve per *functional*.
- * Because both directions are built from the same set of points, changing the sensor placement
- * is a call to setup() and nothing else: the adjoint follows.
+ * evaluate_transpose() gives B^T, which pyMOR's output error estimator needs in order to form
+ * the Riesz representative of the output functional. Both directions are built from the same set
+ * of points, so changing the sensor placement is a call to setup() and nothing else.
  */
 template<int dim, typename Number>
 class SensorOperator
@@ -224,78 +222,6 @@ public:
     dst.compress(dealii::VectorOperation::add);
   }
 
-  /**
-   * The transpose of point *gradient* evaluation, for functionals of the derivative.
-   *
-   * The counterpart of evaluate_transpose() for J = sum_i w_i . grad u(x_i), which is deal.II
-   * step-14's second dual functional -- the x-derivative in a point -- and everything of that
-   * family. Given that the whole adjoint machinery above it takes a right-hand side vector and
-   * nothing else, this is what makes "any point functional", rather than "sensors", the actual
-   * scope.
-   *
-   * @param weights dim entries per sensor point, point index running slowest.
-   * @param dst Overwritten with sum_i w_i . grad phi_j(x_i).
-   */
-  void
-  evaluate_gradient_transpose(dealii::DoFHandler<dim> const & dof_handler,
-                              std::vector<Number> const &     weights,
-                              VectorType &                    dst) const
-  {
-    AssertThrow(remote_evaluator.get() != nullptr,
-                dealii::ExcMessage("SensorOperator::setup() has to be called first."));
-
-    AssertThrow(weights.size() == n_points() * dim,
-                dealii::ExcMessage("Expected dim weights per sensor point, got " +
-                                   std::to_string(weights.size()) + " for " +
-                                   std::to_string(n_points()) + " points in " +
-                                   std::to_string(dim) + "D."));
-
-    using GradientType = dealii::Tensor<1, dim, Number>;
-
-    dst = 0.0;
-
-    std::vector<Number> const flat = shared_weights(weights, dim);
-
-    std::vector<GradientType> input(n_points());
-    for(unsigned int i = 0; i < n_points(); ++i)
-      for(unsigned int d = 0; d < dim; ++d)
-        input[i][d] = flat[i * dim + d];
-
-    auto const integration_function = [&](auto const & values, auto const & cell_data) {
-      dealii::FEPointEvaluation<1, dim, dim, Number> evaluator(remote_evaluator->get_mapping(),
-                                                               dof_handler.get_fe(),
-                                                               dealii::update_gradients);
-
-      std::vector<Number>                          local_values;
-      std::vector<dealii::types::global_dof_index> local_dof_indices;
-
-      for(auto const cell : cell_data.cell_indices())
-      {
-        auto const cell_dofs =
-          cell_data.get_active_cell_iterator(cell)->as_dof_handler_iterator(dof_handler);
-
-        evaluator.reinit(cell_dofs, cell_data.get_unit_points(cell));
-
-        auto const shares = cell_data.get_data_view(cell, values);
-        for(auto const q : evaluator.quadrature_point_indices())
-          evaluator.submit_gradient(shares[q], q);
-
-        local_values.resize(cell_dofs->get_fe().n_dofs_per_cell());
-        evaluator.test_and_sum(local_values, dealii::EvaluationFlags::gradients);
-
-        local_dof_indices.resize(cell_dofs->get_fe().n_dofs_per_cell());
-        cell_dofs->get_dof_indices(local_dof_indices);
-
-        dealii::AffineConstraints<Number>().distribute_local_to_global(local_values,
-                                                                       local_dof_indices,
-                                                                       dst);
-      }
-    };
-
-    remote_evaluator->template process_and_evaluate<GradientType>(input, integration_function);
-
-    dst.compress(dealii::VectorOperation::add);
-  }
 
   unsigned int
   n_points() const
