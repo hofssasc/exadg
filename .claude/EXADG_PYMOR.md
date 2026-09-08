@@ -86,10 +86,14 @@ setting in the input file selects them, the convective term is the only differen
 - **`solve_nonlinear_problem` resets the mass scaling to 1.0 on every call.** A steady residual
   carries no mass term, so any operator that called `set_scaling_factor_mass_operator(0.0)` once at
   construction silently becomes `A + M` after the first solve. Set it inside `apply`.
-- **`A'(u)` is not the exact derivative of `A(u)`.** ExaDG over-integrates the convective term
-  (`quad_index_nonlinear`) and its linearisation (`quad_index_linearized`) differently; a finite
-  difference plateaus at ~3.4e-4. Newton converges linearly, not quadratically. Deliberate, not a
-  bug — the solution is defined by the residual.
+- **`A'(u)` is not the exact derivative of `A(u)`, and the Lax-Friedrichs term is the whole
+  reason.** Its `lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|)` is not differentiable, so
+  `calculate_lax_friedrichs_flux_linearized` freezes it at the linearisation point. Measured on
+  the forced box: a finite difference agrees to **4.5e-08 at `upwind_factor = 0`** and only
+  **5.1e-03 at `upwind_factor = 1`**. Newton converges linearly, not quadratically. Deliberate,
+  not a bug. (It is *not* a quadrature effect — with the default
+  `QuadratureRuleLinearization::Overintegration32k` and a non-explicit convective term,
+  `get_quad_index_velocity_linearized()` and `..._overintegration()` return the same index.)
 - **`SolverControl::NoConvergence` escaping `solve()` aborts the interpreter.** Caught; the model
   declines, which is what lets a greedy skip an unreachable training parameter.
 - **A snapshot velocity is discretely divergence-free**, so `Bu ≈ 0` and an adjoint check probed
