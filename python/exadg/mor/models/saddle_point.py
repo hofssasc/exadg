@@ -97,6 +97,52 @@ class ExaDGNonlinearMomentum(Operator):
         )
 
 
+def _solve_blocks(fom, velocity_space, pressure_space, f, g):
+    """Solve the coupled system once per right-hand side, returning the two blocks.
+
+    Shared by the serial and the MPI solver below. Those two differ only in where the model comes
+    from and whether the call is dispatched to every rank -- never in what is solved, so what is
+    solved is written once.
+    """
+    velocities, pressures = [], []
+    for i in range(len(f)):
+        result = fom.solve(f.vectors[i].impl, g.vectors[i].impl)
+
+        if result is None:
+            raise InversionError("the application declined to solve this system")
+
+        u, p = result
+        velocities.append(velocity_space.make_vector(u))
+        pressures.append(pressure_space.make_vector(p))
+
+    return velocity_space.make_array(velocities), pressure_space.make_array(pressures)
+
+
+def _visualize_arguments(U, title, legend, filename, directory):
+    """The part of visualize() that does not depend on how the write is dispatched.
+
+    Returns ``(arrays, names, base)``: the fields to write, one name each, and the output path
+    without its suffix.
+    """
+    arrays = U if isinstance(U, tuple) else (U,)
+
+    for array in arrays:
+        # A time series would be several records rather than several fields; until an
+        # instationary model exists, refusing beats writing only the first vector.
+        if len(array) != 1:
+            raise NotImplementedError(
+                f"visualize() writes one vector per field, got {len(array)}."
+            )
+
+    names = [
+        legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
+        for i in range(len(arrays))
+    ]
+    base = Path(filename) if filename else Path(directory) / (title or "solution")
+
+    return arrays, names, base
+
+
 class ExaDGCoupledSolver(Solver):
     """Hands the coupled system to the application's own solver.
 
@@ -114,25 +160,12 @@ class ExaDGCoupledSolver(Solver):
 
     def _solve(self, operator, V, mu, initial_guess):
         velocity_space, pressure_space = operator.source.subspaces
-        velocity_rhs, pressure_rhs = V.blocks
+        f, g = V.blocks
 
-        velocities, pressures = [], []
-        for i in range(len(V)):
-            result = self.fom.solve(velocity_rhs.vectors[i].impl, pressure_rhs.vectors[i].impl)
-
-            if result is None:
-                raise InversionError("the application declined to solve this system")
-
-            u, p = result
-            velocities.append(velocity_space.make_vector(u))
-            pressures.append(pressure_space.make_vector(p))
-
-        solution = operator.source.make_array(
-            [velocity_space.make_array(velocities), pressure_space.make_array(pressures)]
-        )
+        blocks = _solve_blocks(self.fom, velocity_space, pressure_space, f, g)
 
         # pyMOR's Solver contract is (solution, info); the info dict is what return_info exposes
-        return solution, {}
+        return operator.source.make_array(list(blocks)), {}
 
 
 class ExaDGSaddlePointVisualizer:
@@ -153,24 +186,11 @@ class ExaDGSaddlePointVisualizer:
         self.directory = directory
 
     def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
-        arrays = U if isinstance(U, tuple) else (U,)
-
-        names = [
-            legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
-            for i in range(len(arrays))
-        ]
-
-        base = Path(filename) if filename else Path(self.directory) / (title or "solution")
+        arrays, names, base = _visualize_arguments(U, title, legend, filename, self.directory)
 
         written = []
         for position, suffix in enumerate(("velocity", "pressure")):
             blocks = [array.blocks[position] for array in arrays]
-
-            for array in blocks:
-                if len(array) != 1:
-                    raise NotImplementedError(
-                        f"visualize() writes one vector per field, got {len(array)}."
-                    )
 
             written.append(
                 blocks[0].space.impl.write_vtu(
@@ -293,20 +313,8 @@ def _pressure_rhs(space, fom):
 def _local_coupled_solve(model, f, g):
     """Solve on every rank. Called through mpi.call, so the arguments arrive as local objects."""
     velocity_space, pressure_space = model.operator.source.subspaces
-    fom = model.operator.solver.fom
 
-    velocities, pressures = [], []
-    for i in range(len(f)):
-        result = fom.solve(f.vectors[i].impl, g.vectors[i].impl)
-
-        if result is None:
-            raise InversionError("the application declined to solve this system")
-
-        u, p = result
-        velocities.append(velocity_space.make_vector(u))
-        pressures.append(pressure_space.make_vector(p))
-
-    return velocity_space.make_array(velocities), pressure_space.make_array(pressures)
+    return _solve_blocks(model.operator.solver.fom, velocity_space, pressure_space, f, g)
 
 
 def _take(pair, index):
@@ -380,13 +388,7 @@ class MPIExaDGSaddlePointVisualizer:
     def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
         from pymor.tools import mpi
 
-        arrays = U if isinstance(U, tuple) else (U,)
-        names = [
-            legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
-            for i in range(len(arrays))
-        ]
-
-        base = Path(filename) if filename else Path(self.directory) / (title or "solution")
+        arrays, names, base = _visualize_arguments(U, title, legend, filename, self.directory)
 
         return tuple(
             mpi.call(
