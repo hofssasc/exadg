@@ -769,6 +769,91 @@ public:
     return application->get_upwind_factor();
   }
 
+  // ===========================================================================================
+  //  The Lax-Friedrichs stabilisation, as a sum over faces
+  // ===========================================================================================
+  //
+  // S(u) = N(u) - B(u, u) is what is left of the convective operator once its trilinear part is
+  // taken out, and it lives entirely on faces: 0.5 * lambda * jump(u), with
+  // lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|). A face is therefore the natural sampling
+  // unit for hyper-reduction, and the two entry points below are what ECSW needs -- one to train
+  // on, one to evaluate with the weights it produces.
+  //
+  // A face is identified by (batch, lane): matrix-free processes faces in vectorised batches, so
+  // a weight vector is indexed batch * lanes + lane. That numbering is local to a rank and to a
+  // partitioning, which is fine while weights are trained and used in one run; saving them for a
+  // different rank count would need a partition-independent name.
+
+  /// Number of face entities on this rank, interior and boundary.
+  unsigned int
+  n_faces() const
+  {
+    auto const & matrix_free = pde_operator->get_matrix_free();
+
+    return (matrix_free.n_inner_face_batches() + matrix_free.n_boundary_face_batches()) *
+           dealii::VectorizedArray<Number>::size();
+  }
+
+  /// sum_f w_f S_f(u), the stabilisation with one weight per face.
+  std::shared_ptr<VectorType>
+  apply_stabilisation(VectorType const & u, std::vector<double> const & weights)
+  {
+    AssertThrow(weights.size() == n_faces(),
+                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
+                                   std::to_string(weights.size()) + "."));
+
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    face_weights   = &weights;
+    training_basis = nullptr;
+
+    run_face_loop(*dst, owned(u));
+
+    face_weights = nullptr;
+
+    return dst;
+  }
+
+  /**
+   * V^T S_f(u) for every face, row-major of shape (n_faces, n_basis).
+   *
+   * This is the matrix ECSW's non-negative least squares fits: its column sums are the exact
+   * projected stabilisation, and a sparse weight vector reproducing them is a rule for evaluating
+   * S on a handful of faces instead of all of them.
+   *
+   * The projection is done here rather than by integrating and scattering, because
+   * V_i^T S_f = \int_F flux . (V_i,m - V_i,p) is a quadrature sum over the face alone -- no
+   * assembly into a global vector is needed to get one face's contribution.
+   */
+  std::vector<double>
+  stabilisation_contributions(std::vector<std::shared_ptr<VectorType>> const & basis,
+                              VectorType const &                              u)
+  {
+    std::vector<VectorType> ghosted(basis.size());
+    for(unsigned int i = 0; i < basis.size(); ++i)
+    {
+      pde_operator->initialize_vector_velocity(ghosted[i]);
+      ghosted[i].copy_locally_owned_data_from(*basis[i]);
+      ghosted[i].update_ghost_values();
+    }
+
+    std::vector<double> matrix(static_cast<std::size_t>(n_faces()) * basis.size(), 0.0);
+
+    face_weights    = nullptr;
+    training_basis  = &ghosted;
+    training_matrix = &matrix;
+
+    VectorType dummy;
+    pde_operator->initialize_vector_velocity(dummy);
+    run_face_loop(dummy, owned(u));
+
+    training_basis  = nullptr;
+    training_matrix = nullptr;
+
+    return matrix;
+  }
+
   /// The two quadrature rules the convective term is evaluated with: the one used by apply()
   /// (linearised/linearly implicit) and the one used by evaluate_nonlinear_operator().
   std::pair<unsigned int, unsigned int>
@@ -820,6 +905,206 @@ private:
       scratch.pop_front();
 
     return scratch.back();
+  }
+
+  // --- the face loop the two stabilisation entry points share ---------------------------------
+
+  typedef FaceIntegrator<dim, dim, Number> FaceIntegratorU;
+  typedef dealii::Tensor<1, dim, dealii::VectorizedArray<Number>> FaceVector;
+
+  void
+  run_face_loop(VectorType & dst, VectorType const & src)
+  {
+    pde_operator->get_matrix_free().loop(&ForcedFOM<dim>::stabilisation_cell_loop,
+                                         &ForcedFOM<dim>::stabilisation_face_loop,
+                                         &ForcedFOM<dim>::stabilisation_boundary_loop,
+                                         this,
+                                         dst,
+                                         src,
+                                         true /* zero dst */,
+                                         dealii::MatrixFree<dim, Number>::DataAccessOnFaces::values,
+                                         dealii::MatrixFree<dim, Number>::DataAccessOnFaces::values);
+  }
+
+  void
+  stabilisation_cell_loop(dealii::MatrixFree<dim, Number> const &,
+                          VectorType &,
+                          VectorType const &,
+                          std::pair<unsigned int, unsigned int> const &) const
+  {
+    // the stabilisation has no volume term
+  }
+
+  /// The weights of a face batch's lanes, or one when no weights are set.
+  dealii::VectorizedArray<Number>
+  weight_of(unsigned int const face) const
+  {
+    unsigned int const lanes = dealii::VectorizedArray<Number>::size();
+
+    auto weight = dealii::make_vectorized_array<Number>(1.0);
+
+    if(face_weights != nullptr)
+      for(unsigned int lane = 0; lane < lanes; ++lane)
+        weight[lane] = (*face_weights)[face * lanes + lane];
+
+    return weight;
+  }
+
+  /**
+   * Handle one face: either submit its weighted flux, or record its projected contribution.
+   *
+   * The two entry points differ only in what they do with the flux, so it is computed once here.
+   * lambda comes from ExaDG's own kernel rather than being rewritten: it is the definition of the
+   * term being isolated, and a second copy would be a second discretisation.
+   *
+   * The projection is a quadrature sum over the face alone,
+   * V_i^T S_f = int_F flux . (V_i,m - V_i,p), so one face's contribution needs no assembly into
+   * a global vector.
+   */
+  void
+  handle_face(unsigned int const face,
+              FaceIntegratorU &  integrator_m,
+              FaceIntegratorU *  integrator_p) const
+  {
+    unsigned int const lanes = dealii::VectorizedArray<Number>::size();
+
+    std::vector<FaceVector> fluxes(integrator_m.n_q_points);
+
+    for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+    {
+      FaceVector const u_m = integrator_m.get_value(q);
+      FaceVector const u_p =
+        (integrator_p != nullptr) ? integrator_p->get_value(q) : exterior_value(q, integrator_m, face);
+      FaceVector const normal = integrator_m.normal_vector(q);
+
+      auto const lambda = stabilisation_kernel->calculate_lambda(u_m * normal, u_p * normal);
+
+      fluxes[q] = (0.5 * lambda) * (u_m - u_p);
+    }
+
+    if(training_matrix != nullptr)
+    {
+      auto const &      basis = *training_basis;
+      std::size_t const row   = static_cast<std::size_t>(face) * lanes;
+
+      FaceIntegratorU probe_m(pde_operator->get_matrix_free(), true, dof_index(), quad_index());
+      FaceIntegratorU probe_p(pde_operator->get_matrix_free(), false, dof_index(), quad_index());
+
+      for(unsigned int i = 0; i < basis.size(); ++i)
+      {
+        probe_m.reinit(face);
+        probe_m.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+
+        if(integrator_p != nullptr)
+        {
+          probe_p.reinit(face);
+          probe_p.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+        }
+
+        auto sum = dealii::make_vectorized_array<Number>(0.0);
+        for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+        {
+          FaceVector jump = probe_m.get_value(q);
+          if(integrator_p != nullptr)
+            jump = jump - probe_p.get_value(q);
+
+          sum += (fluxes[q] * jump) * integrator_m.JxW(q);
+        }
+
+        for(unsigned int lane = 0; lane < lanes; ++lane)
+          (*training_matrix)[(row + lane) * basis.size() + i] = sum[lane];
+      }
+    }
+    else
+    {
+      auto const weight = weight_of(face);
+
+      for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+      {
+        integrator_m.submit_value(weight * fluxes[q], q);
+        if(integrator_p != nullptr)
+          integrator_p->submit_value(-(weight * fluxes[q]), q);
+      }
+    }
+  }
+
+  FaceVector
+  exterior_value(unsigned int const q, FaceIntegratorU & integrator, unsigned int const face) const
+  {
+    auto const boundary_id = pde_operator->get_matrix_free().get_boundary_id(face);
+
+    // Spelled out rather than auto: the parameter is shared_ptr<... const>, and a conversion
+    // from shared_ptr<...> blocks template argument deduction on dim.
+    std::shared_ptr<BoundaryDescriptorU<dim> const> const descriptor =
+      application->get_boundary_descriptor()->velocity;
+
+    return calculate_exterior_value_convective(integrator.get_value(q),
+                                               q,
+                                               integrator,
+                                               ExaDG::OperatorType::full,
+                                               descriptor->get_boundary_type(boundary_id),
+                                               application->get_parameters().type_dirichlet_bc_convective,
+                                               boundary_id,
+                                               descriptor,
+                                               0.0 /* time */);
+  }
+
+  void
+  stabilisation_face_loop(dealii::MatrixFree<dim, Number> const &       matrix_free,
+                          VectorType &                                  dst,
+                          VectorType const &                            src,
+                          std::pair<unsigned int, unsigned int> const & range) const
+  {
+    FaceIntegratorU integrator_m(matrix_free, true, dof_index(), quad_index());
+    FaceIntegratorU integrator_p(matrix_free, false, dof_index(), quad_index());
+
+    for(unsigned int face = range.first; face < range.second; ++face)
+    {
+      integrator_m.reinit(face);
+      integrator_p.reinit(face);
+      integrator_m.gather_evaluate(src, dealii::EvaluationFlags::values);
+      integrator_p.gather_evaluate(src, dealii::EvaluationFlags::values);
+
+      handle_face(face, integrator_m, &integrator_p);
+
+      if(training_matrix == nullptr)
+      {
+        integrator_m.integrate_scatter(dealii::EvaluationFlags::values, dst);
+        integrator_p.integrate_scatter(dealii::EvaluationFlags::values, dst);
+      }
+    }
+  }
+
+  void
+  stabilisation_boundary_loop(dealii::MatrixFree<dim, Number> const &       matrix_free,
+                              VectorType &                                  dst,
+                              VectorType const &                            src,
+                              std::pair<unsigned int, unsigned int> const & range) const
+  {
+    FaceIntegratorU integrator(matrix_free, true, dof_index(), quad_index());
+
+    for(unsigned int face = range.first; face < range.second; ++face)
+    {
+      integrator.reinit(face);
+      integrator.gather_evaluate(src, dealii::EvaluationFlags::values);
+
+      handle_face(face, integrator, nullptr);
+
+      if(training_matrix == nullptr)
+        integrator.integrate_scatter(dealii::EvaluationFlags::values, dst);
+    }
+  }
+
+  unsigned int
+  dof_index() const
+  {
+    return pde_operator->get_dof_index_velocity();
+  }
+
+  unsigned int
+  quad_index() const
+  {
+    return pde_operator->get_quad_index_velocity_overintegration();
   }
 
   std::shared_ptr<ForcedFOM<dim>>
@@ -888,6 +1173,13 @@ private:
     operator_data.kernel_data = kernel_data;
     central_operator.initialize(
       pde_operator->get_matrix_free(), central_constraints, operator_data, central_kernel);
+
+    // Only ever asked for calculate_lambda(), so that the definition of the stabilisation lives
+    // in ExaDG's kernel rather than being restated in the face loop below.
+    kernel_data.upwind_factor = application->get_upwind_factor();
+    stabilisation_kernel      = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    stabilisation_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
   }
 
   double
@@ -972,13 +1264,20 @@ private:
 
   MassOperator<dim, 1, Number> pressure_mass;
 
-  // the convective term with a central flux, as a trilinear form and as a nonlinear operator
   // vectors handed to ExaDG that it may keep a pointer to; see owned()
   std::deque<VectorType> scratch;
 
-  dealii::AffineConstraints<Number>                        central_constraints;
+  // scratch for the stabilisation face loops; see apply_stabilisation()
+  std::vector<double> const *     face_weights    = nullptr;
+  std::vector<VectorType> const * training_basis  = nullptr;
+  std::vector<double> *           training_matrix = nullptr;
+
+  // the convective term with a central flux, as a trilinear form and as a nonlinear operator,
+  // and a kernel at this application's upwind factor that owns the definition of lambda
+  dealii::AffineConstraints<Number>                         central_constraints;
   std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> trilinear_kernel;
   std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> central_kernel;
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> stabilisation_kernel;
 
   ConvectiveOperator<dim, Number> trilinear_operator;
   ConvectiveOperator<dim, Number> central_operator;
@@ -1010,6 +1309,17 @@ register_model(py::module_ & module, std::string const & name)
          &ForcedFOM<dim>::apply_convective_central,
          py::arg("u"),
          "N(u) with a central flux, i.e. at upwind_factor = 0.")
+    .def_property_readonly("n_faces", &ForcedFOM<dim>::n_faces)
+    .def("apply_stabilisation",
+         &ForcedFOM<dim>::apply_stabilisation,
+         py::arg("u"),
+         py::arg("weights"),
+         "sum_f w_f S_f(u), the Lax-Friedrichs stabilisation weighted per face.")
+    .def("stabilisation_contributions",
+         &ForcedFOM<dim>::stabilisation_contributions,
+         py::arg("basis"),
+         py::arg("u"),
+         "V^T S_f(u) for every face, row-major (n_faces, n_basis).")
     .def("apply_trilinear",
          &ForcedFOM<dim>::apply_trilinear,
          py::arg("w"),

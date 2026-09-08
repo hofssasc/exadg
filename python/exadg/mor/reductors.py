@@ -312,7 +312,7 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
             viscous=viscous,
             constant=constant,
             divergence=divergence,
-            momentum=FullOrderMomentum(fom, velocity),
+            momentum=self.build_momentum(velocity),
         )
 
         return {
@@ -323,5 +323,176 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
             "output_functional": project(fom.output_functional, None, self._block_basis),
         }
 
+    def build_momentum(self, velocity):
+        """The collaborator supplying the stabilisation and the Jacobian. Overridden to sample."""
+        return FullOrderMomentum(self.fom, velocity)
+
     def build_rom(self, projected_operators, error_estimator):
         return StationaryModel(error_estimator=error_estimator, **projected_operators)
+
+
+class ECSWStokesReductor(TensorGalerkinStokesReductor):
+    """:class:`TensorGalerkinStokesReductor` with the stabilisation hyper-reduced by ECSW.
+
+    Energy-conserving sampling and weighting: the reduced stabilisation is fitted as a
+    non-negative combination of a few faces' contributions, chosen so that the fit reproduces the
+    exact projected stabilisation on the training states. Nothing is interpolated -- the residual
+    is evaluated exactly on the faces that are kept, which is what makes it a reasonable treatment
+    of a term that is not smooth in the state.
+
+    Args:
+        training_states: Velocity snapshots to fit on. Their coefficients on the enriched basis
+            are what the weights have to reproduce.
+        tolerance: Relative residual at which the fit stops; larger means fewer faces.
+        max_entries: Hard cap on the number of faces kept.
+        Everything else as for the base class.
+    """
+
+    def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
+                 training_states=None, tolerance=1.0e-2, max_entries=None, **kwargs):
+        super().__init__(fom, RB_u=RB_u, RB_p=RB_p, u_product=u_product, p_product=p_product,
+                         **kwargs)
+
+        self.training_states = training_states
+        self.tolerance = tolerance
+        self.max_entries = max_entries
+
+    def build_momentum(self, velocity):
+        # The basis is orthonormal in u_product, so this is the projection of each snapshot onto
+        # the enriched space -- the states the reduced model will actually be evaluated near.
+        coefficients = self.u_product.apply2(velocity, self.training_states).T
+
+        return ECSWMomentum(
+            self.fom, velocity, list(coefficients), self.tolerance, self.max_entries
+        )
+
+
+def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
+    """Non-negative least squares, stopped as soon as the residual is small enough.
+
+    Lawson-Hanson, terminated on a relative residual rather than on optimality. That is the whole
+    point: an exact solution would use every column, and each column kept is one more face the
+    reduced model has to evaluate online. Non-negativity is not decoration either -- weights that
+    could go negative would let the fit cancel one face's contribution against another's, and the
+    stability argument for ECSW rests on them staying positive.
+
+    Args:
+        matrix: ``G``, one column per candidate face.
+        target: ``b``; for ECSW the exact totals, i.e. ``G @ ones``.
+        tolerance: stop once ``|G xi - b| <= tolerance * |b|``.
+        max_entries: stop after this many faces whatever the residual.
+
+    Returns:
+        ``numpy.ndarray`` of non-negative weights, mostly zero.
+    """
+    _, n = matrix.shape
+    limit = n if max_entries is None else min(max_entries, n)
+
+    weights = np.zeros(n)
+    active = np.zeros(n, dtype=bool)
+    residual = target.copy()
+    threshold = tolerance * np.linalg.norm(target)
+
+    while active.sum() < limit and np.linalg.norm(residual) > threshold:
+        gradient = matrix.T @ residual
+        gradient[active] = -np.inf
+
+        candidate = int(np.argmax(gradient))
+        if gradient[candidate] <= 0.0:
+            break
+
+        active[candidate] = True
+
+        # inner loop: least squares on the active set, backing off any weight that turns negative
+        while True:
+            index = np.flatnonzero(active)
+            solution = np.linalg.lstsq(matrix[:, index], target, rcond=None)[0]
+
+            if (solution > 0.0).all():
+                weights = np.zeros(n)
+                weights[index] = solution
+                break
+
+            negative = solution <= 0.0
+            step = np.min(
+                weights[index][negative] / (weights[index][negative] - solution[negative])
+            )
+            weights[index] = weights[index] + step * (solution - weights[index])
+            active[index[weights[index] <= 1.0e-14]] = False
+
+            if not active.any():
+                return np.zeros(n)
+
+        residual = target - matrix @ weights
+
+    return weights
+
+
+def local_ecsw_weights(model, basis, states, tolerance, max_entries):
+    """Train ECSW weights on one rank, keeping that rank's slice.
+
+    Every rank assembles the columns for the faces it owns, all ranks agree on the global fit --
+    the same deterministic least-squares problem, solved redundantly rather than solved once and
+    scattered -- and each keeps the weights belonging to its own faces. The weights stay on the
+    rank because that is where the faces are; only the diagnostics are global and returnable.
+
+    Stashed on the local model rather than returned, because ``mpi.call`` keeps rank 0's value and
+    every rank needs a different answer.
+    """
+    from pymor.tools import mpi
+
+    fom = _bound_model(model)
+    phi = [v.impl for v in basis.vectors]
+    n_faces = fom.n_faces
+
+    rows = []
+    for coefficients in states:
+        contributions = np.array(
+            fom.stabilisation_contributions(phi, _reconstruct(basis, coefficients))
+        ).reshape(n_faces, len(phi))
+        rows.append(contributions.T)
+
+    local = np.vstack(rows)
+
+    pieces = mpi.comm.allgather(local) if mpi.parallel else [local]
+    matrix = np.hstack(pieces)
+
+    weights = sparse_nnls(matrix, matrix.sum(axis=1), tolerance, max_entries)
+
+    offset = sum(piece.shape[1] for piece in pieces[: mpi.rank]) if mpi.parallel else 0
+    model._ecsw_weights = weights[offset : offset + n_faces].tolist()
+
+    selected = int((weights > 0.0).sum())
+    residual = np.linalg.norm(matrix @ weights - matrix.sum(axis=1))
+
+    return np.array([selected, matrix.shape[1], residual / np.linalg.norm(matrix.sum(axis=1))])
+
+
+def local_ecsw_stabilisation(model, basis, coefficients):
+    """``V^T sum_f xi_f S_f(V a)`` on one rank, using the weights trained above."""
+    fom = _bound_model(model)
+    residual = fom.apply_stabilisation(_reconstruct(basis, coefficients), model._ecsw_weights)
+
+    return np.array([mode.impl.inner(residual) for mode in basis.vectors])
+
+
+class ECSWMomentum(FullOrderMomentum):
+    """:class:`FullOrderMomentum` with the stabilisation restricted to a weighted set of faces.
+
+    A drop-in: same two methods, same shapes. Only ``stabilisation`` changes -- the Jacobian is
+    still assembled at full order, so this is a statement about the residual and not yet a
+    speed-up. Sampling the Jacobian is the next step and reuses the same weights.
+    """
+
+    def __init__(self, model, basis, states, tolerance=1.0e-2, max_entries=None):
+        super().__init__(model, basis)
+
+        selected, candidates, residual = dispatch(
+            model, local_ecsw_weights, basis, states, tolerance, max_entries
+        )
+        self.n_selected = int(selected)
+        self.n_candidates = int(candidates)
+        self.training_residual = float(residual)
+
+    def stabilisation(self, coefficients):
+        return dispatch(self.model, local_ecsw_stabilisation, self.basis, coefficients)
