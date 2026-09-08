@@ -200,6 +200,14 @@ public:
       prm.add_parameter("ForcingWidth",
                         forcing_width,
                         "Standard deviation of each forcing mode.");
+      prm.add_parameter("UpwindFactor",
+                        upwind_factor,
+                        "Weight of the Lax-Friedrichs stabilisation in the convective numerical "
+                        "flux; 1.0 is ExaDG's default. Exposed because it is the one term of the "
+                        "convective operator that is not a polynomial in the velocity -- lambda "
+                        "is a maximum of absolute normal velocities -- and therefore the one term "
+                        "a reduced model cannot represent as a third-order tensor.",
+                        dealii::Patterns::Double(0.0, 1.0));
     }
     prm.leave_subsection();
   }
@@ -215,6 +223,12 @@ public:
   get_viscosity() const
   {
     return viscosity;
+  }
+
+  double
+  get_upwind_factor() const
+  {
+    return upwind_factor;
   }
 
   /** "Stokes" or "NavierStokes"; the convective term is the only difference. */
@@ -241,6 +255,7 @@ private:
     this->param.treatment_of_convective_term = TreatmentOfConvectiveTerm::Implicit;
     this->param.formulation_viscous_term = FormulationViscousTerm::LaplaceFormulation;
     this->param.right_hand_side          = true;
+    this->param.upwind_factor            = upwind_factor;
 
     // PHYSICAL QUANTITIES
     this->param.start_time = 0.0;
@@ -417,6 +432,7 @@ private:
 
   double       viscosity        = 1.0;
   double       solver_tolerance = 1.e-10;
+  double       upwind_factor    = 1.0;
   unsigned int modes_per_dim = 2;
   double       forcing_width = 0.15;
 

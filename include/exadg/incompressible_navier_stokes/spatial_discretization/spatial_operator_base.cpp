@@ -785,6 +785,13 @@ SpatialOperatorBase<dim, Number>::get_divergence_operator() const
 }
 
 template<int dim, typename Number>
+ConvectiveOperator<dim, Number> const &
+SpatialOperatorBase<dim, Number>::get_convective_operator() const
+{
+  return convective_operator;
+}
+
+template<int dim, typename Number>
 std::string
 SpatialOperatorBase<dim, Number>::get_dof_name_velocity() const
 {

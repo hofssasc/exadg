@@ -164,6 +164,11 @@ public:
   DivergenceOperator<dim, Number> const &
   get_divergence_operator() const;
 
+  /// The convective operator, for callers that need the nonlinear term on its own. Const
+  /// suffices: set_velocity_ptr() and evaluate_nonlinear_operator() are both const.
+  ConvectiveOperator<dim, Number> const &
+  get_convective_operator() const;
+
   unsigned int
   get_dof_index_velocity() const;
 
@@ -176,21 +181,28 @@ public:
   unsigned int
   get_quad_index_pressure() const;
 
+  /*
+   * The over-integration and linearisation quadrature rules, public for the same reason as the
+   * block accessors above: a caller that builds its own operator on this MatrixFree has to pick
+   * the same rule, or it is discretising a different equation. Note that with the default
+   * QuadratureRuleLinearization::Overintegration32k and a non-explicit convective term the two
+   * indices are equal, so the nonlinear operator and its linearisation share a rule.
+   */
+  unsigned int
+  get_quad_index_velocity_overintegration() const;
+
+  unsigned int
+  get_quad_index_velocity_linearized() const;
+
 protected:
   unsigned int
   get_dof_index_velocity_scalar() const;
-
-  unsigned int
-  get_quad_index_velocity_overintegration() const;
 
   unsigned int
   get_quad_index_velocity_nodal_points() const;
 
   unsigned int
   get_quad_index_pressure_nodal_points() const;
-
-  unsigned int
-  get_quad_index_velocity_linearized() const;
 
 public:
   std::shared_ptr<dealii::Mapping<dim> const>

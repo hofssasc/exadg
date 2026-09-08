@@ -138,6 +138,8 @@ public:
                              pde_operator->get_matrix_free().get_affine_constraints(
                                pde_operator->get_dof_index_pressure()),
                              pressure_mass_data);
+
+    setup_central_convective_operators();
   }
 
   // ===========================================================================================
@@ -674,6 +676,97 @@ public:
                         true /* vector valued */);
   }
 
+  // ===========================================================================================
+  //  The convective term, split into a trilinear part and a stabilisation
+  // ===========================================================================================
+  //
+  // The convective operator is a polynomial in the velocity except for one term. In divergence
+  // form the volume integral and the central part of the numerical flux are exactly trilinear,
+  //
+  //     C(w, u, v) = -( (w x u) : grad v )_K + ( (w.n) {u} . v )_dK,
+  //
+  // so a reduced model can represent them as a third-order tensor C_ijk = C(phi_i, phi_j, phi_k),
+  // built once offline and contracted online at a cost independent of the mesh. What is left is
+  //
+  //     S(u) = N(u) - C(u, u, .)
+  //
+  // the Lax-Friedrichs stabilisation, whose lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|) is
+  // not a polynomial -- it is a maximum of absolute values. S is what hyper-reduction has to
+  // handle, and isolating it is what lets a reduced model treat the two parts differently
+  // without approximating either by accident.
+  //
+  // Both operators below are built on the *same* MatrixFree and the *same* quadrature rule as
+  // the solver's own convective operator, so the split is exact rather than nearly exact.
+
+  /**
+   * C(w, v): ExaDG's linearly-implicit convective operator with a central flux -- linear in v,
+   * and linear in w, both to machine precision.
+   *
+   * It is *not* the polarisation of the nonlinear operator. C(u, u) and N(u) at the same upwind
+   * factor differ -- 3.5e-05 relative at degree 2, refinement 3 -- and that difference is itself
+   * exactly quadratic, so the two are different bilinear maps rather than the same one evaluated
+   * differently. They are consistent with the same continuous form and the gap converges away at
+   * roughly h^5, which bounds what the distinction costs without removing it. Do not build a
+   * reduced third-order tensor from this: polarise N instead,
+   *
+   *     B(a, b) = 0.5 * ( N(a + b) - N(a) - N(b) ),
+   *
+   * which is by construction the bilinear form of the operator being reduced. This method is
+   * kept because it is the evidence for that distinction, and because it is what ExaDG itself
+   * would apply for a linearly-implicit time scheme.
+   */
+  std::shared_ptr<VectorType>
+  apply_trilinear(VectorType const & w, VectorType const & v)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    trilinear_operator.set_velocity_ptr(w);
+    trilinear_operator.apply(*dst, v);
+
+    return dst;
+  }
+
+  /// N(u) with a central flux: the nonlinear convective operator at upwind_factor = 0. Equals
+  /// apply_trilinear(u, u) if the trilinear form really is the same operator.
+  std::shared_ptr<VectorType>
+  apply_convective_central(VectorType const & u)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    central_operator.evaluate_nonlinear_operator(*dst, u, 0.0 /* time */);
+
+    return dst;
+  }
+
+  /// N(u) as the solver actually evaluates it, at this application's upwind factor.
+  std::shared_ptr<VectorType>
+  apply_convective(VectorType const & u)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    pde_operator->get_convective_operator().evaluate_nonlinear_operator(*dst, u, 0.0 /* time */);
+
+    return dst;
+  }
+
+  double
+  get_upwind_factor() const
+  {
+    return application->get_upwind_factor();
+  }
+
+  /// The two quadrature rules the convective term is evaluated with: the one used by apply()
+  /// (linearised/linearly implicit) and the one used by evaluate_nonlinear_operator().
+  std::pair<unsigned int, unsigned int>
+  quadrature_indices() const
+  {
+    return {pde_operator->get_quad_index_velocity_linearized(),
+            pde_operator->get_quad_index_velocity_overintegration()};
+  }
+
   /**
    * Points ExaDG's momentum operator at a linearisation velocity, and keeps it alive.
    *
@@ -700,6 +793,61 @@ private:
   shared_self()
   {
     return std::static_pointer_cast<ForcedFOM<dim>>(this->shared_from_this());
+  }
+
+  /**
+   * Builds the two central-flux convective operators used to split the convective term.
+   *
+   * They share the solver's MatrixFree, degree-of-freedom index and quadrature rule, and differ
+   * from the solver's own convective operator in exactly two settings: upwind_factor is zero, so
+   * the flux is central and the operator is a polynomial in the velocity; and one of them is
+   * LinearlyImplicit, which makes it the bilinear map v -> C(w, v) rather than the Jacobian.
+   *
+   * The distinction matters. With TreatmentOfConvectiveTerm::Implicit, apply() is the derivative
+   * of the nonlinear operator -- in divergence form div(w x v + v x w) -- which is *not* the
+   * trilinear form. LinearlyImplicit gives div(w x v), which is.
+   */
+  void
+  setup_central_convective_operators()
+  {
+    auto const dof_index  = pde_operator->get_dof_index_velocity();
+    auto const quad_index = pde_operator->get_quad_index_velocity_linearized();
+
+    Operators::ConvectiveKernelData kernel_data;
+    kernel_data.formulation       = application->get_parameters().formulation_convective_term;
+    kernel_data.upwind_factor     = 0.0;
+    kernel_data.use_outflow_bc    = application->get_parameters().use_outflow_bc_convective_term;
+    kernel_data.type_dirichlet_bc = application->get_parameters().type_dirichlet_bc_convective;
+    kernel_data.ale               = application->get_parameters().ale_formulation;
+
+    ConvectiveOperatorData<dim> operator_data;
+    operator_data.dof_index            = dof_index;
+    operator_data.quad_index           = quad_index;
+    operator_data.quad_index_nonlinear = pde_operator->get_quad_index_velocity_overintegration();
+    operator_data.bc                   = application->get_boundary_descriptor()->velocity;
+    operator_data.use_cell_based_loops =
+      application->get_parameters().use_cell_based_face_loops;
+
+    dealii::AffineConstraints<Number> constraints;
+    constraints.close();
+
+    // the trilinear form: frozen transport velocity, linear in the argument
+    kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::LinearlyImplicit;
+    trilinear_kernel               = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    trilinear_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, false /* is_mg */);
+    operator_data.kernel_data = kernel_data;
+    trilinear_operator.initialize(
+      pde_operator->get_matrix_free(), constraints, operator_data, trilinear_kernel);
+
+    // the same physics as a nonlinear operator, so that C(u, u) can be checked against N(u)
+    kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::Implicit;
+    central_kernel                 = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    central_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, false /* is_mg */);
+    operator_data.kernel_data = kernel_data;
+    central_operator.initialize(
+      pde_operator->get_matrix_free(), constraints, operator_data, central_kernel);
   }
 
   double
@@ -784,6 +932,13 @@ private:
 
   MassOperator<dim, 1, Number> pressure_mass;
 
+  // the convective term with a central flux, as a trilinear form and as a nonlinear operator
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> trilinear_kernel;
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> central_kernel;
+
+  ConvectiveOperator<dim, Number> trilinear_operator;
+  ConvectiveOperator<dim, Number> central_operator;
+
   // whatever ExaDG's momentum operator currently points at; see install_linearization()
   std::shared_ptr<VectorType> installed_linearization;
 };
@@ -801,6 +956,21 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("refinements") = 4,
          py::arg("verbose")     = false)
     .def_property_readonly("n_modes", &ForcedFOM<dim>::n_modes)
+    .def_property_readonly("upwind_factor", &ForcedFOM<dim>::get_upwind_factor)
+    .def_property_readonly("quadrature_indices", &ForcedFOM<dim>::quadrature_indices)
+    .def("apply_convective",
+         &ForcedFOM<dim>::apply_convective,
+         py::arg("u"),
+         "N(u), the convective operator as the solver evaluates it.")
+    .def("apply_convective_central",
+         &ForcedFOM<dim>::apply_convective_central,
+         py::arg("u"),
+         "N(u) with a central flux, i.e. at upwind_factor = 0.")
+    .def("apply_trilinear",
+         &ForcedFOM<dim>::apply_trilinear,
+         py::arg("w"),
+         py::arg("v"),
+         "C(w, v), the trilinear part of the convective operator.")
     .def("write_forcing",
          &ForcedFOM<dim>::write_forcing,
          py::arg("directory"),
