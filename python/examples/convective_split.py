@@ -72,6 +72,7 @@ def main():
     polarisation(central, u, v)
     refinement()
     stabilisation(upwind, snapshots)
+    face_sum(upwind, snapshots)
     jacobian(upwind, central)
 
     print(
@@ -171,6 +172,23 @@ def stabilisation(upwind, snapshots):
         S = full.copy()
         S.axpy(-1.0, upwind.apply_convective_central(u))
         print(f"  snapshot {i}                 : |S|/|N| = {S.norm() / full.norm():.4f}")
+
+
+def face_sum(upwind, snapshots):
+    """The face-by-face stabilisation must add up to the operator it was split out of.
+
+    This is the check the hyper-reduced path rests on: if a single face's contribution is wrong --
+    a boundary flux, a missing lane -- every weight fitted against it is wrong too, and nothing
+    downstream would say so.
+    """
+    upwind.set_weights([1.0] * upwind.n_faces)
+
+    print("\nsum over faces against N(u) - B(u, u)")
+    for i, u in enumerate(snapshots):
+        exact = upwind.apply_convective(u)
+        exact.axpy(-1.0, upwind.apply_convective_central(u))
+
+        print(f"  snapshot {i}                 : {relative(upwind.apply_stabilisation(u), exact):.3e}")
 
 
 def jacobian(upwind, central):

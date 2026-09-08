@@ -807,12 +807,10 @@ public:
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    face_weights   = &stored_weights;
-    training_basis = nullptr;
+    ScopedMode const mode(*this);
+    face_weights = &stored_weights;
 
     run_selected_face_loop(owned(u), dst.get());
-
-    face_weights = nullptr;
 
     return dst;
   }
@@ -842,16 +840,13 @@ public:
 
     std::vector<double> matrix(static_cast<std::size_t>(n_faces()) * basis.size(), 0.0);
 
-    face_weights    = nullptr;
+    ScopedMode const mode(*this);
     training_basis  = &ghosted;
     training_matrix = &matrix;
 
     VectorType dummy;
     pde_operator->initialize_vector_velocity(dummy);
     run_face_loop(dummy, owned(u));
-
-    training_basis  = nullptr;
-    training_matrix = nullptr;
 
     return matrix;
   }
@@ -952,15 +947,12 @@ public:
   {
     std::vector<double> projected(reduced_basis.size(), 0.0);
 
+    ScopedMode const mode(*this);
     face_weights     = &stored_weights;
     training_basis   = &reduced_basis;
     projected_vector = &projected;
 
     run_selected_face_loop(owned(u));
-
-    face_weights     = nullptr;
-    training_basis   = nullptr;
-    projected_vector = nullptr;
 
     dealii::Utilities::MPI::sum(dealii::ArrayView<double const>(projected.data(), projected.size()),
                                 mpi_comm,
@@ -986,15 +978,12 @@ public:
   {
     std::vector<double> matrix(reduced_basis.size() * reduced_basis.size(), 0.0);
 
+    ScopedMode const mode(*this);
     face_weights    = &stored_weights;
     training_basis  = &reduced_basis;
     jacobian_matrix = &matrix;
 
     run_selected_face_loop(owned(u));
-
-    face_weights    = nullptr;
-    training_basis  = nullptr;
-    jacobian_matrix = nullptr;
 
     dealii::Utilities::MPI::sum(dealii::ArrayView<double const>(matrix.data(), matrix.size()),
                                 mpi_comm,
@@ -1540,7 +1529,32 @@ private:
   // vectors handed to ExaDG that it may keep a pointer to; see owned()
   std::deque<VectorType> scratch;
 
-  // scratch for the stabilisation face loops; see apply_stabilisation()
+  /**
+   * Clears the face loop's mode on the way out.
+   *
+   * The loop is told what to do through the pointers below, and every entry point sets a
+   * different two or three of them. Resetting them by hand at each exit is how one gets missed,
+   * and a stale pointer means the next call silently does the previous call's job.
+   */
+  struct ScopedMode
+  {
+    explicit ScopedMode(ForcedFOM<dim> & fom) : fom(fom)
+    {
+    }
+
+    ~ScopedMode()
+    {
+      fom.face_weights     = nullptr;
+      fom.training_basis   = nullptr;
+      fom.training_matrix  = nullptr;
+      fom.jacobian_matrix  = nullptr;
+      fom.projected_vector = nullptr;
+    }
+
+    ForcedFOM<dim> & fom;
+  };
+
+  // what the face loop should do; set through ScopedMode, never left behind
   std::vector<double> const *     face_weights    = nullptr;
   std::vector<VectorType> const * training_basis  = nullptr;
   std::vector<double> *           training_matrix = nullptr;

@@ -119,7 +119,10 @@ def main():
     print(f"error, exact S     : {exact:.4e}")
 
     print("\nfitting the stabilisation on a subset of faces")
-    print(f"  {'tolerance':>9}  {'faces':>9}  {'fit':>9}  {'ROM error':>11}  {'faster':>8}")
+    print(
+        f"  {'tolerance':>9}  {'faces':>9}  {'batches':>8}  {'fit':>9}  {'ROM error':>11}"
+        f"  {'faster':>8}"
+    )
 
     for tolerance in TOLERANCES:
         reductor = ECSWStokesReductor(
@@ -131,7 +134,7 @@ def main():
         error = worst_error(model, reductor, rom, test)
         print(
             f"  {tolerance:>9.0e}  {momentum.n_selected:>4d}/{momentum.n_candidates:<4d}  "
-            f"{momentum.training_residual:>9.2e}  {error:>11.4e}  "
+            f"{momentum.n_batches:>8d}  {momentum.training_residual:>9.2e}  {error:>11.4e}  "
             f"{speed_up(reference_rom.operator.momentum, momentum):>7.1f}x"
         )
 

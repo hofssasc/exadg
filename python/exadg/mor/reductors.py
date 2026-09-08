@@ -18,42 +18,41 @@
 #  along with this program. If not, see <https://www.gnu.org/licenses/>.
 #  ______________________________________________________________________
 
-"""Saddle-point reduction with the convective term projected exactly, as a third-order tensor.
+"""Saddle-point reduction for the incompressible Navier-Stokes momentum block.
 
-The convective operator of a discontinuous Galerkin discretisation splits into a part that is a
-polynomial in the velocity and a part that is not::
+The convective operator of a discontinuous Galerkin discretisation splits into a polynomial part
+and one that is not::
 
     N(u) = B(u, u) + S(u)
 
-``B`` is the volume integral together with the central part of the numerical flux: trilinear, so
-its Galerkin projection is a fixed third-order tensor ``C[i,j,k] = <phi_i, B(phi_j, phi_k)>``,
-built once offline and contracted online at a cost independent of the mesh. ``S`` is the
-Lax-Friedrichs stabilisation, whose ``lambda`` is a maximum of absolute normal velocities and
-therefore no polynomial at all -- see ``python/examples/convective_split.py``, which measures both
-halves of that statement.
+``B`` -- the volume integral together with the central part of the numerical flux -- is trilinear,
+so its Galerkin projection is a fixed third-order tensor ``C[i,j,k] = <phi_i, B(phi_j, phi_k)>``:
+exact, and free of the mesh online. ``S`` is the Lax-Friedrichs stabilisation, whose ``lambda`` is
+a maximum of absolute normal velocities and no polynomial at all. It is also what keeps
+under-resolved flow stable, so it is sampled rather than dropped or modelled.
+``python/examples/convective_split.py`` measures both halves of that statement.
 
-This reductor projects ``B`` exactly and leaves ``S`` at full order. That is deliberately **not**
-fast: every reduced residual still evaluates ``S`` on the whole mesh. It is the reference against
-which a hyper-reduced ``S`` is measured, in the same way ``stokes_rb.py`` is the reference for
-``navier_stokes_rb.py`` -- because nothing here approximates anything, the reduced model has to
-reproduce a plain Galerkin projection to solver tolerance.
+Two reductors follow:
 
-The tensor is built from ``B`` by polarisation,
+===============================  ====================================================
+:class:`TensorGalerkinStokesReductor`  tensor for ``B``, every face for ``S`` -- exact
+:class:`ECSWStokesReductor`            tensor for ``B``, a weighted subset of faces for ``S``
+===============================  ====================================================
 
-    B(a, b) = 0.5 * ( N_c(a + b) - N_c(a) - N_c(b) )
+The first is the reference the second is measured against: neither approximates the convective
+term, so they have to agree to solver tolerance.
 
-rather than from ExaDG's linearly-implicit convective operator. That operator is also trilinear,
-but it is a *different* bilinear map -- see the docstring of ``ForcedFOM::apply_trilinear``.
+The tensor is built by polarisation, ``B(a, b) = 0.5 (N_c(a+b) - N_c(a) - N_c(b))``, and not from
+ExaDG's linearly-implicit convective operator -- that one is also trilinear but is a *different*
+bilinear map, see ``ForcedFOM::apply_trilinear``.
 
 Runs on any number of ranks. Everything reduced here is an inner product, which C++ reduces over
-the communicator, so every rank computes the same small array and pyMOR keeps rank 0's. What the
-dispatch below buys is only that the *evaluation* happens everywhere: the bound ExaDG model is
-reachable through the coupled solver, and under MPI that solver holds an
-:class:`~pymor.tools.mpi.ObjectId` for the per-rank models rather than one handle.
+the communicator, so every rank computes the same small array and pyMOR keeps rank 0's; the
+dispatch below only ensures the *evaluation* happens everywhere.
 
-One exception, flagged where it happens: :func:`local_ecsw_weights` fits the hyper-reduction
-weights **redundantly on every rank**, over a training matrix gathered whole. That is a known
-scaling defect, not a design choice -- see its warning.
+.. warning::
+   :func:`local_ecsw_weights` fits the weights redundantly on every rank, over a training matrix
+   gathered whole. A known scaling defect rather than a design choice; see its own warning.
 """
 
 import numpy as np
@@ -205,12 +204,21 @@ def install(model, basis, trained, token):
     return fom
 
 
+def local_batches(model, basis, trained, token):
+    """How many face batches the installed weights visit, summed over ranks."""
+    from pymor.tools import mpi
+
+    local = install(model, basis, trained, token).n_selected_batches
+
+    return np.array([mpi.comm.allreduce(local) if mpi.parallel else local])
+
+
 class FullOrderMomentum:
     """The two pieces of the momentum block that are not the tensor, evaluated at full order.
 
-    Deliberately a small object with two methods rather than inlined code: replacing it is what
-    hyper-reduction *is*. An ECSW version evaluates the same two quantities on a weighted subset
-    of elements, returns the same shapes, and is a drop-in for this one.
+    A small object with two methods rather than inlined code, because replacing it is what
+    hyper-reduction *is*: :class:`ECSWMomentum` evaluates the same two quantities over a weighted
+    subset of faces and is a drop-in.
     """
 
     trained = False
@@ -219,6 +227,16 @@ class FullOrderMomentum:
         self.model = model
         self.basis = basis
         self.token = id(self)
+
+    @property
+    def n_batches(self):
+        """Face batches visited, which is the honest cost.
+
+        Matrix-free evaluates a batch of four to eight faces whole, so selecting one face in a
+        batch costs the same as selecting all of them. The count of faces kept is the size of the
+        fit; this is the size of the work.
+        """
+        return int(dispatch(self.model, local_batches, self.basis, self.trained, self.token)[0])
 
     def stabilisation(self, coefficients):
         return dispatch(
