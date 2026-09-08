@@ -45,11 +45,11 @@ The tensor is built from ``B`` by polarisation,
 rather than from ExaDG's linearly-implicit convective operator. That operator is also trilinear,
 but it is a *different* bilinear map -- see the docstring of ``ForcedFOM::apply_trilinear``.
 
-.. warning::
-   Serial only for now. Building the tensor and evaluating ``S`` reach the bound model through
-   ``A.fom``, which under MPI is rank 0's handle; both need dispatching to every rank in the shape
-   ``MPIExaDGCoupledSolver`` already uses. The inner products are global either way, so rank 0's
-   answer is the right one -- it is the dispatch that is missing, not the arithmetic.
+Runs on any number of ranks. Everything reduced here is an inner product, which C++ reduces over
+the communicator, so every rank computes the same small array and pyMOR keeps rank 0's. What the
+dispatch below buys is only that the *evaluation* happens everywhere: the bound ExaDG model is
+reachable through the coupled solver, and under MPI that solver holds an
+:class:`~pymor.tools.mpi.ObjectId` for the per-rank models rather than one handle.
 """
 
 import numpy as np
@@ -60,6 +60,39 @@ from pymor.operators.numpy import NumpyMatrixOperator
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.vectorarrays.constructions import cat_arrays
 from pymor.vectorarrays.numpy import NumpyVectorSpace
+
+
+def dispatch(model, function, basis, *args):
+    """Run ``function(model, basis, *args)`` against the bound ExaDG model on every rank.
+
+    Serially that is a direct call. In parallel the model and the basis are addressed by
+    ``ObjectId`` and the call is broadcast, which is the shape
+    :class:`~exadg.mor.models.saddle_point.MPIExaDGCoupledSolver` already uses. The function must
+    return the *global* answer -- here always a small NumPy array assembled from inner products,
+    which are reduced in C++ -- because pyMOR keeps rank 0's return value.
+    """
+    from pymor.tools import mpi
+
+    if not mpi.parallel:
+        return function(model, basis, *args)
+
+    return mpi.call(
+        mpi.function_call, function, model.operator.solver.models_id, basis.impl.obj_id, *args
+    )
+
+
+def _bound_model(model):
+    """The ExaDG handle, reached through the solver that already holds it."""
+    return model.operator.solver.fom
+
+
+def _reconstruct(basis, coefficients):
+    """``V a`` as an ExaDG vector, from a rank-local basis."""
+    u = basis.space.impl.zero_vector()
+    for weight, mode in zip(coefficients, basis.vectors):
+        u.axpy(float(weight), mode.impl)
+
+    return u
 
 
 def convective_tensor(fom, basis):
@@ -103,57 +136,74 @@ def convective_tensor(fom, basis):
     return tensor
 
 
+def local_momentum_blocks(model, basis):
+    """The three parameter-independent pieces of the momentum block, on one rank.
+
+    Returns ``(tensor, viscous, constant)``: the convective tensor, the projected viscous block,
+    and the right-hand side's constant part. The viscous block is isolated from the momentum
+    operator by removing the convective term, which is legitimate because what remains is affine
+    in the velocity -- so ``r`` applications determine it.
+    """
+    fom = _bound_model(model)
+    momentum = model.operator.blocks[0, 0]
+
+    convective = basis.space.make_array(
+        [basis.space.make_vector(fom.apply_convective(v.impl)) for v in basis.vectors]
+    )
+    constant = basis.inner(momentum.apply(basis.space.zeros(1))).ravel()
+    viscous = basis.inner(momentum.apply(basis) - convective) - constant[:, None]
+
+    return convective_tensor(fom, basis), viscous, constant
+
+
+def local_stabilisation(model, basis, coefficients):
+    """``V^T S(V a)`` with ``S(u) = N(u) - B(u, u)``, the Lax-Friedrichs term, on one rank."""
+    fom = _bound_model(model)
+    u = _reconstruct(basis, coefficients)
+
+    residual = fom.apply_convective(u)
+    residual.axpy(-1.0, fom.apply_convective_central(u))
+
+    return np.array([mode.impl.inner(residual) for mode in basis.vectors])
+
+
+def local_momentum_jacobian(model, basis, coefficients):
+    """``V^T A'(V a) V``, the projected momentum Jacobian, on one rank."""
+    fom = _bound_model(model)
+    jacobian = fom.jacobian_momentum(_reconstruct(basis, coefficients))
+
+    columns = []
+    for mode in basis.vectors:
+        image = basis.space.impl.zero_vector()
+        jacobian.apply(image, mode.impl)
+        columns.append([other.impl.inner(image) for other in basis.vectors])
+
+    return np.array(columns).T
+
+
 class FullOrderMomentum:
     """The two pieces of the momentum block that are not the tensor, evaluated at full order.
 
     Deliberately a small object with two methods rather than inlined code: replacing it is what
     hyper-reduction *is*. An ECSW version evaluates the same two quantities on a weighted subset
-    of elements and is a drop-in for this one.
-
-    Args:
-        fom: A bound ``SaddlePointModel`` offering ``apply_convective``,
-            ``apply_convective_central`` and ``jacobian_momentum``.
-        basis: The enriched velocity basis.
+    of elements, returns the same shapes, and is a drop-in for this one.
     """
 
-    def __init__(self, fom, basis):
-        self.fom = fom
+    def __init__(self, model, basis):
+        self.model = model
         self.basis = basis
-        self.phi = [v.impl for v in basis.vectors]
-
-    def reconstruct(self, coefficients):
-        """``V a`` as an ExaDG vector."""
-        u = self.basis.space.impl.zero_vector()
-        for weight, mode in zip(coefficients, self.phi):
-            u.axpy(float(weight), mode)
-
-        return u
 
     def stabilisation(self, coefficients):
-        """``V^T S(V a)`` with ``S(u) = N(u) - B(u, u)``, the Lax-Friedrichs term."""
-        u = self.reconstruct(coefficients)
-
-        residual = self.fom.apply_convective(u)
-        residual.axpy(-1.0, self.fom.apply_convective_central(u))
-
-        return np.array([mode.inner(residual) for mode in self.phi])
+        return dispatch(self.model, local_stabilisation, self.basis, coefficients)
 
     def jacobian(self, coefficients):
-        """``V^T A'(V a) V``, the projected momentum Jacobian.
+        """Assembled at full order, one operator application per basis vector.
 
-        Assembled at full order, one operator application per basis vector. The tensor covers the
-        *residual's* convective part; the Jacobian is what hyper-reduction has to remove as well,
-        and until it does this is the term that keeps the reduced model tied to the mesh.
+        The tensor covers the *residual's* convective part; the Jacobian is what hyper-reduction
+        has to remove as well, and until it does this is what keeps the reduced model tied to the
+        mesh.
         """
-        jacobian = self.fom.jacobian_momentum(self.reconstruct(coefficients))
-
-        columns = []
-        for mode in self.phi:
-            image = self.basis.space.impl.zero_vector()
-            jacobian.apply(image, mode)
-            columns.append([other.inner(image) for other in self.phi])
-
-        return np.array(columns).T
+        return dispatch(self.model, local_momentum_jacobian, self.basis, coefficients)
 
 
 class ReducedSaddlePointOperator(Operator):
@@ -249,32 +299,20 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
         velocity = gram_schmidt(velocity, offset=len(RB_u), product=self.u_product, copy=False)
         self._block_basis = fom.solution_space.make_block_diagonal_array((velocity, RB_p))
 
-        A = fom.operator.blocks[0, 0]
-        B = fom.operator.blocks[1, 0]
+        # B, and with it the (1,2) block: <phi_i, B^T psi_j> = <B phi_i, psi_j>, so one projection
+        # serves both and the transpose is exact by construction rather than by a second
+        # implementation agreeing with the first. No dispatch: these are pyMOR operators, which
+        # mpi_wrap_model has already made collective.
+        divergence = RB_p.inner(fom.operator.blocks[1, 0].apply(velocity))
 
-        # the bound model, reached through the operator that holds it; it is the same handle the
-        # coupled solver uses
-        impl = A.fom
-
-        # B, and with it the (1,2) block: <phi_i, B^T psi_j> = <B phi_i, psi_j>, so one
-        # projection serves both and the transpose is exact by construction rather than by
-        # a second implementation agreeing with the first.
-        divergence = RB_p.inner(B.apply(velocity))
-
-        # The viscous block and its constant part, isolated from A by removing the convective
-        # term. Both are affine in the velocity, so r applications suffice.
-        convective = velocity.space.make_array(
-            [velocity.space.make_vector(impl.apply_convective(v.impl)) for v in velocity.vectors]
-        )
-        constant = velocity.inner(A.apply(velocity.space.zeros(1))).ravel()
-        viscous = velocity.inner(A.apply(velocity) - convective) - constant[:, None]
+        tensor, viscous, constant = dispatch(fom, local_momentum_blocks, velocity)
 
         operator = ReducedSaddlePointOperator(
-            tensor=convective_tensor(impl, velocity),
+            tensor=tensor,
             viscous=viscous,
             constant=constant,
             divergence=divergence,
-            momentum=FullOrderMomentum(impl, velocity),
+            momentum=FullOrderMomentum(fom, velocity),
         )
 
         return {

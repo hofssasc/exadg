@@ -58,6 +58,9 @@
 #include <exadg/pymor/interface.h>
 #include <exadg/utilities/create_directories.h>
 
+// C/C++
+#include <deque>
+
 // application
 #include "application.h"
 
@@ -640,6 +643,13 @@ public:
     u = solution.block(0);
     p = solution.block(1);
 
+    // Newton pointed the convective kernel at `solution` through set_velocity_ptr, and `solution`
+    // is about to go out of scope. Anything that later evaluates the convective operator --
+    // apply_convective(), say -- begins by updating that vector's ghost values and would write
+    // into freed memory. Serially it survives; on more than one rank it corrupts the heap.
+    // Hand the kernel something this model owns instead.
+    install_linearization(std::make_shared<VectorType>(solution.block(0)));
+
     return true;
   }
 
@@ -721,8 +731,8 @@ public:
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    trilinear_operator.set_velocity_ptr(w);
-    trilinear_operator.apply(*dst, v);
+    trilinear_operator.set_velocity_ptr(owned(w));
+    trilinear_operator.apply(*dst, owned(v));
 
     return dst;
   }
@@ -735,7 +745,7 @@ public:
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    central_operator.evaluate_nonlinear_operator(*dst, u, 0.0 /* time */);
+    central_operator.evaluate_nonlinear_operator(*dst, owned(u), 0.0 /* time */);
 
     return dst;
   }
@@ -747,7 +757,8 @@ public:
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    pde_operator->get_convective_operator().evaluate_nonlinear_operator(*dst, u, 0.0 /* time */);
+    pde_operator->get_convective_operator().evaluate_nonlinear_operator(
+      *dst, owned(u), 0.0 /* time */);
 
     return dst;
   }
@@ -789,6 +800,28 @@ public:
   }
 
 private:
+  /**
+   * The given vector copied into one this model owns, with its ghosts cleared.
+   *
+   * MatrixFree::loop() exchanges ghost values itself and expects to be handed a vector that is
+   * not already ghosted; a vector arriving from Python has whatever state its last use left. The
+   * copies also outlive the call, which matters because ExaDG stores the transport velocity by
+   * pointer. ExaDG's own evaluate_nonlinear_residual_steady() path copies for the same reason.
+   */
+  VectorType const &
+  owned(VectorType const & source)
+  {
+    scratch.emplace_back();
+    pde_operator->initialize_vector_velocity(scratch.back());
+    scratch.back().copy_locally_owned_data_from(source);
+    scratch.back().zero_out_ghost_values();
+
+    if(scratch.size() > 8)
+      scratch.pop_front();
+
+    return scratch.back();
+  }
+
   std::shared_ptr<ForcedFOM<dim>>
   shared_self()
   {
@@ -828,26 +861,33 @@ private:
     operator_data.use_cell_based_loops =
       application->get_parameters().use_cell_based_face_loops;
 
-    dealii::AffineConstraints<Number> constraints;
-    constraints.close();
+    // A member, not a local: OperatorBase::reinit() stores a lazy_ptr to this object rather than
+    // copying it, so a stack-allocated one leaves a dangling pointer behind. It survives serially
+    // and corrupts the heap under MPI, which is the same mistake as the linearisation velocity in
+    // Jacobian above -- ExaDG hands out pointers and the caller owns the lifetime.
+    central_constraints.close();
 
-    // the trilinear form: frozen transport velocity, linear in the argument
+    // Own velocity storage, unlike ExaDG's own convective kernel: evaluate_nonlinear_operator()
+    // begins with kernel->update_ghost_values_velocity(), which dereferences that vector. ExaDG's
+    // kernel has had set_velocity_ptr() called on it by Newton long before anyone evaluates the
+    // nonlinear operator; these two are evaluated directly, so they have to own something valid.
+    // Serially the unset lazy_ptr survives the dereference; on more than one rank it does not.
     kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::LinearlyImplicit;
     trilinear_kernel               = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
     trilinear_kernel->reinit(
-      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, false /* is_mg */);
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
     operator_data.kernel_data = kernel_data;
     trilinear_operator.initialize(
-      pde_operator->get_matrix_free(), constraints, operator_data, trilinear_kernel);
+      pde_operator->get_matrix_free(), central_constraints, operator_data, trilinear_kernel);
 
     // the same physics as a nonlinear operator, so that C(u, u) can be checked against N(u)
     kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::Implicit;
     central_kernel                 = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
     central_kernel->reinit(
-      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, false /* is_mg */);
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
     operator_data.kernel_data = kernel_data;
     central_operator.initialize(
-      pde_operator->get_matrix_free(), constraints, operator_data, central_kernel);
+      pde_operator->get_matrix_free(), central_constraints, operator_data, central_kernel);
   }
 
   double
@@ -933,6 +973,10 @@ private:
   MassOperator<dim, 1, Number> pressure_mass;
 
   // the convective term with a central flux, as a trilinear form and as a nonlinear operator
+  // vectors handed to ExaDG that it may keep a pointer to; see owned()
+  std::deque<VectorType> scratch;
+
+  dealii::AffineConstraints<Number>                        central_constraints;
   std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> trilinear_kernel;
   std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> central_kernel;
 
