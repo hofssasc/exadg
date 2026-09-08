@@ -219,10 +219,6 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
     Returns:
         Tuple ``(model, (velocity_space, pressure_space))``.
     """
-    from pymor.core.logger import set_log_levels
-
-    set_log_levels({"pymor": "WARNING"})
-
     velocity = ExaDGVectorSpace(fom.velocity_space(), id="VELOCITY")
     pressure = ExaDGVectorSpace(fom.pressure_space(), id="PRESSURE")
 

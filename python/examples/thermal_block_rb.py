@@ -40,6 +40,7 @@ for a real study; the certificate is what makes this example worth running, not 
 
 import numpy as np
 from pymor.algorithms.error import reduction_error_analysis
+from pymor.core.logger import set_log_levels
 from pymor.algorithms.pod import pod
 from pymor.parameters.base import Mu
 from pymor.parameters.functionals import MinThetaParameterFunctional
@@ -53,6 +54,9 @@ N_TRAIN, N_TEST, N_MODES = 30, 5, 4
 
 
 def main():
+    # pyMOR logs one line per solve at INFO, and this script solves a great many times.
+    set_log_levels({"pymor": "WARNING"})
+
     model, space = mpi_stationary_model(
         "thermal_block", "ThermalBlockFOM3D", INPUT_FILE, degree=2, refinements=3
     )

@@ -43,6 +43,7 @@ Run from the repository root.
 
 import numpy as np
 from pymor.algorithms.pod import pod
+from pymor.core.logger import set_log_levels
 from pymor.parameters.base import Mu
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.tools import mpi
@@ -55,6 +56,9 @@ N_TRAIN, N_TEST, N_MODES = 20, 5, 4
 
 
 def main():
+    # pyMOR logs one line per solve at INFO, and this script solves a great many times.
+    set_log_levels({"pymor": "WARNING"})
+
     model, (velocity, pressure) = mpi_saddle_point_model(
         "forced", "ForcedFOM2D", INPUT_FILE, degree=DEGREE, refinements=REFINEMENTS
     )

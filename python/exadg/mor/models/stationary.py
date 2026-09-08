@@ -143,11 +143,7 @@ def stationary_model(
     Returns:
         Tuple ``(model, space)``.
     """
-    from pymor.core.logger import set_log_levels
     from pymor.models.basic import StationaryModel
-
-    # pyMOR logs one line per solve at INFO; a greedy run or a chain would emit a flood
-    set_log_levels({"pymor": "WARNING"})
 
     space = ExaDGVectorSpace(fom)
 

@@ -63,8 +63,9 @@ AMPLITUDES = (0.5, 1.5)
 def main():
     # pyMOR warns once per projection that the nonlinear operator has no efficient projection.
     # That is true and is exactly the hyper-reduction gap the docstring describes, but it says so
-    # a few dozen times.
-    set_log_levels({"pymor": "ERROR"})
+    # once per basis size. The logger is named after the class's module, so silencing it needs
+    # the "exadg" key: ExaDGNonlinearMomentum's logger is not under "pymor".
+    set_log_levels({"pymor": "ERROR", "exadg": "ERROR"})
 
     model, (velocity, pressure) = mpi_saddle_point_model(
         "forced", "ForcedFOM2D", INPUT_FILE, degree=DEGREE, refinements=REFINEMENTS
