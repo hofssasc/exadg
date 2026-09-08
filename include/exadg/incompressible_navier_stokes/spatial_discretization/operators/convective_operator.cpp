@@ -319,7 +319,8 @@ ConvectiveOperator<dim, Number>::do_face_integral_nonlinear_operator(
       u_grid = integrator_grid_velocity.get_value(q);
 
     std::tuple<vector, vector> flux =
-      kernel->calculate_flux_nonlinear_interior_and_neighbor(u_m, u_p, normal_m, u_grid);
+      kernel->calculate_flux_nonlinear_interior_and_neighbor(
+        u_m, u_p, normal_m, u_grid, integrator_m.get_current_cell_index(), q);
 
     integrator_m.submit_value(std::get<0>(flux), q);
     integrator_p.submit_value(std::get<1>(flux), q);
@@ -355,7 +356,8 @@ ConvectiveOperator<dim, Number>::do_boundary_integral_nonlinear_operator(
       u_grid = integrator_grid_velocity.get_value(q);
 
     vector flux =
-      kernel->calculate_flux_nonlinear_boundary(u_m, u_p, normal_m, u_grid, boundary_type);
+      kernel->calculate_flux_nonlinear_boundary(
+      u_m, u_p, normal_m, u_grid, boundary_type, integrator.get_current_cell_index(), q);
 
     integrator.submit_value(flux, q);
   }
@@ -454,7 +456,7 @@ ConvectiveOperator<dim, Number>::do_face_integral(IntegratorFace & integrator_m,
     vector normal_m = integrator_m.normal_vector(q);
 
     std::tuple<vector, vector> flux = kernel->calculate_flux_linear_operator_interior_and_neighbor(
-      u_m, u_p, delta_u_m, delta_u_p, normal_m, q);
+      u_m, u_p, delta_u_m, delta_u_p, normal_m, integrator_m.get_current_cell_index(), q);
 
     integrator_m.submit_value(std::get<0>(flux) /* flux_m */, q);
     integrator_p.submit_value(std::get<1>(flux) /* flux_p */, q);
@@ -479,7 +481,8 @@ ConvectiveOperator<dim, Number>::do_face_int_integral(IntegratorFace & integrato
     vector normal_m = integrator_m.normal_vector(q);
 
     vector flux =
-      kernel->calculate_flux_linear_operator_interior(u_m, u_p, delta_u_m, delta_u_p, normal_m, q);
+      kernel->calculate_flux_linear_operator_interior(
+        u_m, u_p, delta_u_m, delta_u_p, normal_m, integrator_m.get_current_cell_index(), q);
 
     integrator_m.submit_value(flux, q);
   }
@@ -509,7 +512,8 @@ ConvectiveOperator<dim, Number>::do_face_int_integral_cell_based(
     vector normal_m = integrator_m.normal_vector(q);
 
     vector flux =
-      kernel->calculate_flux_linear_operator_interior(u_m, u_p, delta_u_m, delta_u_p, normal_m, q);
+      kernel->calculate_flux_linear_operator_interior(
+        u_m, u_p, delta_u_m, delta_u_p, normal_m, integrator_m.get_current_cell_index(), q);
 
     integrator_m.submit_value(flux, q);
   }
@@ -533,7 +537,8 @@ ConvectiveOperator<dim, Number>::do_face_ext_integral(IntegratorFace & integrato
     vector normal_p = -integrator_p.normal_vector(q);
 
     vector flux =
-      kernel->calculate_flux_linear_operator_interior(u_p, u_m, delta_u_p, delta_u_m, normal_p, q);
+      kernel->calculate_flux_linear_operator_interior(
+        u_p, u_m, delta_u_p, delta_u_m, normal_p, integrator_m.get_current_cell_index(), q);
 
     integrator_p.submit_value(flux, q);
   }
@@ -597,7 +602,8 @@ ConvectiveOperator<dim, Number>::do_boundary_integral(
     vector normal_m = integrator.normal_vector(q);
 
     vector flux = kernel->calculate_flux_linear_operator_boundary(
-      u_m, u_p, delta_u_m, delta_u_p, normal_m, boundary_type, q);
+      u_m, u_p, delta_u_m, delta_u_p, normal_m, boundary_type,
+      integrator.get_current_cell_index(), q);
 
     integrator.submit_value(flux, q);
   }

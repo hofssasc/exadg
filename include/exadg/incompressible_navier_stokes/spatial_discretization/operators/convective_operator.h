@@ -27,6 +27,7 @@
 #include <exadg/incompressible_navier_stokes/user_interface/parameters.h>
 #include <exadg/matrix_free/integrators.h>
 #include <exadg/operators/operator_base.h>
+#include <exadg/operators/variable_coefficients.h>
 
 namespace ExaDG
 {
@@ -40,6 +41,7 @@ struct ConvectiveKernelData
     : formulation(FormulationConvectiveTerm::DivergenceFormulation),
       temporal_treatment(TreatmentOfConvectiveTerm::Implicit),
       upwind_factor(1.0),
+      lambda_is_variable(false),
       use_outflow_bc(false),
       type_dirichlet_bc(TypeDirichletBCs::Mirror),
       ale(false)
@@ -51,6 +53,20 @@ struct ConvectiveKernelData
   TreatmentOfConvectiveTerm temporal_treatment;
 
   double upwind_factor;
+
+  /*
+   * Read the Lax-Friedrichs coefficient lambda from a stored face coefficient field instead of
+   * computing it from the trace values.
+   *
+   * lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|) is the one part of the convective operator
+   * that is not a polynomial in the velocity, which is what stops a reduced-order model from
+   * representing the operator as a third-order tensor. Making it a coefficient is what allows it
+   * to be approximated separately -- interpolated from a few sampled faces, say -- while the rest
+   * of the operator stays exact. Mirrors ViscousKernelData::viscosity_is_variable.
+   *
+   * Off by default, and off means the flux is bit-identical to before.
+   */
+  bool lambda_is_variable;
 
   bool use_outflow_bc;
 
@@ -86,6 +102,18 @@ public:
   {
     this->data = data;
 
+    if(data.lambda_is_variable)
+    {
+      AssertThrow(data.formulation == FormulationConvectiveTerm::DivergenceFormulation,
+                  dealii::ExcMessage("A variable lambda is only implemented for the divergence "
+                                     "formulation; the convective formulation stabilises with a "
+                                     "different quantity."));
+
+      // faces only: lambda is a numerical-flux coefficient and has no cell counterpart
+      lambda_coefficients.initialize(matrix_free, quad_index_linearized, true, false);
+      lambda_coefficients.set_coefficients(dealii::VectorizedArray<Number>(0.0));
+    }
+
     // integrators for linearized problem
     integrator_velocity =
       std::make_shared<IntegratorCell>(matrix_free, dof_index, quad_index_linearized);
@@ -116,6 +144,23 @@ public:
                   dealii::ExcMessage(
                     "ALE formulation can only be used in combination with ConvectiveFormulation"));
     }
+  }
+
+  /*
+   * The Lax-Friedrichs coefficient as a face coefficient field. Only meaningful when
+   * ConvectiveKernelData::lambda_is_variable is set; otherwise lambda is computed from the trace
+   * values and these tables are not allocated.
+   */
+  scalar
+  get_coefficient_face(unsigned int const face, unsigned int const q) const
+  {
+    return lambda_coefficients.get_coefficient_face(face, q);
+  }
+
+  void
+  set_coefficient_face(unsigned int const face, unsigned int const q, scalar const & value)
+  {
+    lambda_coefficients.set_coefficient_face(face, q, value);
   }
 
   static MappingFlags
@@ -447,16 +492,18 @@ public:
    */
   inline DEAL_II_ALWAYS_INLINE //
     std::tuple<vector, vector>
-    calculate_flux_nonlinear_interior_and_neighbor(vector const & uM,
-                                                   vector const & uP,
-                                                   vector const & normalM,
-                                                   vector const & u_grid) const
+    calculate_flux_nonlinear_interior_and_neighbor(vector const &     uM,
+                                                   vector const &     uP,
+                                                   vector const &     normalM,
+                                                   vector const &     u_grid,
+                                                   unsigned int const face,
+                                                   unsigned int const q) const
   {
     vector flux_m, flux_p;
 
     if(data.formulation == FormulationConvectiveTerm::DivergenceFormulation)
     {
-      vector flux = calculate_lax_friedrichs_flux(uM, uP, normalM);
+      vector flux = calculate_lax_friedrichs_flux(uM, uP, normalM, face, q);
 
       flux_m = flux;
       flux_p = -flux; // opposite signs since n⁺ = - n⁻
@@ -494,13 +541,15 @@ public:
                                       vector const &        uP,
                                       vector const &        normalM,
                                       vector const &        u_grid,
-                                      BoundaryTypeU const & boundary_type) const
+                                      BoundaryTypeU const & boundary_type,
+                                      unsigned int const    face,
+                                      unsigned int const    q) const
   {
     vector flux;
 
     if(data.formulation == FormulationConvectiveTerm::DivergenceFormulation)
     {
-      flux = calculate_lax_friedrichs_flux(uM, uP, normalM);
+      flux = calculate_lax_friedrichs_flux(uM, uP, normalM, face, q);
 
       if(boundary_type == BoundaryTypeU::Neumann and data.use_outflow_bc == true)
         apply_outflow_bc(flux, uM * normalM);
@@ -541,6 +590,7 @@ public:
                                                          vector const &     delta_uM,
                                                          vector const &     delta_uP,
                                                          vector const &     normalM,
+                                                         unsigned int const face,
                                                          unsigned int const q) const
   {
     vector fluxM, fluxP;
@@ -551,12 +601,12 @@ public:
       {
         // linearization of nonlinear convective term
 
-        fluxM = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM);
+        fluxM = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM, face, q);
         fluxP = -fluxM;
       }
       else if(data.temporal_treatment == TreatmentOfConvectiveTerm::LinearlyImplicit)
       {
-        fluxM = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM);
+        fluxM = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM, face, q);
         fluxP = -fluxM;
       }
       else
@@ -628,6 +678,7 @@ public:
                                             vector const &     delta_uM,
                                             vector const &     delta_uP,
                                             vector const &     normalM,
+                                            unsigned int const face,
                                             unsigned int const q) const
   {
     vector flux;
@@ -637,11 +688,11 @@ public:
       if(data.temporal_treatment == TreatmentOfConvectiveTerm::Implicit)
       {
         // linearization of nonlinear convective term
-        flux = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM);
+        flux = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM, face, q);
       }
       else if(data.temporal_treatment == TreatmentOfConvectiveTerm::LinearlyImplicit)
       {
-        flux = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM);
+        flux = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM, face, q);
       }
       else
       {
@@ -713,6 +764,7 @@ public:
                                             vector const &        delta_uP,
                                             vector const &        normalM,
                                             BoundaryTypeU const & boundary_type,
+                                            unsigned int const    face,
                                             unsigned int const    q) const
   {
     vector flux;
@@ -722,14 +774,14 @@ public:
       if(data.temporal_treatment == TreatmentOfConvectiveTerm::Implicit)
       {
         // linearization of nonlinear convective term
-        flux = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM);
+        flux = calculate_lax_friedrichs_flux_linearized(uM, uP, delta_uM, delta_uP, normalM, face, q);
 
         if(boundary_type == BoundaryTypeU::Neumann and data.use_outflow_bc == true)
           apply_outflow_bc(flux, uM * normalM);
       }
       else if(data.temporal_treatment == TreatmentOfConvectiveTerm::LinearlyImplicit)
       {
-        flux = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM);
+        flux = calculate_lax_friedrichs_flux_linear_transport(uM, uP, delta_uM, delta_uP, normalM, face, q);
 
         if(boundary_type == BoundaryTypeU::Neumann and data.use_outflow_bc == true)
           apply_outflow_bc(flux, uM * normalM);
@@ -808,14 +860,35 @@ public:
     return data.upwind_factor * 2.0 * std::max(std::abs(uM_n), std::abs(uP_n));
   }
 
+  /**
+   * lambda, either computed from the trace values or read from the coefficient field.
+   *
+   * The stored form exists so that a reduced-order model can approximate this one term on its
+   * own: it is the only part of the convective operator that is not a polynomial in the velocity.
+   */
+  inline DEAL_II_ALWAYS_INLINE //
+    scalar
+    get_lambda(scalar const &     uM_n,
+               scalar const &     uP_n,
+               unsigned int const face,
+               unsigned int const q) const
+  {
+    if(data.lambda_is_variable)
+      return lambda_coefficients.get_coefficient_face(face, q);
+    else
+      return calculate_lambda(uM_n, uP_n);
+  }
+
   /*
    *  Divergence formulation: Calculate Lax-Friedrichs flux for nonlinear operator.
    */
   inline DEAL_II_ALWAYS_INLINE //
     vector
-    calculate_lax_friedrichs_flux(vector const & uM,
-                                  vector const & uP,
-                                  vector const & normalM) const
+    calculate_lax_friedrichs_flux(vector const &     uM,
+                                  vector const &     uP,
+                                  vector const &     normalM,
+                                  unsigned int const face,
+                                  unsigned int const q) const
   {
     scalar uM_n = uM * normalM;
     scalar uP_n = uP * normalM;
@@ -825,7 +898,7 @@ public:
 
     vector jump_value = uM - uP;
 
-    scalar lambda = calculate_lambda(uM_n, uP_n);
+    scalar lambda = get_lambda(uM_n, uP_n, face, q);
 
     return (average_normal_flux + 0.5 * lambda * jump_value);
   }
@@ -836,11 +909,13 @@ public:
    */
   inline DEAL_II_ALWAYS_INLINE //
     vector
-    calculate_lax_friedrichs_flux_linear_transport(vector const & wM,
-                                                   vector const & wP,
-                                                   vector const & uM,
-                                                   vector const & uP,
-                                                   vector const & normalM) const
+    calculate_lax_friedrichs_flux_linear_transport(vector const &     wM,
+                                                   vector const &     wP,
+                                                   vector const &     uM,
+                                                   vector const &     uP,
+                                                   vector const &     normalM,
+                                                   unsigned int const face,
+                                                   unsigned int const q) const
   {
     scalar wM_n = wM * normalM;
     scalar wP_n = wP * normalM;
@@ -852,7 +927,7 @@ public:
 
     // the function calculate_lambda() is for the nonlinear operator with quadratic nonlinearity. In
     // case of linear transport, lambda is reduced by a factor of 2.
-    scalar lambda = 0.5 * calculate_lambda(wM_n, wP_n);
+    scalar lambda = 0.5 * get_lambda(wM_n, wP_n, face, q);
 
     return (average_normal_flux + 0.5 * lambda * jump_value);
   }
@@ -862,11 +937,13 @@ public:
    */
   inline DEAL_II_ALWAYS_INLINE //
     vector
-    calculate_lax_friedrichs_flux_linearized(vector const & uM,
-                                             vector const & uP,
-                                             vector const & delta_uM,
-                                             vector const & delta_uP,
-                                             vector const & normalM) const
+    calculate_lax_friedrichs_flux_linearized(vector const &     uM,
+                                             vector const &     uP,
+                                             vector const &     delta_uM,
+                                             vector const &     delta_uP,
+                                             vector const &     normalM,
+                                             unsigned int const face,
+                                             unsigned int const q) const
   {
     scalar uM_n = uM * normalM;
     scalar uP_n = uP * normalM;
@@ -880,7 +957,7 @@ public:
 
     vector jump_value = delta_uM - delta_uP;
 
-    scalar lambda = calculate_lambda(uM_n, uP_n);
+    scalar lambda = get_lambda(uM_n, uP_n, face, q);
 
     return (average_normal_flux + 0.5 * lambda * jump_value);
   }
@@ -957,6 +1034,9 @@ public:
 
 private:
   ConvectiveKernelData data;
+
+  // lambda as a face coefficient field; allocated only when data.lambda_is_variable
+  VariableCoefficients<dealii::VectorizedArray<Number>> lambda_coefficients;
 
   // linearization velocity for nonlinear problems or transport velocity for "linearly implicit
   // formulation" of convective term

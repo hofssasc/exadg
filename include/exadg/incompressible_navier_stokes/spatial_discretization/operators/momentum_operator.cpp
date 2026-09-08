@@ -446,7 +446,7 @@ MomentumOperator<dim, Number>::do_face_integral(IntegratorFace & integrator_m,
 
       std::tuple<vector, vector> flux =
         convective_kernel->calculate_flux_linear_operator_interior_and_neighbor(
-          u_m, u_p, value_m, value_p, normal_m, q);
+          u_m, u_p, value_m, value_p, normal_m, integrator_m.get_current_cell_index(), q);
 
       value_flux_m += std::get<0>(flux);
       value_flux_p += std::get<1>(flux);
@@ -503,7 +503,7 @@ MomentumOperator<dim, Number>::do_face_int_integral(IntegratorFace & integrator_
       vector u_p = convective_kernel->get_velocity_p(q);
 
       value_flux_m += convective_kernel->calculate_flux_linear_operator_interior(
-        u_m, u_p, value_m, value_p, normal_m, q);
+        u_m, u_p, value_m, value_p, normal_m, integrator_m.get_current_cell_index(), q);
     }
 
     if(operator_data.viscous_problem)
@@ -559,7 +559,7 @@ MomentumOperator<dim, Number>::do_face_int_integral_cell_based(IntegratorFace & 
       vector u_p = u_m;
 
       value_flux_m += convective_kernel->calculate_flux_linear_operator_interior(
-        u_m, u_p, value_m, value_p, normal_m, q);
+        u_m, u_p, value_m, value_p, normal_m, integrator_m.get_current_cell_index(), q);
     }
 
     if(operator_data.viscous_problem)
@@ -611,7 +611,7 @@ MomentumOperator<dim, Number>::do_face_ext_integral(IntegratorFace & integrator_
       vector u_p = convective_kernel->get_velocity_p(q);
 
       value_flux_p += convective_kernel->calculate_flux_linear_operator_interior(
-        u_p, u_m, value_p, value_m, normal_p, q);
+        u_p, u_m, value_p, value_m, normal_p, integrator_m.get_current_cell_index(), q);
     }
 
     if(operator_data.viscous_problem)
@@ -710,7 +710,8 @@ MomentumOperator<dim, Number>::do_boundary_integral(
       }
 
       value_flux_m += convective_kernel->calculate_flux_linear_operator_boundary(
-        u_m, u_p, value_m, value_p, normal_m, boundary_type, q);
+        u_m, u_p, value_m, value_p, normal_m, boundary_type,
+        integrator.get_current_cell_index(), q);
     }
 
     if(operator_data.viscous_problem)
