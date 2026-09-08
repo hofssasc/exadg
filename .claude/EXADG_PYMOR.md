@@ -1,169 +1,148 @@
-# ExaDG ↔ pyMOR: where everything is
+# ExaDG ↔ pyMOR
 
-Orientation for a session picking up the `exaDG-pyMOR` branch. Facts and pointers only — the
-reasoning lives in the vault notes at the bottom.
+Entry point for a session picking up the `exaDG-pyMOR` branch. Facts and pointers; the reasoning
+lives in the vault notes at the bottom.
 
-## Run environment
+## Run it
 
 ```bash
 PYTHONPATH=/home/hofstetter/Code/exadg/build/python
-~/Code/miniforge3/envs/queens/bin/python           # 3.11; the .so files are built for that ABI
+~/Code/miniforge3/envs/queens/bin/python          # 3.11; the .so files are built for that ABI
 ```
 
-The base miniforge python is 3.13 and fails with a bare `ModuleNotFoundError: No module named
-'exadg.forced'`, which reads like a missing build rather than a version mismatch.
+The base miniforge python is 3.13 and fails with a bare `ModuleNotFoundError`, which reads like a
+missing build rather than a version mismatch.
 
 **Editing `python/exadg/**/*.py` is not enough.** CMake *copies* them into `build/python/exadg/`,
-so re-run `cmake .` in `build/` before an import sees the change. C++ needs
-`make -j8 forced` / `thermal_block` / `_core`.
+so re-run `cmake .` in `build/` before an import sees the change — and a **new** file must be added
+to the list in `python/CMakeLists.txt`. C++ needs `make -j8 forced` / `thermal_block` / `_core`.
 
-Examples read paths relative to the repository root — run them from there, not from `build/`.
+Examples take paths relative to the repository root; run them from there.
 
 ```bash
-python python/examples/stokes_rb.py
-mpirun -n 4 python -m pymor.tools.mpi python/examples/stokes_rb.py
+python python/examples/navier_stokes_ecsw.py
+mpirun -n 4 python -m pymor.tools.mpi python/examples/navier_stokes_ecsw.py
 ```
 
-`-m pymor.tools.mpi` is not optional: it starts pyMOR's event loop on ranks 1…n−1 and the script
-on rank 0. Plain `mpirun` runs the script once per rank and deadlocks on the first collective.
+`-m pymor.tools.mpi` is not optional: it starts pyMOR's event loop on ranks 1…n−1 and the script on
+rank 0. Plain `mpirun` runs the script once per rank and deadlocks on the first collective.
 
-## The four layers
+## Layers
 
-| layer | file | knows about |
+| layer | file | knows |
 |---|---|---|
-| vocabulary | `include/exadg/pymor/interface.h` | shapes only — abstract base classes, no physics |
-| binding | `python/core_bindings.cpp` → module `exadg._core` | binds the vocabulary **once** |
-| application | `applications/<app>/python_bindings.cpp` | the physics; implements the vocabulary |
-| pyMOR shim | `python/exadg/mor/binding.py` | pyMOR's interfaces; **no physics at all** |
-| assembly | `python/exadg/mor/models/{stationary,saddle_point}.py` | which pyMOR `Model`; naming, parameterisation |
+| vocabulary | `include/exadg/pymor/interface.h` | shapes only — abstract base classes |
+| binding | `python/core_bindings.cpp` → `exadg._core` | binds the vocabulary **once** |
+| application | `applications/<app>/python_bindings.cpp` | the physics |
+| pyMOR shim | `python/exadg/mor/binding.py` | pyMOR's interfaces; no physics |
+| models | `python/exadg/mor/models/{stationary,saddle_point}.py` | which pyMOR `Model`; naming |
+| reductors | `python/exadg/mor/reductors.py` | the tensor and ECSW reductions |
 
-`exadg._core` is **forced, not tidy**: pybind11's type registry is process-global and keyed by
-`std::type_index`, so a second module binding `distributed::Vector` aborts with
-`generic_type: type "Vector" is already registered!`. Every application module must
-`py::module_::import("exadg._core")` at the top of its `PYBIND11_MODULE`.
+`exadg._core` is forced, not tidy: pybind11's type registry is process-global, so a second module
+binding `distributed::Vector` aborts with `generic_type: type "Vector" is already registered!`.
+Every application module must `py::module_::import("exadg._core")`.
 
-## Two models
+## The two applications
 
-| | `FullOrderModel` | `SaddlePointModel` |
+| | `poisson/thermal_block` | `incompressible_navier_stokes/forced` |
 |---|---|---|
-| application | `applications/poisson/thermal_block/` | `applications/incompressible_navier_stokes/forced/` |
-| Python | `models/stationary.py` | `models/saddle_point.py` |
-| examples | `thermal_block_rb.py`, `thermal_block_ei.py` | `stokes_rb.py`, `navier_stokes_rb.py` |
-| spaces | is a `Space` — one | hands out two |
-| operator | affine components $\sum_i c_i(\mu) A_i$ | three fixed blocks (A, B, and B's transpose) |
-| parameters | in the operator | in the right-hand side only |
-| nonlinear | no | `is_nonlinear` / `apply_nonlinear` / `jacobian_momentum` |
+| interface | `FullOrderModel` | `SaddlePointModel` |
+| discretisation | CG, Dirichlet rows eliminated | DG (L2), nothing constrained |
+| parameters | in the operator, $P$ affine components | in the right-hand side only |
+| equation | linear | Stokes or Navier–Stokes, by input file |
 
-The `forced` application is one application for both Stokes and Navier–Stokes: the `Equation`
-setting in the input file selects them, the convective term is the only difference, and
-`input.json` / `input_navier_stokes.json` are the two configurations.
+`forced` serves both flow equations: `Equation` selects them and the convective term is the only
+difference, so one is a controlled comparison for the other.
+
+## The Navier–Stokes reduction, in one picture
+
+$$N(u) = \underbrace{B(u,u)}_{\text{trilinear} \to \text{tensor } C_{ijk}} + \underbrace{S(u)}_{\text{Lax–Friedrichs} \to \text{ECSW}}$$
+
+Everything hard is in `S`. Its $\lambda = \texttt{uf}\cdot 2\max(|u_M\!\cdot\!n|,|u_P\!\cdot\!n|)$ is
+a maximum of absolute values, so it is **(a)** not a polynomial — no tensor, **(b)** not
+differentiable — ExaDG freezes it, so the Jacobian is only first-order accurate, and **(c)** the
+mechanism that stabilises under-resolved flow, so it cannot be dropped.
+
+`B` is projected exactly; `S` is sampled on a weighted subset of faces. The same weights serve the
+Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 
 ## Rules that are load-bearing
 
-1. **Nothing is assumed.** Symmetry, invertibility, a restricted evaluation — each is a virtual
-   method defaulting to "no", whose transposed form aborts rather than improvising. A wrong guess
-   is invisible: an adjoint solve that quietly solves the wrong system returns plausible numbers.
-2. **Structure is declared in C++, naming is not.** `parameter_shape()` says there are sixteen
-   coefficients; that they are called `mu` and enter through an exponential is a modelling choice
-   and lives in Python, where changing it is not a recompile.
-3. **Composite objects need explicit MPI counterparts.** `mpi_wrap_model` wraps *leaf* operators
-   in `MPIOperator` and attaches `MPISolver`. Anything pyMOR builds by composing those leaves — a
-   `BlockOperator`, its solver, a block visualizer — is assembled on rank 0 and gets nothing. Hence
-   `MPIExaDGCoupledSolver` and `MPIExaDGSaddlePointVisualizer`.
-4. **A model constructor is collective.** deal.II partitions the triangulation across the
-   communicator, so the FOM must be built on *every* rank. That is why `mpi_*_model` ships a
-   picklable recipe naming the application by string rather than a model.
-5. **Everything returning data must return the global answer.** Every wrapped method runs on all
-   ranks and pyMOR keeps rank 0's. `dofs()` and `amax()` reduce in C++.
+1. **Nothing is assumed.** Symmetry, invertibility, a restricted evaluation — each defaults to
+   "no" and its transposed form aborts rather than improvising.
+2. **Structure is declared in C++, naming is not.** `parameter_shape()` says how many parameters;
+   what they are called and how the operator depends on them live in Python.
+3. **Composite objects need explicit MPI counterparts.** `mpi_wrap_model` wraps *leaf* operators.
+   Anything pyMOR composes from them — a `BlockOperator`, its solver, a block visualizer — gets
+   nothing. Hence `MPIExaDGCoupledSolver`, `MPIExaDGSaddlePointVisualizer`, `reductors.dispatch`.
+4. **A model constructor is collective**, so the FOM is built on every rank from a picklable
+   recipe naming the application by string.
+5. **Anything returning data must return the global answer.** Every wrapped method runs on all
+   ranks and pyMOR keeps rank 0's.
 
 ## Traps, each of which cost real time
 
-- **`set_velocity_ptr` keeps a pointer.** `MomentumOperator::set_solution_linearization` forwards
-  to it, so ExaDG dereferences the linearisation velocity long after pyMOR has discarded the
-  `Jacobian` that owned it → segfault in `update_ghost_values`. `set_velocity_copy` does *not* fix
-  it (a different nil-pointer crash in `ConvectiveKernel::reinit_cell`). The **model** owns it, via
-  `ForcedFOM::install_linearization`.
-- **`solve_nonlinear_problem` resets the mass scaling to 1.0 on every call.** A steady residual
-  carries no mass term, so any operator that called `set_scaling_factor_mass_operator(0.0)` once at
-  construction silently becomes `A + M` after the first solve. Set it inside `apply`.
-- **`A'(u)` is not the exact derivative of `A(u)`, and the Lax-Friedrichs term is the whole
-  reason.** Its `lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|)` is not differentiable, so
-  `calculate_lax_friedrichs_flux_linearized` freezes it at the linearisation point. Measured on
-  the forced box: a finite difference agrees to **4.5e-08 at `upwind_factor = 0`** and only
-  **5.1e-03 at `upwind_factor = 1`**. Newton converges linearly, not quadratically. Deliberate,
-  not a bug. (It is *not* a quadrature effect — with the default
-  `QuadratureRuleLinearization::Overintegration32k` and a non-explicit convective term,
-  `get_quad_index_velocity_linearized()` and `..._overintegration()` return the same index.)
-- **`SolverControl::NoConvergence` escaping `solve()` aborts the interpreter.** Caught; the model
-  declines, which is what lets a greedy skip an unreachable training parameter.
-- **A snapshot velocity is discretely divergence-free**, so `Bu ≈ 0` and an adjoint check probed
-  at a snapshot divides roundoff by roundoff (reads ~1e-5, means nothing). Probe at `Bᵀp`.
-- **pyMOR names a `BasicObject`'s logger after its class's *module*.** `ExaDGNonlinearMomentum`
-  logs under `exadg`, never under `pymor`.
-- **`restricted()` replicates the stencil, it does not distribute it.** Each rank assembles the
-  cells it owns and then receives the rest, so every rank holds the whole restricted operator and
-  `apply` needs no communication. That is forced, not chosen: `MPIOperator.restricted` runs on all
-  ranks but keeps and evaluates **only rank 0's object**, so an operator that still needed its
-  peers would deadlock on the first evaluation. Affordable because the stencil is O(1) cells.
-- **`mpi.call` returns `None` outright when pyMOR was built without mpi4py**
-  (`pymor/tools/mpi.py:73` sets `finished = True`). Never route a serial path through it.
-- **pyMOR bug**: `mpi_wrap_model` asserts `isinstance(base_type, Model)` (an instance) then does
-  `class MPIWrappedModel(MPIModel, base_type)` (needs a class). No value satisfies both; pass an
-  `ObjectId` instead. Not reported upstream.
+- **ExaDG hands out pointers; the caller owns the lifetime.** Three bugs of this shape, all silent
+  serially and fatal under MPI: `set_velocity_ptr` (`solve()` left the kernel pointing at its own
+  local solution), `OperatorBase::reinit` keeping a `lazy_ptr` to a stack-local `AffineConstraints`,
+  and a `ConvectiveKernel` with no velocity storage whose `update_ghost_values_velocity()`
+  dereferenced nothing. **Suspect lifetimes first when MPI corrupts the heap.**
+- **Vectors from Python must be copied and un-ghosted** before `MatrixFree::loop`, which does its
+  own exchange — `ForcedFOM::owned()`.
+- **`solve_nonlinear_problem` resets the mass scaling to 1.0**, so a steady operator must zero it
+  inside `apply`, not once at construction.
+- **`A'(u)` is not the exact derivative**: λ is frozen. Measured 4.5e-08 at `upwind_factor = 0`
+  against 5.1e-03 at 1.0. Not a quadrature effect — both indices are 2.
+- **ExaDG's linearly-implicit operator is not the polarisation of its nonlinear one.** Both are
+  trilinear; they differ at discretisation level (~$h^5$). Build tensors from the nonlinear one.
+- **A snapshot velocity is discretely divergence-free**, so an adjoint check probed at a snapshot
+  divides roundoff by roundoff. Probe at $B^\top p$.
+- **pyMOR names a `BasicObject`'s logger after its class's module** — `ExaDGNonlinearMomentum` logs
+  under `exadg`, never `pymor`.
+- **`MPISolver` assembles before dispatching**, so a parametric operator must return something its
+  own solver can prepare — see `ExaDGParametricOperator.assemble`.
+- **pyMOR bug**: `mpi_wrap_model` asserts `isinstance(base_type, Model)` then subclasses it. Pass
+  an `ObjectId`.
+- **Teardown noise is benign**: `Rank0ObjectId.__del__` raising `TypeError` after a clean exit.
 
-## The regression surface
+## Regression surface
 
-Run all of these before claiming a change is safe. Every printed quantity is global, so **1 and 4
-ranks must agree to nine significant digits** — the twelfth digit moves with the partitioning
-because reductions sum in a different order.
+Every printed quantity is global, so **1 and 4 ranks must agree to nine significant digits**.
 
-| check | what it pins |
+| script | pins |
 |---|---|
-| `thermal_block_rb.py` (1, 4 ranks) | affine path, certified estimator, `dofs`/`amax` |
-| `thermal_block_ei.py` (1, 4 ranks) | the restriction contract through pyMOR's own call path |
-| `stokes_rb.py` (1, 4 ranks) | `⟨Bu,p⟩` vs `⟨u,Bᵀp⟩`; block system vs ExaDG's solve; exactness at P modes |
-| `navier_stokes_rb.py` (1, 4 ranks) | the nonlinear path; error falls with the basis |
+| `thermal_block_rb.py` | affine path, certified estimator, `dofs`/`amax` |
+| `thermal_block_ei.py` | the restriction contract through pyMOR's own call path |
+| `stokes_rb.py` | adjoint identity, block system vs ExaDG's solve, exactness at $P$ modes |
+| `navier_stokes_rb.py` | the nonlinear path |
+| `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ |
+| `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
+| `navier_stokes_ecsw.py` | sampling does not move the error |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
-Known rank-dependent values: the Stokes last row (~1e-10 vs ~7e-11) and the NS residual
-(6.556e-07 vs 1.244e-07) are both at their solver's tolerance floor, not defects.
+Legitimately rank-dependent: Stokes' last row and the NS residual sit at their solver's tolerance
+floor; `thermal_block_ei`'s first row is a singular reduced operator that raises on one rank and
+returns ~1e17 on four.
 
 ## Known defects, not yet fixed
 
-- **The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather
-  the whole training matrix — `(n_train * n_basis) x n_faces_global`, on *every* rank — and solve
-  the same NNLS. Correct, because the problem is deterministic and needs no scatter, but it scales
-  in neither memory nor work, and its width grows with the mesh, which is the one thing
-  hyper-reduction exists to prevent. **Solve it once and scatter the weights.** First thing to fix
-  before running at size.
-- **Reconstructing `V a` is still a full-order operation** — r mesh-sized vector updates per
-  reduced residual, and now the floor on the sampled path (28.9x at refinement 6 and still rising,
-  but the sampled time creeps up with the mesh). A fully online ECSW reconstructs only on the
-  sampled cells.
-- **State on the bound model is shared between reduced models.** The basis and weights live on the
-  FOM, so two ROMs over one FOM would clobber each other. Each stamps a token and reinstalls when
-  it does not match — cheap while one model is used at a time, an O(r n_dofs + n_faces) reinstall
-  when alternating.
+1. **The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather
+   the whole training matrix — $(n_\text{train} r) \times n_\text{faces}$, on *every* rank — and
+   solve the same NNLS. Scales in neither memory nor work, and its width grows with the mesh.
+2. **Reconstructing $Va$ is still full order** — $r$ mesh-sized updates per reduced residual, now
+   the floor on the sampled path.
+3. **The token dance.** Basis and weights live on the shared bound model, so each reduced model
+   stamps a token and reinstalls when it does not match.
 
-## Current state
-
-Reduction works end to end for the thermal block, Stokes and Navier–Stokes. The NS ROM is
-**correct but not fast** — every reduced Newton step evaluates the residual at full order.
-
-Next step: **hyper-reduction, ECSW rather than DEIM.** DEIM needs `restricted()`, i.e. a second
-implementation of the physics on a stencil (`include/exadg/pymor/restricted_laplace.h` is that for
-the Laplace operator, and it is matrix-based on purpose). ECSW keeps the matrix-free loop and only
-attaches per-cell weights, which is what `RestrictedLaplace`'s per-cell contribution layout is
-already shaped for. pyMOR has DEIM/EIM but **no ECSW**.
-
-Also outstanding: switch the thermal block from `ExponentialParameterFunctional` to
-`ProjectionParameterFunctional` and drop the P³ workaround (deferred deliberately, so the examples
-stayed a byte-identical regression test through the interface rewrite).
+All three are analysed, with proposed architectures, in
+`~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that before
+touching any of them.**
 
 ## Vault
 
 `~/Documents/Dissertation/Literature/40-Reference/`
 
 - `ExaDG pyMOR Interface.md` — the interface, then each model in detail
-- `ExaDG Operators and Solvers.md` — ExaDG itself: operators, solvers, and the two setups
+- `ExaDG Operators and Solvers.md` — ExaDG itself: operators, solvers, the two setups
+- `ExaDG ROM Next Steps.md` — the three defects above, and how to fix them properly
 - `ExaDG Build System.md` — build and linking
