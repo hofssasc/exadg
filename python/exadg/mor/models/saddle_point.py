@@ -253,14 +253,22 @@ def _as_operator(space, vector):
 
 
 def _velocity_rhs(space, fom, components, coefficients):
-    """f = f_0 + sum_i c_i(mu) f_i, dropping f_0 when it is exactly zero.
+    """f = f_0 + sum_i c_i(mu) f_i, with the constant part f_0 only where it belongs.
 
-    The constant part is the right-hand side at zero parameters: the boundary terms of the
-    gradient and viscous operators. Homogeneous boundary conditions make it vanish, and this
-    application's do, but that is checked here rather than assumed -- a lifted Dirichlet
-    condition would put a non-zero constant term in exactly this place.
+    f_0 is the right-hand side at zero parameters: the inhomogeneous boundary terms of the
+    gradient and viscous operators, moved to the right. Whether it belongs on the right depends
+    on which form of A the model exposes, and the two branches genuinely differ.
+
+    ``momentum()`` is ExaDG's ``vmult``, the *homogeneous* operator, so those terms are not in it
+    and have to appear here. ``apply_nonlinear()`` is ExaDG's residual, assembled from
+    ``evaluate()``, which already carries them -- adding f_0 as well would count them twice, and
+    the reduced model would converge to a solution ExaDG's own Newton does not.
+
+    Both are zero under homogeneous boundary conditions, which is what every application here has
+    and what the norm check below detects. The branch costs nothing and removes a defect that
+    would otherwise surface the first time somebody lifts a Dirichlet condition.
     """
-    constant = fom.velocity_rhs()
+    constant = None if fom.is_nonlinear else fom.velocity_rhs()
 
     operators = [_as_operator(space, component.vector) for component in components]
     functionals = list(coefficients)
