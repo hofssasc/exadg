@@ -50,6 +50,10 @@ the communicator, so every rank computes the same small array and pyMOR keeps ra
 dispatch below buys is only that the *evaluation* happens everywhere: the bound ExaDG model is
 reachable through the coupled solver, and under MPI that solver holds an
 :class:`~pymor.tools.mpi.ObjectId` for the per-rank models rather than one handle.
+
+One exception, flagged where it happens: :func:`local_ecsw_weights` fits the hyper-reduction
+weights **redundantly on every rank**, over a training matrix gathered whole. That is a known
+scaling defect, not a design choice -- see its warning.
 """
 
 import numpy as np
@@ -167,18 +171,21 @@ def local_stabilisation(model, basis, coefficients):
     return np.array([mode.impl.inner(residual) for mode in basis.vectors])
 
 
-def local_momentum_jacobian(model, basis, coefficients):
-    """``V^T A'(V a) V``, the projected momentum Jacobian, on one rank."""
+def local_stabilisation_jacobian(model, basis, coefficients, weights):
+    """``V^T (sum_f w_f S'_f(V a)) V`` on one rank, the linearised stabilisation."""
     fom = _bound_model(model)
-    jacobian = fom.jacobian_momentum(_reconstruct(basis, coefficients))
+    phi = [mode.impl for mode in basis.vectors]
 
-    columns = []
-    for mode in basis.vectors:
-        image = basis.space.impl.zero_vector()
-        jacobian.apply(image, mode.impl)
-        columns.append([other.impl.inner(image) for other in basis.vectors])
+    matrix = fom.stabilisation_jacobian(
+        phi, _reconstruct(basis, coefficients), fom.n_faces * [1.0] if weights is None else weights
+    )
 
-    return np.array(columns).T
+    return np.array(matrix).reshape(len(phi), len(phi))
+
+
+def local_ones(model, basis):
+    """A unit weight per face on this rank."""
+    return np.ones(_bound_model(model).n_faces)
 
 
 class FullOrderMomentum:
@@ -196,14 +203,16 @@ class FullOrderMomentum:
     def stabilisation(self, coefficients):
         return dispatch(self.model, local_stabilisation, self.basis, coefficients)
 
-    def jacobian(self, coefficients):
-        """Assembled at full order, one operator application per basis vector.
+    def stabilisation_jacobian(self, coefficients):
+        """``V^T S'(V a) V``, the linearised stabilisation over every face.
 
-        The tensor covers the *residual's* convective part; the Jacobian is what hyper-reduction
-        has to remove as well, and until it does this is what keeps the reduced model tied to the
-        mesh.
+        ExaDG freezes lambda when it linearises -- it is not differentiable -- so this is a linear
+        face operator and the same loop serves it. Together with the tensor and the viscous block
+        it is the *exact* derivative of the reduced residual, which is a better Jacobian than the
+        projection of ExaDG's own: that one carries the same frozen lambda but is assembled from
+        a linearisation path that differs from the nonlinear one at discretisation level.
         """
-        return dispatch(self.model, local_momentum_jacobian, self.basis, coefficients)
+        return dispatch(self.model, local_stabilisation_jacobian, self.basis, coefficients, None)
 
 
 class ReducedSaddlePointOperator(Operator):
@@ -257,13 +266,23 @@ class ReducedSaddlePointOperator(Operator):
         return self.range.make_array(np.array(images).T)
 
     def jacobian(self, U, mu=None):
+        """The exact derivative of :meth:`apply`, assembled from the same three pieces.
+
+        The convective part comes from the tensor -- ``d/da C a a = 2 C a`` -- so the only piece
+        that is evaluated is the linearised stabilisation, and hyper-reducing that hyper-reduces
+        the Jacobian as well.
+        """
         assert len(U) == 1
 
         a_u, _ = self._split(U.to_numpy()[:, 0])
         n, n_u = self.source.dim, self.n_velocity
 
         matrix = np.zeros((n, n))
-        matrix[:n_u, :n_u] = self.momentum.jacobian(a_u)
+        matrix[:n_u, :n_u] = (
+            self.viscous
+            + 2.0 * np.einsum("ikj,k->ij", self.tensor, a_u)
+            + self.momentum.stabilisation_jacobian(a_u)
+        )
         matrix[:n_u, n_u:] = self.divergence.T
         matrix[n_u:, :n_u] = self.divergence
 
@@ -431,13 +450,26 @@ def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
 def local_ecsw_weights(model, basis, states, tolerance, max_entries):
     """Train ECSW weights on one rank, keeping that rank's slice.
 
-    Every rank assembles the columns for the faces it owns, all ranks agree on the global fit --
-    the same deterministic least-squares problem, solved redundantly rather than solved once and
-    scattered -- and each keeps the weights belonging to its own faces. The weights stay on the
-    rank because that is where the faces are; only the diagnostics are global and returnable.
+    Every rank assembles the columns for the faces it owns, all ranks agree on the global fit, and
+    each keeps the weights belonging to its own faces. The weights stay on the rank because that is
+    where the faces are, and they are stashed on the local model rather than returned, because
+    ``mpi.call`` keeps rank 0's value while every rank needs a different answer.
 
-    Stashed on the local model rather than returned, because ``mpi.call`` keeps rank 0's value and
-    every rank needs a different answer.
+    .. warning::
+       **The fit is redundant across ranks and this has to change.**
+
+       Every rank gathers the *entire* training matrix and solves the *same* non-negative least
+       squares. That is correct -- the problem is deterministic, so all ranks agree without a
+       scatter -- and it is convenient, but it does not scale in either direction:
+
+       * memory: the gathered matrix is ``(n_train * n_basis) x n_faces_global`` **on every rank**,
+         and its width grows with the mesh, which is exactly the thing hyper-reduction exists to
+         stop mattering;
+       * work: the solve is repeated once per rank rather than done once.
+
+       The fix is to solve it once -- distributed, or on one rank -- and scatter the weights back
+       to the faces they belong to. Left as it is here only because it kept the first working
+       version small; it is the first thing to replace before this is run at any real size.
     """
     from pymor.tools import mpi
 
@@ -476,6 +508,11 @@ def local_ecsw_stabilisation(model, basis, coefficients):
     return np.array([mode.impl.inner(residual) for mode in basis.vectors])
 
 
+def local_ecsw_stabilisation_jacobian(model, basis, coefficients):
+    """``V^T (sum_f xi_f S'_f(V a)) V`` on one rank, using the trained weights."""
+    return local_stabilisation_jacobian(model, basis, coefficients, model._ecsw_weights)
+
+
 class ECSWMomentum(FullOrderMomentum):
     """:class:`FullOrderMomentum` with the stabilisation restricted to a weighted set of faces.
 
@@ -496,3 +533,14 @@ class ECSWMomentum(FullOrderMomentum):
 
     def stabilisation(self, coefficients):
         return dispatch(self.model, local_ecsw_stabilisation, self.basis, coefficients)
+
+    def stabilisation_jacobian(self, coefficients):
+        """The linearised stabilisation on the sampled faces, with the same weights.
+
+        ExaDG's linearisation freezes lambda, so S' is a linear face operator built from the same
+        quantity the residual samples -- the weights carry over unchanged, and with them the
+        Jacobian stops depending on the mesh too.
+        """
+        return dispatch(
+            self.model, local_ecsw_stabilisation_jacobian, self.basis, coefficients
+        )

@@ -128,6 +128,18 @@ because reductions sum in a different order.
 Known rank-dependent values: the Stokes last row (~1e-10 vs ~7e-11) and the NS residual
 (6.556e-07 vs 1.244e-07) are both at their solver's tolerance floor, not defects.
 
+## Known defects, not yet fixed
+
+- **The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather
+  the whole training matrix — `(n_train * n_basis) x n_faces_global`, on *every* rank — and solve
+  the same NNLS. Correct, because the problem is deterministic and needs no scatter, but it scales
+  in neither memory nor work, and its width grows with the mesh, which is the one thing
+  hyper-reduction exists to prevent. **Solve it once and scatter the weights.** First thing to fix
+  before running at size.
+- **The sampled face loop still visits every face.** `MatrixFree::loop` has no "these batches only"
+  entry point, so the unselected faces are computed and multiplied by zero. The arithmetic is
+  hyper-reduced; the wall clock is not. Needs a loop driven over selected face batches.
+
 ## Current state
 
 Reduction works end to end for the thermal block, Stokes and Navier–Stokes. The NS ROM is

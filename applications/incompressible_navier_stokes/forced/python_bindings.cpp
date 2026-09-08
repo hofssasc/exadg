@@ -864,6 +864,52 @@ public:
   }
 
   /**
+   * V^T (sum_f w_f S'_f(u)) V, the projected linearised stabilisation, row-major (n, n).
+   *
+   * ExaDG freezes lambda when it linearises -- it is a maximum of absolute values and not
+   * differentiable -- so S'(u) dv = 0.5 * lambda(u) * jump(dv) is a *linear* face operator, and
+   * its projection is the symmetric matrix
+   *
+   *     V_i^T S'_f V_j = int_F 0.5 * lambda(u) * jump(phi_i) . jump(phi_j).
+   *
+   * With the same weights as the residual this makes the Jacobian mesh-independent too. Faces of
+   * zero weight are skipped, so the quadratic work is paid only on the sampled ones.
+   */
+  std::vector<double>
+  stabilisation_jacobian(std::vector<std::shared_ptr<VectorType>> const & basis,
+                         VectorType const &                              u,
+                         std::vector<double> const &                     weights)
+  {
+    AssertThrow(weights.size() == n_faces(),
+                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
+                                   std::to_string(weights.size()) + "."));
+
+    std::vector<VectorType> ghosted(basis.size());
+    for(unsigned int i = 0; i < basis.size(); ++i)
+    {
+      pde_operator->initialize_vector_velocity(ghosted[i]);
+      ghosted[i].copy_locally_owned_data_from(*basis[i]);
+      ghosted[i].update_ghost_values();
+    }
+
+    std::vector<double> matrix(basis.size() * basis.size(), 0.0);
+
+    face_weights     = &weights;
+    training_basis   = &ghosted;
+    jacobian_matrix  = &matrix;
+
+    VectorType dummy;
+    pde_operator->initialize_vector_velocity(dummy);
+    run_face_loop(dummy, owned(u));
+
+    face_weights    = nullptr;
+    training_basis  = nullptr;
+    jacobian_matrix = nullptr;
+
+    return matrix;
+  }
+
+  /**
    * Points ExaDG's momentum operator at a linearisation velocity, and keeps it alive.
    *
    * ExaDG stores the pointer, so ownership has to sit somewhere that outlives every Jacobian
@@ -969,17 +1015,86 @@ private:
     unsigned int const lanes = dealii::VectorizedArray<Number>::size();
 
     std::vector<FaceVector> fluxes(integrator_m.n_q_points);
+    std::vector<dealii::VectorizedArray<Number>> lambdas(integrator_m.n_q_points);
 
     for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
     {
       FaceVector const u_m = integrator_m.get_value(q);
       FaceVector const u_p =
-        (integrator_p != nullptr) ? integrator_p->get_value(q) : exterior_value(q, integrator_m, face);
+        (integrator_p != nullptr) ?
+          integrator_p->get_value(q) :
+          exterior_value(q, integrator_m, face, u_m, ExaDG::OperatorType::full);
       FaceVector const normal = integrator_m.normal_vector(q);
 
-      auto const lambda = stabilisation_kernel->calculate_lambda(u_m * normal, u_p * normal);
+      lambdas[q] = stabilisation_kernel->calculate_lambda(u_m * normal, u_p * normal);
+      fluxes[q]  = (0.5 * lambdas[q]) * (u_m - u_p);
+    }
 
-      fluxes[q] = (0.5 * lambda) * (u_m - u_p);
+    if(jacobian_matrix != nullptr)
+    {
+      auto const weight = weight_of(face);
+
+      bool any = false;
+      for(unsigned int lane = 0; lane < lanes; ++lane)
+        any = any or weight[lane] != 0.0;
+
+      if(not any)
+        return;
+
+      // the jumps of every basis vector on this face, gathered once
+      auto const &                         basis = *training_basis;
+      std::vector<std::vector<FaceVector>> jumps(basis.size());
+
+      FaceIntegratorU probe_m(pde_operator->get_matrix_free(), true, dof_index(), quad_index());
+      FaceIntegratorU probe_p(pde_operator->get_matrix_free(), false, dof_index(), quad_index());
+
+      for(unsigned int i = 0; i < basis.size(); ++i)
+      {
+        probe_m.reinit(face);
+        probe_m.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+
+        if(integrator_p != nullptr)
+        {
+          probe_p.reinit(face);
+          probe_p.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+        }
+
+        // On a boundary face the increment's exterior value is the *homogeneous* mirror of its
+        // interior one -- the boundary data does not vary with the state. Mirror Dirichlet gives
+        // a jump of 2 phi_m, a do-nothing outflow gives none at all, and using the raw trace
+        // instead gets both wrong: it is four times too small on one and entirely spurious on
+        // the other.
+        jumps[i].resize(integrator_m.n_q_points);
+        for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+        {
+          FaceVector const value = probe_m.get_value(q);
+          FaceVector const other =
+            (integrator_p != nullptr) ?
+              probe_p.get_value(q) :
+              exterior_value(q, integrator_m, face, value, ExaDG::OperatorType::homogeneous);
+
+          jumps[i][q] = value - other;
+        }
+      }
+
+      for(unsigned int i = 0; i < basis.size(); ++i)
+        for(unsigned int j = i; j < basis.size(); ++j)
+        {
+          auto entry = dealii::make_vectorized_array<Number>(0.0);
+          for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+            entry += weight * (0.5 * lambdas[q]) * (jumps[i][q] * jumps[j][q]) *
+                     integrator_m.JxW(q);
+
+          double sum = 0.0;
+          for(unsigned int lane = 0; lane < lanes; ++lane)
+            sum += entry[lane];
+
+          (*jacobian_matrix)[i * basis.size() + j] += sum;
+          if(i != j)
+            (*jacobian_matrix)[j * basis.size() + i] += sum;
+        }
+
+      return;
     }
 
     if(training_matrix != nullptr)
@@ -1029,7 +1144,11 @@ private:
   }
 
   FaceVector
-  exterior_value(unsigned int const q, FaceIntegratorU & integrator, unsigned int const face) const
+  exterior_value(unsigned int const     q,
+                 FaceIntegratorU &      integrator,
+                 unsigned int const     face,
+                 FaceVector const &     value,
+                 ExaDG::OperatorType const operator_type) const
   {
     auto const boundary_id = pde_operator->get_matrix_free().get_boundary_id(face);
 
@@ -1038,10 +1157,10 @@ private:
     std::shared_ptr<BoundaryDescriptorU<dim> const> const descriptor =
       application->get_boundary_descriptor()->velocity;
 
-    return calculate_exterior_value_convective(integrator.get_value(q),
+    return calculate_exterior_value_convective(value,
                                                q,
                                                integrator,
-                                               ExaDG::OperatorType::full,
+                                               operator_type,
                                                descriptor->get_boundary_type(boundary_id),
                                                application->get_parameters().type_dirichlet_bc_convective,
                                                boundary_id,
@@ -1271,6 +1390,7 @@ private:
   std::vector<double> const *     face_weights    = nullptr;
   std::vector<VectorType> const * training_basis  = nullptr;
   std::vector<double> *           training_matrix = nullptr;
+  std::vector<double> *           jacobian_matrix = nullptr;
 
   // the convective term with a central flux, as a trilinear form and as a nonlinear operator,
   // and a kernel at this application's upwind factor that owns the definition of lambda
@@ -1315,6 +1435,12 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("u"),
          py::arg("weights"),
          "sum_f w_f S_f(u), the Lax-Friedrichs stabilisation weighted per face.")
+    .def("stabilisation_jacobian",
+         &ForcedFOM<dim>::stabilisation_jacobian,
+         py::arg("basis"),
+         py::arg("u"),
+         py::arg("weights"),
+         "V^T (sum_f w_f S'_f(u)) V, row-major (n_basis, n_basis).")
     .def("stabilisation_contributions",
          &ForcedFOM<dim>::stabilisation_contributions,
          py::arg("basis"),

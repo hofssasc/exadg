@@ -39,9 +39,20 @@ with the weights chosen by a non-negative least squares that stops as soon as th
 enough -- every extra face kept is one more the reduced model has to evaluate. Asking a smooth
 interpolant to reproduce a kink is exactly what DEIM would do and exactly what this avoids.
 
-**Not yet a speed-up.** The momentum Jacobian is still assembled at full order, so the online cost
-is still tied to the mesh; sampling it reuses these same weights and is the next step. What this
-script measures is that the sampled residual is as accurate as the exact one.
+The Jacobian is sampled with the same weights. ExaDG freezes lambda when it linearises -- it is
+not differentiable -- so the linearised stabilisation is a *linear* face operator built from the
+same quantity, and the weights carry over unchanged. With the tensor supplying the convective
+part's derivative exactly, the reduced Jacobian is then the exact derivative of the reduced
+residual, and neither depends on the mesh any more.
+
+**What is still missing before this is a wall-clock speed-up.** The arithmetic is sampled but the
+*loop* is not: ``MatrixFree::loop`` still visits every face and multiplies the unselected ones by
+zero. Evaluating only the selected face batches is a separate piece of work, and it is what turns
+the counts below into time.
+
+**And the weight fit does not scale.** It is currently solved redundantly on every rank over a
+training matrix gathered whole; see the warning on ``local_ecsw_weights``. That is the first thing
+to fix before running this at size.
 
 Runs unchanged on any number of ranks::
 
@@ -124,8 +135,9 @@ def main():
         "the rank count because matrix-free pads its face batches per rank -- the padding slots\n"
         "contribute nothing and are never selected, so the fit is unchanged.\n"
         "\n"
-        "Still full order: the momentum Jacobian. Sampling it with these same weights is what\n"
-        "turns this into a speed-up."
+        "Residual and Jacobian are both sampled, so neither depends on the mesh. Two things still\n"
+        "do: the face loop visits every face rather than only the selected ones, and the weight\n"
+        "fit is solved redundantly on every rank over a matrix gathered whole."
     )
 
 
