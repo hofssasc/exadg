@@ -136,9 +136,14 @@ Known rank-dependent values: the Stokes last row (~1e-10 vs ~7e-11) and the NS r
   in neither memory nor work, and its width grows with the mesh, which is the one thing
   hyper-reduction exists to prevent. **Solve it once and scatter the weights.** First thing to fix
   before running at size.
-- **The sampled face loop still visits every face.** `MatrixFree::loop` has no "these batches only"
-  entry point, so the unselected faces are computed and multiplied by zero. The arithmetic is
-  hyper-reduced; the wall clock is not. Needs a loop driven over selected face batches.
+- **Reconstructing `V a` is still a full-order operation** — r mesh-sized vector updates per
+  reduced residual, and now the floor on the sampled path (28.9x at refinement 6 and still rising,
+  but the sampled time creeps up with the mesh). A fully online ECSW reconstructs only on the
+  sampled cells.
+- **State on the bound model is shared between reduced models.** The basis and weights live on the
+  FOM, so two ROMs over one FOM would clobber each other. Each stamps a token and reinstalls when
+  it does not match — cheap while one model is used at a time, an O(r n_dofs + n_faces) reinstall
+  when alternating.
 
 ## Current state
 

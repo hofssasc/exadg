@@ -160,32 +160,49 @@ def local_momentum_blocks(model, basis):
     return convective_tensor(fom, basis), viscous, constant
 
 
-def local_stabilisation(model, basis, coefficients):
-    """``V^T S(V a)`` with ``S(u) = N(u) - B(u, u)``, the Lax-Friedrichs term, on one rank."""
-    fom = _bound_model(model)
-    u = _reconstruct(basis, coefficients)
+def local_stabilisation(model, basis, coefficients, trained, token):
+    """``V^T sum_f w_f S_f(V a)`` on one rank, projected inside the face loop.
 
-    residual = fom.apply_convective(u)
-    residual.axpy(-1.0, fom.apply_convective_central(u))
+    Unit weights select every face, so this is the general path rather than a hyper-reduced
+    special case -- one route means the sampled and unsampled evaluations cannot drift apart.
 
-    return np.array([mode.impl.inner(residual) for mode in basis.vectors])
+    Projecting in C++ rather than returning a degree-of-freedom vector matters once the faces are
+    sampled: the route through a full-order vector costs a mesh-sized allocation, an additive
+    compress and ``r`` mesh-sized inner products per evaluation, and those dominate as soon as the
+    face work is down to a dozen faces.
+    """
+    fom = install(model, basis, trained, token)
+
+    return np.array(fom.stabilisation_projected(_reconstruct(basis, coefficients)))
 
 
-def local_stabilisation_jacobian(model, basis, coefficients, weights):
+def local_stabilisation_jacobian(model, basis, coefficients, trained, token):
     """``V^T (sum_f w_f S'_f(V a)) V`` on one rank, the linearised stabilisation."""
+    fom = install(model, basis, trained, token)
+    matrix = fom.stabilisation_jacobian(_reconstruct(basis, coefficients))
+
+    return np.array(matrix).reshape(len(basis), len(basis))
+
+
+def install(model, basis, trained, token):
+    """Install the basis and the face weights on the bound model, if they are not already.
+
+    Both are fixed for the life of a reduced model, and passing them per evaluation would put the
+    mesh straight back into the online cost: r vectors copied and ghost-exchanged, plus one double
+    per face crossing the language boundary, every time the residual is asked for.
+
+    The state lives on the *model*, though, and several reduced models can share one -- a sampled
+    model and the exact one it is measured against. Each stamps a token and checks it here, so
+    switching between them reinstalls instead of quietly evaluating with the other's weights.
+    """
     fom = _bound_model(model)
-    phi = [mode.impl for mode in basis.vectors]
 
-    matrix = fom.stabilisation_jacobian(
-        phi, _reconstruct(basis, coefficients), fom.n_faces * [1.0] if weights is None else weights
-    )
+    if fom.installed_token != token:
+        fom.set_reduced_basis([mode.impl for mode in basis.vectors])
+        fom.set_weights(model._ecsw_weights if trained else fom.n_faces * [1.0])
+        fom.installed_token = token
 
-    return np.array(matrix).reshape(len(phi), len(phi))
-
-
-def local_ones(model, basis):
-    """A unit weight per face on this rank."""
-    return np.ones(_bound_model(model).n_faces)
+    return fom
 
 
 class FullOrderMomentum:
@@ -196,12 +213,17 @@ class FullOrderMomentum:
     of elements, returns the same shapes, and is a drop-in for this one.
     """
 
+    trained = False
+
     def __init__(self, model, basis):
         self.model = model
         self.basis = basis
+        self.token = id(self)
 
     def stabilisation(self, coefficients):
-        return dispatch(self.model, local_stabilisation, self.basis, coefficients)
+        return dispatch(
+            self.model, local_stabilisation, self.basis, coefficients, self.trained, self.token
+        )
 
     def stabilisation_jacobian(self, coefficients):
         """``V^T S'(V a) V``, the linearised stabilisation over every face.
@@ -212,7 +234,10 @@ class FullOrderMomentum:
         projection of ExaDG's own: that one carries the same frozen lambda but is assembled from
         a linearisation path that differs from the nonlinear one at discretisation level.
         """
-        return dispatch(self.model, local_stabilisation_jacobian, self.basis, coefficients, None)
+        return dispatch(
+            self.model, local_stabilisation_jacobian, self.basis, coefficients,
+            self.trained, self.token,
+        )
 
 
 class ReducedSaddlePointOperator(Operator):
@@ -500,19 +525,6 @@ def local_ecsw_weights(model, basis, states, tolerance, max_entries):
     return np.array([selected, matrix.shape[1], residual / np.linalg.norm(matrix.sum(axis=1))])
 
 
-def local_ecsw_stabilisation(model, basis, coefficients):
-    """``V^T sum_f xi_f S_f(V a)`` on one rank, using the weights trained above."""
-    fom = _bound_model(model)
-    residual = fom.apply_stabilisation(_reconstruct(basis, coefficients), model._ecsw_weights)
-
-    return np.array([mode.impl.inner(residual) for mode in basis.vectors])
-
-
-def local_ecsw_stabilisation_jacobian(model, basis, coefficients):
-    """``V^T (sum_f xi_f S'_f(V a)) V`` on one rank, using the trained weights."""
-    return local_stabilisation_jacobian(model, basis, coefficients, model._ecsw_weights)
-
-
 class ECSWMomentum(FullOrderMomentum):
     """:class:`FullOrderMomentum` with the stabilisation restricted to a weighted set of faces.
 
@@ -531,16 +543,4 @@ class ECSWMomentum(FullOrderMomentum):
         self.n_candidates = int(candidates)
         self.training_residual = float(residual)
 
-    def stabilisation(self, coefficients):
-        return dispatch(self.model, local_ecsw_stabilisation, self.basis, coefficients)
-
-    def stabilisation_jacobian(self, coefficients):
-        """The linearised stabilisation on the sampled faces, with the same weights.
-
-        ExaDG's linearisation freezes lambda, so S' is a linear face operator built from the same
-        quantity the residual samples -- the weights carry over unchanged, and with them the
-        Jacobian stops depending on the mesh too.
-        """
-        return dispatch(
-            self.model, local_ecsw_stabilisation_jacobian, self.basis, coefficients
-        )
+    trained = True

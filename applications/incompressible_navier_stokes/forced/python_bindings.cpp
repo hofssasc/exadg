@@ -794,21 +794,23 @@ public:
            dealii::VectorizedArray<Number>::size();
   }
 
-  /// sum_f w_f S_f(u), the stabilisation with one weight per face.
+  /**
+   * sum_f w_f S_f(u) as a full-order vector, over the weights last set.
+   *
+   * Not on the reduced model's path -- that projects inside the loop and never forms this -- but
+   * it is how the face loop is checked against N(u) - B(u, u), which is a statement about every
+   * degree of freedom rather than about r projections of them.
+   */
   std::shared_ptr<VectorType>
-  apply_stabilisation(VectorType const & u, std::vector<double> const & weights)
+  apply_stabilisation(VectorType const & u)
   {
-    AssertThrow(weights.size() == n_faces(),
-                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
-                                   std::to_string(weights.size()) + "."));
-
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    face_weights   = &weights;
+    face_weights   = &stored_weights;
     training_basis = nullptr;
 
-    run_face_loop(*dst, owned(u));
+    run_selected_face_loop(owned(u), dst.get());
 
     face_weights = nullptr;
 
@@ -864,6 +866,110 @@ public:
   }
 
   /**
+   * Store the reduced basis, ghosted, for the evaluations below.
+   *
+   * Set once per reduced model rather than passed per call: copying r mesh-sized vectors and
+   * exchanging their ghosts on every residual evaluation is O(r * n_dofs) of bookkeeping, which
+   * is exactly the mesh dependence sampling the faces is meant to remove.
+   */
+  void
+  set_reduced_basis(std::vector<std::shared_ptr<VectorType>> const & basis)
+  {
+    reduced_basis.resize(basis.size());
+    for(unsigned int i = 0; i < basis.size(); ++i)
+    {
+      pde_operator->initialize_vector_velocity(reduced_basis[i]);
+      reduced_basis[i].copy_locally_owned_data_from(*basis[i]);
+      reduced_basis[i].update_ghost_values();
+    }
+  }
+
+  /**
+   * Store the face weights and the batches they select.
+   *
+   * Also set once: crossing the language boundary with one double per face, and rescanning them
+   * for the selected batches, is O(n_faces) per call and would put the mesh back into the online
+   * cost by the back door.
+   */
+  void
+  set_weights(std::vector<double> const & weights)
+  {
+    AssertThrow(weights.size() == n_faces(),
+                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
+                                   std::to_string(weights.size()) + "."));
+
+    unsigned int const lanes = dealii::VectorizedArray<Number>::size();
+
+    stored_weights = weights;
+    selected_batches.clear();
+
+    for(unsigned int batch = 0; batch * lanes < weights.size(); ++batch)
+      for(unsigned int lane = 0; lane < lanes; ++lane)
+        if(weights[batch * lanes + lane] != 0.0)
+        {
+          selected_batches.push_back(batch);
+          break;
+        }
+  }
+
+  unsigned int
+  n_selected_batches() const
+  {
+    return static_cast<unsigned int>(selected_batches.size());
+  }
+
+  /**
+   * Who installed the basis and weights currently held.
+   *
+   * The state above is per *model*, and several reduced models can share one -- an ECSW model and
+   * the exact one it is measured against, say. Each stamps its own token when it installs and
+   * checks the stamp before evaluating, so switching between them reinstalls rather than silently
+   * using the other's weights. Zero means nothing is installed.
+   */
+  std::size_t
+  get_installed_token() const
+  {
+    return installed_token;
+  }
+
+  void
+  set_installed_token(std::size_t const token)
+  {
+    installed_token = token;
+  }
+
+  /**
+   * V^T sum_f w_f S_f(u), the projected stabilisation, without ever forming the full vector.
+   *
+   * The residual of a reduced model is r numbers, and the route through a degree-of-freedom
+   * vector costs a mesh-sized allocation, an additive compress and r mesh-sized inner products
+   * per evaluation -- all of which dominate once the face work is sampled down to a dozen faces.
+   * Projecting inside the loop leaves only the reconstruction of V a, which is what a
+   * fully-online ECSW would evaluate on the sampled cells alone.
+   */
+  std::vector<double>
+  stabilisation_projected(VectorType const & u)
+  {
+    std::vector<double> projected(reduced_basis.size(), 0.0);
+
+    face_weights     = &stored_weights;
+    training_basis   = &reduced_basis;
+    projected_vector = &projected;
+
+    run_selected_face_loop(owned(u));
+
+    face_weights     = nullptr;
+    training_basis   = nullptr;
+    projected_vector = nullptr;
+
+    dealii::Utilities::MPI::sum(dealii::ArrayView<double const>(projected.data(), projected.size()),
+                                mpi_comm,
+                                dealii::ArrayView<double>(projected.data(), projected.size()));
+
+    return projected;
+  }
+
+  /**
    * V^T (sum_f w_f S'_f(u)) V, the projected linearised stabilisation, row-major (n, n).
    *
    * ExaDG freezes lambda when it linearises -- it is a maximum of absolute values and not
@@ -876,35 +982,23 @@ public:
    * zero weight are skipped, so the quadratic work is paid only on the sampled ones.
    */
   std::vector<double>
-  stabilisation_jacobian(std::vector<std::shared_ptr<VectorType>> const & basis,
-                         VectorType const &                              u,
-                         std::vector<double> const &                     weights)
+  stabilisation_jacobian(VectorType const & u)
   {
-    AssertThrow(weights.size() == n_faces(),
-                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
-                                   std::to_string(weights.size()) + "."));
+    std::vector<double> matrix(reduced_basis.size() * reduced_basis.size(), 0.0);
 
-    std::vector<VectorType> ghosted(basis.size());
-    for(unsigned int i = 0; i < basis.size(); ++i)
-    {
-      pde_operator->initialize_vector_velocity(ghosted[i]);
-      ghosted[i].copy_locally_owned_data_from(*basis[i]);
-      ghosted[i].update_ghost_values();
-    }
+    face_weights    = &stored_weights;
+    training_basis  = &reduced_basis;
+    jacobian_matrix = &matrix;
 
-    std::vector<double> matrix(basis.size() * basis.size(), 0.0);
-
-    face_weights     = &weights;
-    training_basis   = &ghosted;
-    jacobian_matrix  = &matrix;
-
-    VectorType dummy;
-    pde_operator->initialize_vector_velocity(dummy);
-    run_face_loop(dummy, owned(u));
+    run_selected_face_loop(owned(u));
 
     face_weights    = nullptr;
     training_basis  = nullptr;
     jacobian_matrix = nullptr;
+
+    dealii::Utilities::MPI::sum(dealii::ArrayView<double const>(matrix.data(), matrix.size()),
+                                mpi_comm,
+                                dealii::ArrayView<double>(matrix.data(), matrix.size()));
 
     return matrix;
   }
@@ -939,7 +1033,7 @@ private:
    * copies also outlive the call, which matters because ExaDG stores the transport velocity by
    * pointer. ExaDG's own evaluate_nonlinear_residual_steady() path copies for the same reason.
    */
-  VectorType const &
+  VectorType &
   owned(VectorType const & source)
   {
     scratch.emplace_back();
@@ -957,6 +1051,62 @@ private:
 
   typedef FaceIntegrator<dim, dim, Number> FaceIntegratorU;
   typedef dealii::Tensor<1, dim, dealii::VectorizedArray<Number>> FaceVector;
+
+  /**
+   * The same face work, driven over the selected batches only.
+   *
+   * MatrixFree::loop has no "these batches only" entry point, so once the weights are sparse the
+   * loop itself has to be written out: reinit, gather, flux, scatter, over a list. What the loop
+   * normally does for free has to be done here -- ghost values in before, an additive compress
+   * out after -- and getting either wrong is silent on one rank.
+   *
+   * A batch is visited when any of its lanes carries a weight, so unit weights select everything
+   * and this path is the general one rather than a special case. That is deliberate: one code
+   * path means the sampled and unsampled evaluations cannot drift apart.
+   */
+  void
+  run_selected_face_loop(VectorType & src, VectorType * dst = nullptr)
+  {
+    auto const &       matrix_free = pde_operator->get_matrix_free();
+    unsigned int const n_inner     = matrix_free.n_inner_face_batches();
+    auto const &       batches     = selected_batches;
+
+    if(dst != nullptr)
+      *dst = 0.0;
+
+    src.update_ghost_values();
+
+    FaceIntegratorU integrator_m(matrix_free, true, dof_index(), quad_index());
+    FaceIntegratorU integrator_p(matrix_free, false, dof_index(), quad_index());
+
+    for(auto const face : batches)
+    {
+      bool const interior = face < n_inner;
+
+      integrator_m.reinit(face);
+      integrator_m.gather_evaluate(src, dealii::EvaluationFlags::values);
+
+      if(interior)
+      {
+        integrator_p.reinit(face);
+        integrator_p.gather_evaluate(src, dealii::EvaluationFlags::values);
+      }
+
+      handle_face(face, integrator_m, interior ? &integrator_p : nullptr);
+
+      if(dst != nullptr)
+      {
+        integrator_m.integrate_scatter(dealii::EvaluationFlags::values, *dst);
+        if(interior)
+          integrator_p.integrate_scatter(dealii::EvaluationFlags::values, *dst);
+      }
+    }
+
+    if(dst != nullptr)
+      dst->compress(dealii::VectorOperation::add);
+
+    src.zero_out_ghost_values();
+  }
 
   void
   run_face_loop(VectorType & dst, VectorType const & src)
@@ -1097,10 +1247,11 @@ private:
       return;
     }
 
-    if(training_matrix != nullptr)
+    if(training_matrix != nullptr or projected_vector != nullptr)
     {
-      auto const &      basis = *training_basis;
-      std::size_t const row   = static_cast<std::size_t>(face) * lanes;
+      auto const &      basis  = *training_basis;
+      std::size_t const row    = static_cast<std::size_t>(face) * lanes;
+      auto const        weight = weight_of(face);
 
       FaceIntegratorU probe_m(pde_operator->get_matrix_free(), true, dof_index(), quad_index());
       FaceIntegratorU probe_p(pde_operator->get_matrix_free(), false, dof_index(), quad_index());
@@ -1127,7 +1278,10 @@ private:
         }
 
         for(unsigned int lane = 0; lane < lanes; ++lane)
-          (*training_matrix)[(row + lane) * basis.size() + i] = sum[lane];
+          if(training_matrix != nullptr)
+            (*training_matrix)[(row + lane) * basis.size() + i] = sum[lane];
+          else
+            (*projected_vector)[i] += weight[lane] * sum[lane];
       }
     }
     else
@@ -1391,6 +1545,13 @@ private:
   std::vector<VectorType> const * training_basis  = nullptr;
   std::vector<double> *           training_matrix = nullptr;
   std::vector<double> *           jacobian_matrix = nullptr;
+  std::vector<double> *           projected_vector = nullptr;
+
+  // set once per reduced model; see set_reduced_basis() and set_weights()
+  std::vector<VectorType>   reduced_basis;
+  std::vector<double>       stored_weights;
+  std::vector<unsigned int> selected_batches;
+  std::size_t               installed_token = 0;
 
   // the convective term with a central flux, as a trilinear form and as a nonlinear operator,
   // and a kernel at this application's upwind factor that owns the definition of lambda
@@ -1430,16 +1591,23 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("u"),
          "N(u) with a central flux, i.e. at upwind_factor = 0.")
     .def_property_readonly("n_faces", &ForcedFOM<dim>::n_faces)
-    .def("apply_stabilisation",
-         &ForcedFOM<dim>::apply_stabilisation,
+    .def("set_reduced_basis", &ForcedFOM<dim>::set_reduced_basis, py::arg("basis"),
+         "Store the reduced basis, ghosted, for the evaluations below.")
+    .def("set_weights", &ForcedFOM<dim>::set_weights, py::arg("weights"),
+         "Store one weight per face, and the batches they select.")
+    .def_property_readonly("n_selected_batches", &ForcedFOM<dim>::n_selected_batches)
+    .def_property("installed_token",
+                  &ForcedFOM<dim>::get_installed_token,
+                  &ForcedFOM<dim>::set_installed_token)
+    .def("apply_stabilisation", &ForcedFOM<dim>::apply_stabilisation, py::arg("u"),
+         "sum_f w_f S_f(u) as a full-order vector, over the weights last set.")
+    .def("stabilisation_projected",
+         &ForcedFOM<dim>::stabilisation_projected,
          py::arg("u"),
-         py::arg("weights"),
-         "sum_f w_f S_f(u), the Lax-Friedrichs stabilisation weighted per face.")
+         "V^T sum_f w_f S_f(u), without forming the full-order vector.")
     .def("stabilisation_jacobian",
          &ForcedFOM<dim>::stabilisation_jacobian,
-         py::arg("basis"),
          py::arg("u"),
-         py::arg("weights"),
          "V^T (sum_f w_f S'_f(u)) V, row-major (n_basis, n_basis).")
     .def("stabilisation_contributions",
          &ForcedFOM<dim>::stabilisation_contributions,

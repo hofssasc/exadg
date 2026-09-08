@@ -45,14 +45,20 @@ same quantity, and the weights carry over unchanged. With the tensor supplying t
 part's derivative exactly, the reduced Jacobian is then the exact derivative of the reduced
 residual, and neither depends on the mesh any more.
 
-**What is still missing before this is a wall-clock speed-up.** The arithmetic is sampled but the
-*loop* is not: ``MatrixFree::loop`` still visits every face and multiplies the unselected ones by
-zero. Evaluating only the selected face batches is a separate piece of work, and it is what turns
-the counts below into time.
+Both are evaluated over the selected face batches only, by a hand-written loop rather than
+``MatrixFree::loop``, and projected inside that loop so no full-order vector is ever formed. The
+saving grows with the mesh, because the number of faces kept does not::
 
-**And the weight fit does not scale.** It is currently solved redundantly on every rank over a
-training matrix gathered whole; see the warning on ``local_ecsw_weights``. That is the first thing
-to fix before running this at size.
+    refinement   dofs   faces   kept    full     sampled   speed-up
+             3   1152     144     12   0.198 ms   0.087 ms     2.3x
+             4   4608     544     14   0.656 ms   0.113 ms     5.8x
+             5  18432    2112     13   2.514 ms   0.149 ms    16.9x
+             6  73728    8320     12   9.842 ms   0.341 ms    28.9x
+
+**Two things still scale with the mesh.** Reconstructing ``V a`` is r full-order vector updates
+per evaluation -- a fully online ECSW would reconstruct only on the sampled cells -- and the
+weight fit is solved redundantly on every rank over a training matrix gathered whole. See the
+warning on ``local_ecsw_weights``; that one is the first to fix before running at size.
 
 Runs unchanged on any number of ranks::
 
@@ -61,6 +67,8 @@ Runs unchanged on any number of ranks::
 
 Run from the repository root.
 """
+
+import time
 
 import numpy as np
 from pymor.algorithms.pod import pod
@@ -111,7 +119,7 @@ def main():
     print(f"error, exact S     : {exact:.4e}")
 
     print("\nfitting the stabilisation on a subset of faces")
-    print(f"  {'tolerance':>9}  {'faces':>9}  {'fit':>9}  {'ROM error':>11}")
+    print(f"  {'tolerance':>9}  {'faces':>9}  {'fit':>9}  {'ROM error':>11}  {'faster':>8}")
 
     for tolerance in TOLERANCES:
         reductor = ECSWStokesReductor(
@@ -123,7 +131,8 @@ def main():
         error = worst_error(model, reductor, rom, test)
         print(
             f"  {tolerance:>9.0e}  {momentum.n_selected:>4d}/{momentum.n_candidates:<4d}  "
-            f"{momentum.training_residual:>9.2e}  {error:>11.4e}"
+            f"{momentum.training_residual:>9.2e}  {error:>11.4e}  "
+            f"{speed_up(reference_rom.operator.momentum, momentum):>7.1f}x"
         )
 
         assert error < 2.0 * exact, "sampling the stabilisation changed the answer"
@@ -139,6 +148,26 @@ def main():
         "do: the face loop visits every face rather than only the selected ones, and the weight\n"
         "fit is solved redundantly on every rank over a matrix gathered whole."
     )
+
+
+def speed_up(exact_momentum, sampled_momentum, repeats=20):
+    """How much cheaper one reduced stabilisation is than the same one over every face.
+
+    Modest at this size and growing with the mesh -- see the table in the module docstring. The
+    remaining floor is the reconstruction of V a, which is still a full-order operation.
+    """
+    coefficients = np.zeros(exact_momentum.basis.dim if hasattr(exact_momentum.basis, "dim")
+                            else len(exact_momentum.basis))
+    coefficients[0] = 1.0
+
+    def timed(momentum):
+        momentum.stabilisation(coefficients)
+        start = time.perf_counter()
+        for _ in range(repeats):
+            momentum.stabilisation(coefficients)
+        return time.perf_counter() - start
+
+    return timed(exact_momentum) / timed(sampled_momentum)
 
 
 def worst_error(model, reductor, rom, test):
