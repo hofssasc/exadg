@@ -198,7 +198,8 @@ private:
                                           mapping,
                                           constraints,
                                           blocks_per_dim,
-                                          output_dofs);
+                                          output_dofs,
+                                          MPI_COMM_WORLD);
   }
 
   /** The source vector's entries on the stencil, which is all the restriction ever reads. */

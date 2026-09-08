@@ -234,12 +234,79 @@ def _rhs(fom, space, shape, names):
 
 def _build_model(module_name, class_name, args, kwargs, model_kwargs):
     """Construct the per-rank model. Module level so that it survives pickling to the ranks."""
+    return _build_models(module_name, class_name, args, kwargs, model_kwargs, None)[0]
+
+
+def _build_models(module_name, class_name, args, kwargs, model_kwargs, forms):
+    """One full-order model, presented in each of the requested forms.
+
+    The forms share a discretisation, which is the point: comparing an interpolated operator
+    against an exactly projected one is only a statement about the interpolation if both describe
+    the same mesh, and pyMOR compares vector spaces by identity of the underlying model.
+    """
     import importlib
 
     module = importlib.import_module(f"exadg.{module_name}")
     fom = getattr(module, class_name)(*args, **kwargs)
 
-    return stationary_model(fom, **model_kwargs)[0]
+    if forms is None:
+        return (stationary_model(fom, **model_kwargs)[0],)
+
+    return tuple(stationary_model(fom, form=form, **model_kwargs)[0] for form in forms)
+
+
+def _take(models, index):
+    """Select one model of the tuple, so each can be managed as its own MPI object."""
+    return models[index]
+
+
+def mpi_stationary_models(module_name, class_name, *args, forms=("affine",), **kwargs):
+    """Several presentations of one full-order model, wrapped for MPI when running in parallel.
+
+    :func:`mpi_stationary_model` builds one; this builds several over a *single* discretisation,
+    which is what lets their vector spaces compare equal. Empirical interpolation needs exactly
+    that: the interpolated operator and the affine reference it is measured against have to be
+    two views of one problem.
+
+    Args:
+        module_name: Application module inside the ``exadg`` package.
+        class_name: Model class in it.
+        forms: One entry per model wanted; see :func:`stationary_model`.
+        *args, **kwargs: As for :func:`mpi_stationary_model`.
+
+    Returns:
+        Tuple ``(models, space)``, with one model per entry of ``forms``.
+    """
+    from pymor.tools import mpi
+
+    model_kwargs = {
+        key: kwargs.pop(key)
+        for key in ("parameters", "coefficients", "directory")
+        if key in kwargs
+    }
+
+    factory = functools.partial(
+        _build_models, module_name, class_name, args, kwargs, model_kwargs, tuple(forms)
+    )
+
+    if not mpi.parallel:
+        models = factory()
+
+        return models, models[0].solution_space
+
+    from pymor.models.mpi import mpi_wrap_model
+
+    built = mpi.call(mpi.function_call_manage, factory)
+    models = tuple(
+        mpi_wrap_model(
+            mpi.call(mpi.function_call_manage, _take, built, index),
+            use_with=True,
+            pickle_local_spaces=False,
+        )
+        for index in range(len(forms))
+    )
+
+    return models, models[0].solution_space
 
 
 def mpi_stationary_model(module_name, class_name, *args, **kwargs):

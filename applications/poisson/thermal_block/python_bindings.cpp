@@ -855,24 +855,20 @@ private:
    * without a restriction makes empirical interpolation fall back to evaluating the full
    * operator, which is slower and correct, instead of producing a wrong one.
    *
-   * **More than one rank.** The stencil is collected from locally owned cells only, so each rank
-   * would build a different piece of it and none of them the whole operator. Making it parallel
-   * means agreeing the cell set across ranks and gathering the evaluation, which is separate
-   * work rather than a missing line.
-   *
    * **A coefficient of degree above zero.** RestrictedLaplace precomputes each cell's
    * contribution per block, which presumes the coefficient is constant on a cell. With a nodal
    * field a cell carries several basis functions and the precomputation would have to be per
    * local degree of freedom instead.
+   *
+   * Collective: every rank assembles the stencil cells it owns and then receives the rest, so
+   * each ends up holding the whole restricted operator. pyMOR calls this on all ranks but keeps
+   * and evaluates only rank 0's, so anything less would deadlock at the first apply.
    */
   std::shared_ptr<PyMOR::RestrictedOperator>
   make_restricted(std::vector<dealii::types::global_dof_index> const & output_dofs,
                   std::vector<double> const &                          coefficients,
                   bool const                                           parametric)
   {
-    if(dealii::Utilities::MPI::n_mpi_processes(mpi_comm) > 1)
-      return nullptr;
-
     if(coefficient_degree() > 0)
       return nullptr;
 
@@ -881,7 +877,8 @@ private:
       *pde_operator->get_mapping(),
       pde_operator->get_matrix_free()->get_affine_constraints(pde_operator->get_dof_index()),
       application->get_blocks_per_dim(),
-      output_dofs);
+      output_dofs,
+      mpi_comm);
 
     return std::make_shared<Restricted>(impl, coefficients, parametric);
   }

@@ -53,6 +53,7 @@ from pymor.core.base import ImmutableObject
 from pymor.core.exceptions import InversionError
 from pymor.operators.interface import Operator
 from pymor.operators.list import ListVectorArrayOperatorBase
+from pymor.parameters.functionals import ConstantParameterFunctional
 from pymor.solvers.list import ListVectorArrayBasedSolver
 from pymor.vectorarrays.list import CopyOnWriteVector, ListVectorSpace
 from pymor.vectorarrays.numpy import NumpyVectorSpace
@@ -368,9 +369,24 @@ class ExaDGParametricOperator(ExaDGOperator):
         self.coefficients = coefficients
 
     def _prepare(self, mu):
-        assert mu is not None
-
         self.impl.set_coefficients([float(c.evaluate(mu)) for c in self.coefficients])
+
+    def assemble(self, mu=None):
+        """This operator with its parameter fixed, rather than wrapped.
+
+        pyMOR's default assembly of a parametric operator is a ``FixedParameterOperator`` around
+        it. That is fine until something wants to *prepare* the operator, because installing the
+        coefficients is a method on this class and the wrapper does not forward it --
+        :class:`~pymor.solvers.mpi.MPISolver` assembles before dispatching, so under MPI every
+        solve landed on the wrapper. Returning a copy whose functionals are already constant keeps
+        the operator itself and decides the values it will install.
+        """
+        if not self.parametric:
+            return self
+
+        return self.with_(
+            coefficients=[ConstantParameterFunctional(c.evaluate(mu)) for c in self.coefficients]
+        )
 
     def restricted(self, dofs):
         handle = self.impl.restricted([int(d) for d in dofs])

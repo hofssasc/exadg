@@ -100,9 +100,11 @@ setting in the input file selects them, the convective term is the only differen
   at a snapshot divides roundoff by roundoff (reads ~1e-5, means nothing). Probe at `Bᵀp`.
 - **pyMOR names a `BasicObject`'s logger after its class's *module*.** `ExaDGNonlinearMomentum`
   logs under `exadg`, never under `pymor`.
-- **`restricted()` returns `nullptr` above one rank** (the stencil is gathered from locally owned
-  cells only). The binding turns that into `NotImplementedError`, which pyMOR treats as "fall back
-  to the full operator" — correct, but no speed-up.
+- **`restricted()` replicates the stencil, it does not distribute it.** Each rank assembles the
+  cells it owns and then receives the rest, so every rank holds the whole restricted operator and
+  `apply` needs no communication. That is forced, not chosen: `MPIOperator.restricted` runs on all
+  ranks but keeps and evaluates **only rank 0's object**, so an operator that still needed its
+  peers would deadlock on the first evaluation. Affordable because the stencil is O(1) cells.
 - **`mpi.call` returns `None` outright when pyMOR was built without mpi4py**
   (`pymor/tools/mpi.py:73` sets `finished = True`). Never route a serial path through it.
 - **pyMOR bug**: `mpi_wrap_model` asserts `isinstance(base_type, Model)` (an instance) then does
@@ -118,7 +120,7 @@ because reductions sum in a different order.
 | check | what it pins |
 |---|---|
 | `thermal_block_rb.py` (1, 4 ranks) | affine path, certified estimator, `dofs`/`amax` |
-| `thermal_block_ei.py` (serial) | the restriction contract through pyMOR's own call path |
+| `thermal_block_ei.py` (1, 4 ranks) | the restriction contract through pyMOR's own call path |
 | `stokes_rb.py` (1, 4 ranks) | `⟨Bu,p⟩` vs `⟨u,Bᵀp⟩`; block system vs ExaDG's solve; exactness at P modes |
 | `navier_stokes_rb.py` (1, 4 ranks) | the nonlinear path; error falls with the basis |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |

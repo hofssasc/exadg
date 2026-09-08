@@ -34,11 +34,16 @@ operator than the one being reduced. The C++ counterpart of this check is
 **Whether interpolation is worth it.** It is not, for this problem, and the point of the sweep
 is to show that against a reference rather than assert it. The reduced model is compared with
 the exact affine projection on the same basis, so the only difference between the two numbers
-is the interpolation. Serial only: ``restricted`` raises under MPI.
+is the interpolation.
 
-Run from the repository root::
+Runs unchanged on any number of ranks. The stencil is replicated rather than distributed --
+each rank assembles the cells it owns and then receives the rest -- because pyMOR builds the
+restricted operator on every rank but keeps and evaluates only rank 0's::
 
     python python/examples/thermal_block_ei.py
+    mpirun -n 4 python -m pymor.tools.mpi python/examples/thermal_block_ei.py
+
+Run from the repository root.
 """
 
 import numpy as np
@@ -50,8 +55,9 @@ from pymor.parameters.base import Mu
 from pymor.reductors.basic import StationaryRBReductor
 from pymor.vectorarrays.numpy import NumpyVectorSpace
 
-from exadg import thermal_block
-from exadg.mor.models.stationary import stationary_model
+from pymor.tools import mpi
+
+from exadg.mor.models.stationary import mpi_stationary_models
 
 INPUT_FILE = "applications/poisson/thermal_block/input.json"
 N_TRAIN, N_TEST, N_MODES = 60, 10, 10
@@ -69,13 +75,19 @@ def main():
         }
     )
 
-    fom = thermal_block.ThermalBlockFOM2D(INPUT_FILE, degree=2, refinements=4)
-
     # The same equation twice: as a sum of affine components, and as one operator whose
     # parameter dependence pyMOR cannot see. The second is what interpolation is for.
-    field, space = stationary_model(fom, form="field")
-    affine, _ = stationary_model(fom, form="affine")
-    n_parameters = fom.n_parameters
+    (field, affine), space = mpi_stationary_models(
+        "thermal_block",
+        "ThermalBlockFOM2D",
+        INPUT_FILE,
+        degree=2,
+        refinements=4,
+        forms=("field", "affine"),
+    )
+    n_parameters = field.operator.parameters["mu"]
+
+    print(f"ranks: {mpi.size}")
 
     rng = np.random.default_rng(0)
     train = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (N_TRAIN, n_parameters))]
@@ -161,7 +173,9 @@ def sweep(field, affine, space, basis, train, test, n_parameters):
         try:
             rom_error = state_error(affine, reductor, test)
         except Exception:
-            # a rank-deficient collateral basis makes the reduced operator singular
+            # A rank-deficient collateral basis makes the reduced operator singular. Whether the
+            # dense solve raises or returns something enormous depends on rounding, so the first
+            # row reads nan on one rank and ~1e17 on four; both say the same thing.
             rom_error = float("nan")
 
         n_blocks = len(field.operator.restricted(dofs)[0].handle.active_components)

@@ -19,10 +19,12 @@
  *  ______________________________________________________________________
  */
 
+
 #ifndef EXADG_PYMOR_RESTRICTED_LAPLACE_H_
 #define EXADG_PYMOR_RESTRICTED_LAPLACE_H_
 
 // deal.II
+#include <deal.II/base/mpi.h>
 #include <deal.II/dofs/dof_handler.h>
 #include <deal.II/fe/fe_values.h>
 #include <deal.II/fe/mapping.h>
@@ -61,6 +63,14 @@ namespace ExaDG
  * rather than driving the matrix-free loop. Matrix-free processes cells in vectorised batches of
  * four to eight, so a handful of scattered cells would waste most of the lanes. This form also
  * happens to be the shape ECSW wants, since it accumulates per cell.
+ *
+ * **In parallel the stencil is replicated, not distributed.** Each rank assembles the cells it
+ * owns and then every rank receives all of them, so afterwards each holds the complete operator
+ * and apply() needs no communication at all. That is not a shortcut: pyMOR builds the restricted
+ * operator collectively but keeps only rank 0's object and calls it there alone, so an operator
+ * that still needed its peers would deadlock on the first evaluation. It is also affordable
+ * precisely because hyper-reduction is the point -- the stencil is a handful of cells whatever
+ * the mesh, which is the same reason a hyper-reduced online phase need not be distributed.
  */
 template<int dim, typename Number = double>
 class RestrictedLaplace
@@ -69,17 +79,19 @@ public:
   /**
    * @param dof_handler The solution space.
    * @param mapping Used for the cell quadrature.
-   * @param constraints The same object the operator applies, so that constrained rows and
+   * @param affine_constraints The same object the operator applies, so that constrained rows and
    *        columns are reproduced rather than approximated.
    * @param blocks_per_dim Blocks per coordinate direction of the coefficient.
    * @param output_dofs The rows to reproduce; must be distinct.
+   * @param mpi_comm The communicator the stencil is gathered over.
    */
   RestrictedLaplace(dealii::DoFHandler<dim> const &                      dof_handler,
                     dealii::Mapping<dim> const &                         mapping,
                     dealii::AffineConstraints<Number> const &            affine_constraints,
                     unsigned int const                                   blocks_per_dim,
-                    std::vector<dealii::types::global_dof_index> const & output_dofs)
-    : blocks_per_dim(blocks_per_dim), output_dofs(output_dofs), constraints(&affine_constraints)
+                    std::vector<dealii::types::global_dof_index> const & output_dofs,
+                    MPI_Comm const &                                     mpi_comm)
+    : blocks_per_dim(blocks_per_dim), output_dofs(output_dofs)
   {
     auto const & fe = dof_handler.get_fe();
 
@@ -87,13 +99,27 @@ public:
     AssertThrow(requested.size() == output_dofs.size(),
                 dealii::ExcMessage("The requested degrees of freedom must be distinct."));
 
-    unsigned int const dofs_per_cell = fe.n_dofs_per_cell();
+    dofs_per_cell = fe.n_dofs_per_cell();
     std::vector<dealii::types::global_dof_index> local(dofs_per_cell);
 
-    // Collect the cells that touch a requested degree of freedom. A row of the operator only
-    // receives contributions from cells containing that degree of freedom, so this set is
-    // exactly what is needed and nothing more.
-    std::set<dealii::types::global_dof_index> source_set;
+    dealii::QGauss<dim> const quadrature(fe.degree + 1);
+
+    dealii::FEValues<dim> fe_values(mapping,
+                                    fe,
+                                    quadrature,
+                                    dealii::update_gradients | dealii::update_JxW_values |
+                                      dealii::update_quadrature_points);
+
+    unsigned int const n_blocks = dealii::Utilities::pow(blocks_per_dim, dim);
+
+    // Assemble the cells this rank owns. A row of the operator receives contributions only from
+    // cells containing that degree of freedom, so this set is exactly what is needed. The whole
+    // geometric part -- quadrature, shape gradients, Jacobians -- is evaluated once here and
+    // never again: the operator is affine in the block diffusivities cell by cell, so applying
+    // it afterwards is dense arithmetic on matrices of size (dofs per cell) squared. That is also
+    // precisely the structure ECSW assumes, a per-element contribution scaled by a weight.
+    std::vector<Cell> mine;
+
     for(auto const & cell : dof_handler.active_cell_iterators())
     {
       if(not cell->is_locally_owned())
@@ -109,12 +135,47 @@ public:
           break;
         }
 
-      if(touches)
+      if(not touches)
+        continue;
+
+      Cell entry;
+      entry.dofs = local;
+      entry.constrained.resize(dofs_per_cell);
+      for(unsigned int i = 0; i < dofs_per_cell; ++i)
+        entry.constrained[i] = affine_constraints.is_constrained(local[i]) ? 1 : 0;
+
+      fe_values.reinit(cell);
+
+      std::map<unsigned int, std::vector<double>> per_block;
+      for(unsigned int q = 0; q < quadrature.size(); ++q)
       {
-        cells.push_back(cell);
-        source_set.insert(local.begin(), local.end());
+        unsigned int const block =
+          BlockCoefficient<dim>::block_index_of(blocks_per_dim, fe_values.quadrature_point(q));
+
+        AssertThrow(block < n_blocks, dealii::ExcMessage("Block index out of range."));
+
+        auto & matrix =
+          per_block.try_emplace(block, dofs_per_cell * dofs_per_cell, 0.0).first->second;
+
+        for(unsigned int i = 0; i < dofs_per_cell; ++i)
+          for(unsigned int j = 0; j < dofs_per_cell; ++j)
+            matrix[i * dofs_per_cell + j] +=
+              (fe_values.shape_grad(i, q) * fe_values.shape_grad(j, q)) * fe_values.JxW(q);
       }
+
+      for(auto const & item : per_block)
+        entry.contributions.push_back({item.first, item.second});
+
+      mine.push_back(std::move(entry));
     }
+
+    // Replicate: after this every rank holds the whole stencil and can evaluate it alone.
+    for(auto const & from_rank : dealii::Utilities::MPI::all_gather(mpi_comm, mine))
+      cells.insert(cells.end(), from_rank.begin(), from_rank.end());
+
+    std::set<dealii::types::global_dof_index> source_set;
+    for(auto const & cell : cells)
+      source_set.insert(cell.dofs.begin(), cell.dofs.end());
 
     source_dofs.assign(source_set.begin(), source_set.end());
 
@@ -126,78 +187,29 @@ public:
     for(unsigned int i = 0; i < output_dofs.size(); ++i)
       output_position[output_dofs[i]] = i;
 
-    // Precompute, per cell, where each local degree of freedom reads from and writes to. The
-    // gather and scatter maps do not depend on the parameter, so they are built once.
-    for(auto const & cell : cells)
-    {
-      cell->get_dof_indices(local);
+    // Whether a row is constrained is read back from the gathered cells rather than queried on
+    // the constraints object: every output degree of freedom belongs to a stencil cell on some
+    // rank, but not necessarily on this one, and AffineConstraints only knows its own lines.
+    output_constrained.assign(output_dofs.size(), false);
 
-      CellMap map;
-      map.gather.resize(dofs_per_cell);
-      map.scatter.resize(dofs_per_cell);
-      map.constrained.resize(dofs_per_cell);
+    for(auto & cell : cells)
+    {
+      cell.gather.resize(dofs_per_cell);
+      cell.scatter.resize(dofs_per_cell);
 
       for(unsigned int i = 0; i < dofs_per_cell; ++i)
       {
-        map.gather[i]      = source_position.at(local[i]);
-        map.constrained[i] = constraints->is_constrained(local[i]);
+        cell.gather[i] = source_position.at(cell.dofs[i]);
 
-        auto const found = output_position.find(local[i]);
-        map.scatter[i]   = (found == output_position.end())
-                             ? dealii::numbers::invalid_unsigned_int
-                             : found->second;
+        auto const found = output_position.find(cell.dofs[i]);
+        cell.scatter[i]  = (found == output_position.end()) ?
+                             dealii::numbers::invalid_unsigned_int :
+                             found->second;
+
+        if(cell.scatter[i] != dealii::numbers::invalid_unsigned_int and cell.constrained[i])
+          output_constrained[cell.scatter[i]] = true;
       }
-
-      cell_maps.push_back(map);
     }
-
-    // Precompute each cell's contribution, split by block.
-    //
-    // The operator is affine in the block diffusivities, and that affinity holds cell by cell:
-    // the contribution of a cell to block p is a fixed matrix, independent of the parameter. So
-    // the whole geometric part -- the quadrature, the shape gradients, the Jacobians -- is
-    // evaluated once here and never again. Applying the operator afterwards is dense arithmetic
-    // on matrices of size (dofs per cell) squared.
-    //
-    // This is also precisely the structure ECSW assumes: a per-element contribution scaled by a
-    // weight. Building it here means the DEIM and ECSW routes share an implementation.
-    dealii::QGauss<dim> const quadrature(fe.degree + 1);
-
-    dealii::FEValues<dim> fe_values(mapping,
-                                    fe,
-                                    quadrature,
-                                    dealii::update_gradients | dealii::update_JxW_values |
-                                      dealii::update_quadrature_points);
-
-    unsigned int const n_blocks = dealii::Utilities::pow(blocks_per_dim, dim);
-
-    for(unsigned int c = 0; c < cells.size(); ++c)
-    {
-      fe_values.reinit(cells[c]);
-
-      std::map<unsigned int, std::vector<double>> per_block;
-
-      for(unsigned int q = 0; q < quadrature.size(); ++q)
-      {
-        unsigned int const block =
-          BlockCoefficient<dim>::block_index_of(blocks_per_dim, fe_values.quadrature_point(q));
-
-        AssertThrow(block < n_blocks, dealii::ExcMessage("Block index out of range."));
-
-        auto & matrix = per_block.try_emplace(block, dofs_per_cell * dofs_per_cell, 0.0)
-                          .first->second;
-
-        for(unsigned int i = 0; i < dofs_per_cell; ++i)
-          for(unsigned int j = 0; j < dofs_per_cell; ++j)
-            matrix[i * dofs_per_cell + j] +=
-              (fe_values.shape_grad(i, q) * fe_values.shape_grad(j, q)) * fe_values.JxW(q);
-      }
-
-      for(auto const & entry : per_block)
-        cell_maps[c].contributions.push_back({entry.first, entry.second});
-    }
-
-    this->dofs_per_cell = dofs_per_cell;
   }
 
   std::vector<dealii::types::global_dof_index> const &
@@ -225,8 +237,8 @@ public:
   get_blocks() const
   {
     std::set<unsigned int> blocks;
-    for(auto const & map : cell_maps)
-      for(auto const & contribution : map.contributions)
+    for(auto const & cell : cells)
+      for(auto const & contribution : cell.contributions)
         blocks.insert(contribution.block);
 
     return std::vector<unsigned int>(blocks.begin(), blocks.end());
@@ -236,7 +248,8 @@ public:
    * Applies the restricted operator at the given block coefficients.
    *
    * Coefficients, not parameters: a single affine component is the operator with the indicator
-   * of one block, and how a parameter maps to a coefficient is decided in Python.
+   * of one block, and how a parameter maps to a coefficient is decided in Python. Purely local --
+   * the stencil was replicated at construction.
    */
   std::vector<double>
   apply_coefficients(std::vector<double> const & diffusivity,
@@ -250,36 +263,34 @@ public:
     std::vector<double> result(output_dofs.size(), 0.0);
     std::vector<double> local_values(dofs_per_cell);
 
-    for(unsigned int c = 0; c < cell_maps.size(); ++c)
+    for(auto const & cell : cells)
     {
-      auto const & map = cell_maps[c];
-
       // The operator reads zero from constrained columns and acts as the identity on constrained
       // rows. Replicating both is what makes the restriction agree with the full apply exactly
       // rather than merely closely.
       for(unsigned int i = 0; i < dofs_per_cell; ++i)
-        local_values[i] = map.constrained[i] ? 0.0 : source_values[map.gather[i]];
+        local_values[i] = cell.constrained[i] ? 0.0 : source_values[cell.gather[i]];
 
-      for(auto const & contribution : map.contributions)
+      for(auto const & contribution : cell.contributions)
       {
         double const coefficient = diffusivity[contribution.block];
 
         for(unsigned int i = 0; i < dofs_per_cell; ++i)
         {
-          if(map.scatter[i] == dealii::numbers::invalid_unsigned_int or map.constrained[i])
+          if(cell.scatter[i] == dealii::numbers::invalid_unsigned_int or cell.constrained[i])
             continue;
 
           double value = 0.0;
           for(unsigned int j = 0; j < dofs_per_cell; ++j)
             value += contribution.matrix[i * dofs_per_cell + j] * local_values[j];
 
-          result[map.scatter[i]] += coefficient * value;
+          result[cell.scatter[i]] += coefficient * value;
         }
       }
     }
 
     for(unsigned int i = 0; i < output_dofs.size(); ++i)
-      if(constraints->is_constrained(output_dofs[i]))
+      if(output_constrained[i])
       {
         auto const position =
           std::lower_bound(source_dofs.begin(), source_dofs.end(), output_dofs[i]);
@@ -294,25 +305,47 @@ private:
   {
     unsigned int        block;
     std::vector<double> matrix;
+
+    template<class Archive>
+    void
+    serialize(Archive & archive, unsigned int const /*version*/)
+    {
+      archive & block & matrix;
+    }
   };
 
-  struct CellMap
+  /**
+   * One stencil cell, in a form that survives being sent to another rank.
+   *
+   * Degrees of freedom are global indices, which is what makes that possible: the gather and
+   * scatter positions below are rebuilt locally once the union is known. `constrained` is char
+   * rather than bool because std::vector<bool> does not serialise as a container of values.
+   */
+  struct Cell
   {
+    std::vector<dealii::types::global_dof_index> dofs;
+    std::vector<char>                            constrained;
+    std::vector<Contribution>                    contributions;
+
     std::vector<unsigned int> gather;
     std::vector<unsigned int> scatter;
-    std::vector<bool>         constrained;
-    std::vector<Contribution> contributions;
+
+    template<class Archive>
+    void
+    serialize(Archive & archive, unsigned int const /*version*/)
+    {
+      archive & dofs & constrained & contributions;
+    }
   };
 
   unsigned int                                 blocks_per_dim;
   std::vector<dealii::types::global_dof_index> output_dofs;
   std::vector<dealii::types::global_dof_index> source_dofs;
 
-  std::vector<typename dealii::DoFHandler<dim>::active_cell_iterator> cells;
-  std::vector<CellMap>                                               cell_maps;
+  std::vector<Cell> cells;
+  std::vector<bool> output_constrained;
 
-  dealii::AffineConstraints<Number> const * constraints;
-  unsigned int                              dofs_per_cell;
+  unsigned int dofs_per_cell;
 };
 
 } // namespace ExaDG
