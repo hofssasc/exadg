@@ -45,20 +45,25 @@ same quantity, and the weights carry over unchanged. With the tensor supplying t
 part's derivative exactly, the reduced Jacobian is then the exact derivative of the reduced
 residual, and neither depends on the mesh any more.
 
-Both are evaluated over the selected face batches only, by a hand-written loop rather than
-``MatrixFree::loop``, and projected inside that loop so no full-order vector is ever formed. The
-saving grows with the mesh, because the number of faces kept does not::
+Both are read off a ``SampledOperator`` the model hands out, which speaks *reduced coefficients*
+rather than velocity vectors. That is what makes the online cost independent of the mesh: given a
+vector it would have to reconstruct ``V a`` everywhere before looking at a dozen faces; given
+coefficients it combines the basis traces it stored on those faces when the weights were installed.
+Nothing mesh-sized is touched and no deal.II integrator is called::
 
     refinement   dofs   faces   kept    full     sampled   speed-up
-             3   1152     144     12   0.198 ms   0.087 ms     2.3x
-             4   4608     544     14   0.656 ms   0.113 ms     5.8x
-             5  18432    2112     13   2.514 ms   0.149 ms    16.9x
-             6  73728    8320     12   9.842 ms   0.341 ms    28.9x
+             3   1152     144     12   0.020 ms   0.007 ms     3.1x
+             4   4608     544     14   0.078 ms   0.008 ms     9.3x
+             5  18432    2112     13   0.292 ms   0.010 ms    29.5x
+             6  73728    8320     12   1.149 ms   0.007 ms   159.5x
 
-**Two things still scale with the mesh.** Reconstructing ``V a`` is r full-order vector updates
-per evaluation -- a fully online ECSW would reconstruct only on the sampled cells -- and the
-weight fit is solved redundantly on every rank over a training matrix gathered whole. See the
-warning on ``local_ecsw_weights``; that one is the first to fix before running at size.
+The sampled column is flat across a sixty-fourfold growth in degrees of freedom. That, rather than
+the speed-up, is the claim.
+
+**One thing still scales with the mesh**: the weight fit is solved redundantly on every rank over a
+training matrix gathered whole. See the warning on ``local_ecsw_weights``, and the architecture in
+``ExaDG ROM Next Steps.md``. It is offline, so it bounds the size of problem that can be trained
+rather than the cost of a reduced solve.
 
 Runs unchanged on any number of ranks::
 
@@ -133,7 +138,7 @@ def main():
 
         error = worst_error(model, reductor, rom, test)
         print(
-            f"  {tolerance:>9.0e}  {momentum.n_selected:>4d}/{momentum.n_candidates:<4d}  "
+            f"  {tolerance:>9.0e}  {momentum.n_faces:>4d}/{momentum.n_candidates:<4d}  "
             f"{momentum.n_batches:>8d}  {momentum.training_residual:>9.2e}  {error:>11.4e}  "
             f"{speed_up(reference_rom.operator.momentum, momentum):>7.1f}x"
         )
@@ -147,9 +152,8 @@ def main():
         "the rank count because matrix-free pads its face batches per rank -- the padding slots\n"
         "contribute nothing and are never selected, so the fit is unchanged.\n"
         "\n"
-        "Residual and Jacobian are both sampled, so neither depends on the mesh. Two things still\n"
-        "do: the face loop visits every face rather than only the selected ones, and the weight\n"
-        "fit is solved redundantly on every rank over a matrix gathered whole."
+        "Residual and Jacobian are both sampled, and neither touches the mesh: see the table in\n"
+        "the module docstring. What still does is the weight fit, which is offline."
     )
 
 
@@ -159,8 +163,7 @@ def speed_up(exact_momentum, sampled_momentum, repeats=20):
     Modest at this size and growing with the mesh -- see the table in the module docstring. The
     remaining floor is the reconstruction of V a, which is still a full-order operation.
     """
-    coefficients = np.zeros(exact_momentum.basis.dim if hasattr(exact_momentum.basis, "dim")
-                            else len(exact_momentum.basis))
+    coefficients = np.zeros(len(exact_momentum.basis))
     coefficients[0] = 1.0
 
     def timed(momentum):

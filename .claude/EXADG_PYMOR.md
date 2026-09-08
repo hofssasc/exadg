@@ -93,6 +93,10 @@ Jacobian, because a frozen λ makes `S'` a *linear* face operator.
   inside `apply`, not once at construction.
 - **`A'(u)` is not the exact derivative**: λ is frozen. Measured 4.5e-08 at `upwind_factor = 0`
   against 5.1e-03 at 1.0. Not a quadrature effect — both indices are 2.
+- **On a boundary face the test and trial jumps differ.** The residual is integrated against the
+  interior test function alone; the increment still has an exterior value, so the trial jump is
+  the mirrored one. Conflating them makes the boundary term twice too large — which then hides as
+  a plausible-looking $O(h^5)$ residue.
 - **ExaDG's linearly-implicit operator is not the polarisation of its nonlinear one.** Both are
   trilinear; they differ at discretisation level (~$h^5$). Build tensors from the nonlinear one.
 - **A snapshot velocity is discretely divergence-free**, so an adjoint check probed at a snapshot
@@ -126,17 +130,15 @@ returns ~1e17 on four.
 
 ## Known defects, not yet fixed
 
-1. **The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather
-   the whole training matrix — $(n_\text{train} r) \times n_\text{faces}$, on *every* rank — and
-   solve the same NNLS. Scales in neither memory nor work, and its width grows with the mesh.
-2. **Reconstructing $Va$ is still full order** — $r$ mesh-sized updates per reduced residual, now
-   the floor on the sampled path.
-3. **The token dance.** Basis and weights live on the shared bound model, so each reduced model
-   stamps a token and reinstalls when it does not match.
+**The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather the
+whole training matrix — $(n_\text{train}\, r) \times n_\text{faces}$, on *every* rank — and solve
+the same NNLS. Scales in neither memory nor work, and its width grows with the mesh. Offline, so it
+bounds the size of problem that can be trained rather than the cost of a reduced solve.
 
-All three are analysed, with proposed architectures, in
-`~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that before
-touching any of them.**
+The architecture for the fix is in
+`~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**
+Two defects listed there are now fixed: the evaluator owns its basis and weights (no tokens), and
+it speaks reduced coefficients (no full-order reconstruction).
 
 ## Vault
 

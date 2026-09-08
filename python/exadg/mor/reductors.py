@@ -159,103 +159,109 @@ def local_momentum_blocks(model, basis):
     return convective_tensor(fom, basis), viscous, constant
 
 
-def local_stabilisation(model, basis, coefficients, trained, token):
-    """``V^T sum_f w_f S_f(V a)`` on one rank, projected inside the face loop.
+def local_sampled(model, basis, weights):
+    """Create the sampled stabilisation on one rank, over the given weights.
 
-    Unit weights select every face, so this is the general path rather than a hyper-reduced
-    special case -- one route means the sampled and unsampled evaluations cannot drift apart.
-
-    Projecting in C++ rather than returning a degree-of-freedom vector matters once the faces are
-    sampled: the route through a full-order vector costs a mesh-sized allocation, an additive
-    compress and ``r`` mesh-sized inner products per evaluation, and those dominate as soon as the
-    face work is down to a dozen faces.
+    Returned as an :class:`~pymor.tools.mpi.ObjectId` under MPI, so that later calls address every
+    rank's evaluator rather than rank 0's alone.
     """
-    fom = install(model, basis, trained, token)
+    evaluator = _bound_model(model).sampled_momentum([mode.impl for mode in basis.vectors])
 
-    return np.array(fom.stabilisation_projected(_reconstruct(basis, coefficients)))
+    if weights is not None:
+        evaluator.set_weights(weights)
 
-
-def local_stabilisation_jacobian(model, basis, coefficients, trained, token):
-    """``V^T (sum_f w_f S'_f(V a)) V`` on one rank, the linearised stabilisation."""
-    fom = install(model, basis, trained, token)
-    matrix = fom.stabilisation_jacobian(_reconstruct(basis, coefficients))
-
-    return np.array(matrix).reshape(len(basis), len(basis))
+    return evaluator
 
 
-def install(model, basis, trained, token):
-    """Install the basis and the face weights on the bound model, if they are not already.
-
-    Both are fixed for the life of a reduced model, and passing them per evaluation would put the
-    mesh straight back into the online cost: r vectors copied and ghost-exchanged, plus one double
-    per face crossing the language boundary, every time the residual is asked for.
-
-    The state lives on the *model*, though, and several reduced models can share one -- a sampled
-    model and the exact one it is measured against. Each stamps a token and checks it here, so
-    switching between them reinstalls instead of quietly evaluating with the other's weights.
-    """
-    fom = _bound_model(model)
-
-    if fom.installed_token != token:
-        fom.set_reduced_basis([mode.impl for mode in basis.vectors])
-        fom.set_weights(model._ecsw_weights if trained else fom.n_faces * [1.0])
-        fom.installed_token = token
-
-    return fom
+def local_evaluate(evaluator, method, coefficients):
+    """Call one of the evaluator's methods on every rank. Its result is already summed over them."""
+    return np.array(getattr(evaluator, method)(list(coefficients)))
 
 
-def local_batches(model, basis, trained, token):
-    """How many face batches the installed weights visit, summed over ranks."""
+def local_selected(evaluator):
+    """Faces the evaluator visits, summed over ranks."""
     from pymor.tools import mpi
 
-    local = install(model, basis, trained, token).n_selected_batches
+    count = evaluator.n_selected
 
-    return np.array([mpi.comm.allreduce(local) if mpi.parallel else local])
+    return np.array([mpi.comm.allreduce(count) if mpi.parallel else count])
+
+
+def _make_evaluator(model, basis, weights):
+    """One :class:`SampledOperator` per rank, addressed by ObjectId when there is more than one."""
+    from pymor.tools import mpi
+
+    if not mpi.parallel:
+        return local_sampled(model, basis, weights)
+
+    return mpi.call(
+        mpi.function_call_manage, local_sampled,
+        model.operator.solver.models_id, basis.impl.obj_id, weights,
+    )
+
+
+def _evaluate(model, evaluator, method, coefficients):
+    """Ask every rank's evaluator, and take the answer -- which each of them reduced already."""
+    from pymor.tools import mpi
+
+    if not mpi.parallel:
+        if method == "n_selected":
+            return local_selected(evaluator)[0]
+
+        return np.array(getattr(evaluator, method)(list(coefficients)))
+
+    if method == "n_selected":
+        return mpi.call(mpi.function_call, local_selected, evaluator)[0]
+
+    return mpi.call(mpi.function_call, local_evaluate, evaluator, method, list(coefficients))
 
 
 class FullOrderMomentum:
-    """The two pieces of the momentum block that are not the tensor, evaluated at full order.
+    """The stabilisation and its Jacobian, over every face.
 
-    A small object with two methods rather than inlined code, because replacing it is what
-    hyper-reduction *is*: :class:`ECSWMomentum` evaluates the same two quantities over a weighted
-    subset of faces and is a drop-in.
+    Both are read off a :class:`SampledOperator` the model hands out, which owns the basis and the
+    weights. That ownership is the point: a reduced model and the one it is measured against hold
+    one evaluator each and cannot disturb one another.
+
+    :class:`ECSWMomentum` differs only in the weights it installs.
     """
 
-    trained = False
-
-    def __init__(self, model, basis):
+    def __init__(self, model, basis, weights=None):
         self.model = model
         self.basis = basis
-        self.token = id(self)
+        self.evaluator = _make_evaluator(model, basis, weights)
 
     @property
     def n_batches(self):
-        """Face batches visited, which is the honest cost.
+        """Face batches visited, summed over ranks -- the honest cost.
 
         Matrix-free evaluates a batch of four to eight faces whole, so selecting one face in a
-        batch costs the same as selecting all of them. The count of faces kept is the size of the
-        fit; this is the size of the work.
+        batch costs the same as selecting all of them. Faces kept is the size of the fit; this is
+        the size of the work.
         """
-        return int(dispatch(self.model, local_batches, self.basis, self.trained, self.token)[0])
+        return int(_evaluate(self.model, self.evaluator, "n_selected", ()))
 
     def stabilisation(self, coefficients):
-        return dispatch(
-            self.model, local_stabilisation, self.basis, coefficients, self.trained, self.token
-        )
+        """``V^T sum_f w_f S_f(V a)``."""
+        return _evaluate(self.model, self.evaluator, "projected", coefficients)
 
     def stabilisation_jacobian(self, coefficients):
-        """``V^T S'(V a) V``, the linearised stabilisation over every face.
+        """``V^T (sum_f w_f S'_f(V a)) V``.
 
-        ExaDG freezes lambda when it linearises -- it is not differentiable -- so this is a linear
-        face operator and the same loop serves it. Together with the tensor and the viscous block
-        it is the *exact* derivative of the reduced residual, which is a better Jacobian than the
-        projection of ExaDG's own: that one carries the same frozen lambda but is assembled from
-        a linearisation path that differs from the nonlinear one at discretisation level.
+        ExaDG freezes lambda when it linearises -- it is not differentiable -- so ``S'`` is a
+        linear face operator over the same faces, and the weights carry over unchanged. Together
+        with the tensor and the viscous block it reproduces ``V^T A'(V a) V`` to machine precision
+        at every refinement -- the decomposition is exact, not merely consistent.
         """
-        return dispatch(
-            self.model, local_stabilisation_jacobian, self.basis, coefficients,
-            self.trained, self.token,
-        )
+        r = len(self.basis)
+
+        return _evaluate(self.model, self.evaluator, "jacobian", coefficients).reshape(r, r)
+
+    def contributions(self, coefficients):
+        """``V^T S_f(V a)`` for every face, shape ``(n_faces, r)``. Offline: it touches the mesh."""
+        flat = _evaluate(self.model, self.evaluator, "contributions", coefficients)
+
+        return flat.reshape(-1, len(self.basis))
 
 
 class ReducedSaddlePointOperator(Operator):
@@ -422,11 +428,9 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
     def build_momentum(self, velocity):
         # The basis is orthonormal in u_product, so this is the projection of each snapshot onto
         # the enriched space -- the states the reduced model will actually be evaluated near.
-        coefficients = self.u_product.apply2(velocity, self.training_states).T
+        states = self.u_product.apply2(velocity, self.training_states).T
 
-        return ECSWMomentum(
-            self.fom, velocity, list(coefficients), self.tolerance, self.max_entries
-        )
+        return ECSWMomentum(self.fom, velocity, states, self.tolerance, self.max_entries)
 
 
 def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
@@ -490,57 +494,43 @@ def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
     return weights
 
 
-def local_ecsw_weights(model, basis, states, tolerance, max_entries):
-    """Train ECSW weights on one rank, keeping that rank's slice.
+def local_ecsw_weights(evaluator, states, tolerance, max_entries):
+    """Fit the weights on one rank and install them there.
 
-    Every rank assembles the columns for the faces it owns, all ranks agree on the global fit, and
-    each keeps the weights belonging to its own faces. The weights stay on the rank because that is
-    where the faces are, and they are stashed on the local model rather than returned, because
-    ``mpi.call`` keeps rank 0's value while every rank needs a different answer.
+    Each rank assembles the columns for the faces it owns, all ranks agree on the global fit, and
+    each installs the weights belonging to its own faces -- which is where those faces are.
 
     .. warning::
        **The fit is redundant across ranks and this has to change.**
 
        Every rank gathers the *entire* training matrix and solves the *same* non-negative least
-       squares. That is correct -- the problem is deterministic, so all ranks agree without a
-       scatter -- and it is convenient, but it does not scale in either direction:
-
-       * memory: the gathered matrix is ``(n_train * n_basis) x n_faces_global`` **on every rank**,
-         and its width grows with the mesh, which is exactly the thing hyper-reduction exists to
-         stop mattering;
-       * work: the solve is repeated once per rank rather than done once.
-
-       The fix is to solve it once -- distributed, or on one rank -- and scatter the weights back
-       to the faces they belong to. Left as it is here only because it kept the first working
-       version small; it is the first thing to replace before this is run at any real size.
+       squares. Correct -- the problem is deterministic, so all ranks agree without a scatter --
+       but it scales in neither direction: the gathered matrix is
+       ``(n_train * r) x n_faces_global`` **on every rank**, its width grows with the mesh, and
+       the solve is repeated once per rank. Only the active set is ever small, and only the active
+       set needs gathering. See ``ExaDG ROM Next Steps.md`` in the vault for the architecture.
     """
     from pymor.tools import mpi
 
-    fom = _bound_model(model)
-    phi = [v.impl for v in basis.vectors]
-    n_faces = fom.n_faces
-
-    rows = []
-    for coefficients in states:
-        contributions = np.array(
-            fom.stabilisation_contributions(phi, _reconstruct(basis, coefficients))
-        ).reshape(n_faces, len(phi))
-        rows.append(contributions.T)
-
-    local = np.vstack(rows)
+    n_faces = evaluator.n_entities
+    local = np.vstack(
+        [np.array(evaluator.contributions(list(state))).reshape(n_faces, -1).T for state in states]
+    )
 
     pieces = mpi.comm.allgather(local) if mpi.parallel else [local]
     matrix = np.hstack(pieces)
+    target = matrix.sum(axis=1)
 
-    weights = sparse_nnls(matrix, matrix.sum(axis=1), tolerance, max_entries)
+    weights = sparse_nnls(matrix, target, tolerance, max_entries)
 
     offset = sum(piece.shape[1] for piece in pieces[: mpi.rank]) if mpi.parallel else 0
-    model._ecsw_weights = weights[offset : offset + n_faces].tolist()
+    evaluator.set_weights(weights[offset : offset + n_faces].tolist())
 
-    selected = int((weights > 0.0).sum())
-    residual = np.linalg.norm(matrix @ weights - matrix.sum(axis=1))
-
-    return np.array([selected, matrix.shape[1], residual / np.linalg.norm(matrix.sum(axis=1))])
+    return np.array([
+        (weights > 0.0).sum(),
+        matrix.shape[1],
+        np.linalg.norm(matrix @ weights - target) / np.linalg.norm(target),
+    ])
 
 
 class ECSWMomentum(FullOrderMomentum):
@@ -554,11 +544,16 @@ class ECSWMomentum(FullOrderMomentum):
     def __init__(self, model, basis, states, tolerance=1.0e-2, max_entries=None):
         super().__init__(model, basis)
 
-        selected, candidates, residual = dispatch(
-            model, local_ecsw_weights, basis, states, tolerance, max_entries
-        )
-        self.n_selected = int(selected)
-        self.n_candidates = int(candidates)
-        self.training_residual = float(residual)
+        from pymor.tools import mpi
 
-    trained = True
+        arguments = (self.evaluator, [list(state) for state in states], tolerance, max_entries)
+        fitted = (
+            local_ecsw_weights(*arguments) if not mpi.parallel
+            else mpi.call(mpi.function_call, local_ecsw_weights, *arguments)
+        )
+
+        self.n_faces = int(fitted[0])
+        self.n_candidates = int(fitted[1])
+        self.training_residual = float(fitted[2])
+
+

@@ -243,6 +243,15 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def_property_readonly("parameter_slot", &ParametricOperator<V>::parameter_slot)
     .def("set_coefficients", &ParametricOperator<V>::set_coefficients, py::arg("coefficients"));
 
+  py::class_<SampledOperator<V>, std::shared_ptr<SampledOperator<V>>>(
+    module, (prefix + "SampledOperator").c_str())
+    .def_property_readonly("n_entities", &SampledOperator<V>::n_entities)
+    .def_property_readonly("n_selected", &SampledOperator<V>::n_selected)
+    .def("set_weights", &SampledOperator<V>::set_weights, py::arg("weights"))
+    .def("contributions", &SampledOperator<V>::contributions, py::arg("coefficients"))
+    .def("projected", &SampledOperator<V>::projected, py::arg("coefficients"))
+    .def("jacobian", &SampledOperator<V>::jacobian, py::arg("coefficients"));
+
   py::class_<Functional<V>, std::shared_ptr<Functional<V>>>(module,
                                                             (prefix + "Functional").c_str())
     .def_property_readonly("n_outputs", &Functional<V>::n_outputs)
@@ -309,6 +318,7 @@ register_vector_type(py::module_ & module, std::string const & prefix)
       py::arg("p"),
       "N(u, p) without the right-hand side; returns (velocity, pressure), or None if linear.")
     .def("jacobian_momentum", &SaddlePointModel<V>::jacobian_momentum, py::arg("velocity"))
+    .def("sampled_momentum", &SaddlePointModel<V>::sampled_momentum, py::arg("basis"))
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)

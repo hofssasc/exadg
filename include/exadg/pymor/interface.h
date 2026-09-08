@@ -55,7 +55,8 @@ namespace PyMOR
  *   a DoFHandler's function space      Space                            always
  *   MatrixFree + DoFHandler + Driver   FullOrderModel                   a single-field problem
  *   OperatorCoupled's block system     SaddlePointModel                 a velocity/pressure problem
- *   cell matrices from FEValues        RestrictedOperator               you want hyper-reduction
+ *   cell matrices from FEValues        RestrictedOperator               you want empirical interpolation
+ *   a residual summed over faces/cells SampledOperator                  you want ECSW
  *   a functional of the solution       Functional                       the model has outputs
  *
  * Two rules run through the file.
@@ -219,6 +220,62 @@ public:
   {
     return 0;
   }
+};
+
+/**
+ * An operator evaluated as a weighted sum over a few mesh entities, for hyper-reduction.
+ *
+ * The object a reduced model needs once its residual is too nonlinear to project exactly. An
+ * application supplies its residual as a sum of per-entity contributions -- faces of a numerical
+ * flux, cells of a nonlinear material law -- and a reductor fits weights that reproduce the whole
+ * from a few of them. Which entities they are is the application's business; nothing in Python
+ * needs to know.
+ *
+ * Everything here speaks **reduced coefficients**, not degrees of freedom. That is deliberate and
+ * is what makes the online cost independent of the mesh: given a vector, an implementation would
+ * have to reconstruct V a everywhere before looking at a dozen entities, and that reconstruction
+ * would then be the dominant cost. Given coefficients, it can reconstruct on the sampled entities
+ * alone.
+ *
+ * The evaluator owns its basis and weights, so a model may hand out several and they do not
+ * interfere -- a hyper-reduced reduced model and the exact one it is measured against hold one
+ * each.
+ */
+template<typename VectorType>
+class SampledOperator
+{
+public:
+  virtual ~SampledOperator() = default;
+
+  /// Entities available to sample. Local to a rank, and to a partitioning.
+  virtual std::size_t
+  n_entities() const = 0;
+
+  /// Entities the current weights actually visit.
+  virtual std::size_t
+  n_selected() const = 0;
+
+  /// Install one weight per entity. Zero means "do not evaluate".
+  virtual void
+  set_weights(std::vector<double> const & weights) = 0;
+
+  /**
+   * V^T R_e(V a) for **every** entity, row-major (n_entities, r).
+   *
+   * The training data: its column sums are the exact projected residual, and a sparse
+   * non-negative weight vector reproducing them is a rule for evaluating on a few entities.
+   * Ignores the installed weights, and is an offline quantity -- it touches the whole mesh.
+   */
+  virtual std::vector<double>
+  contributions(std::vector<double> const & coefficients) = 0;
+
+  /// V^T sum_e w_e R_e(V a), length r.
+  virtual std::vector<double>
+  projected(std::vector<double> const & coefficients) = 0;
+
+  /// V^T (sum_e w_e R'_e(V a)) V, row-major (r, r).
+  virtual std::vector<double>
+  jacobian(std::vector<double> const & coefficients) = 0;
 };
 
 /**
@@ -547,6 +604,19 @@ public:
    */
   virtual std::shared_ptr<LinearOperator<VectorType>>
   jacobian_momentum(VectorType const & /*velocity*/)
+  {
+    return nullptr;
+  }
+
+  /**
+   * The part of the momentum operator that cannot be projected exactly, as a sampled operator.
+   *
+   * Returns nullptr for a model with no such part, or one that does not offer hyper-reduction.
+   * The basis is the one the reduced model projects onto -- after supremizer enrichment, if there
+   * is any -- and the evaluator keeps it, so it must be complete before this is called.
+   */
+  virtual std::shared_ptr<SampledOperator<VectorType>>
+  sampled_momentum(std::vector<std::shared_ptr<VectorType>> const & /*basis*/)
   {
     return nullptr;
   }
