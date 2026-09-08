@@ -110,9 +110,11 @@ class ExaDGVector(CopyOnWriteVector):
         """Index and magnitude of the largest entry.
 
         Empirical interpolation selects its next interpolation point with this, so it is on the
-        path after all -- ``deim`` and ``ei_greedy`` both call it. Single rank only; the C++ side
-        raises otherwise, because a componentwise reduction would return a locally correct and
-        globally wrong index.
+        path after all -- ``deim`` and ``ei_greedy`` both call it. Collective, and the index is
+        global: C++ takes a maximum over the values and then a *minimum over the global indices*
+        attaining it, so the tie-break does not depend on the rank count. ``MPI_MAXLOC`` would
+        break ties by rank, and a collateral basis built on two ranks would then differ from one
+        built on four.
         """
         return self.impl.amax()
 
