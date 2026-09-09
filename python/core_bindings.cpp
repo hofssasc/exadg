@@ -248,7 +248,11 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def_property_readonly("n_entities", &SampledOperator<V>::n_entities)
     .def("set_weights", &SampledOperator<V>::set_weights, py::arg("weights"))
     .def("contributions", &SampledOperator<V>::contributions, py::arg("coefficients"))
-    .def("compiled", &SampledOperator<V>::compiled);
+    .def("compiled", &SampledOperator<V>::compiled)
+    .def("write_selection",
+         &SampledOperator<V>::write_selection,
+         py::arg("directory"),
+         py::arg("basename"));
 
   py::class_<Functional<V>, std::shared_ptr<Functional<V>>>(module,
                                                             (prefix + "Functional").c_str())

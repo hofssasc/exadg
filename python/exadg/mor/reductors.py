@@ -173,6 +173,11 @@ def local_sampled(model, basis, weights):
     return evaluator
 
 
+def local_write_selection(builder, directory, basename):
+    """Draw the selected entities on every rank. The write is collective; rank 0's path is kept."""
+    return builder.write_selection(directory, basename)
+
+
 def local_compiled(builder):
     """Compile one rank's builder into the evaluation half, which refers to no model."""
     return builder.compiled()
@@ -292,6 +297,24 @@ class FullOrderMomentum:
         flat = _evaluate(self.builder, "contributions", coefficients)
 
         return flat.reshape(-1, len(self.basis))
+
+    def write_selection(self, filename):
+        """Draw the faces the weights select, as a VTU/PVTU record, and return its path.
+
+        Cell data: a face is not a cell, so what is drawn is the weight each cell *carries*, summed
+        over the selected faces on its boundary. Goes through the builder, which is the half that
+        still knows where in the mesh a face is.
+        """
+        from pathlib import Path
+        from pymor.tools import mpi
+
+        base = Path(filename)
+        arguments = (self.builder, str(base.parent), base.name)
+
+        if not mpi.parallel:
+            return local_write_selection(*arguments)
+
+        return mpi.call(mpi.function_call, local_write_selection, *arguments)
 
 
 class ReducedSaddlePointOperator(Operator):

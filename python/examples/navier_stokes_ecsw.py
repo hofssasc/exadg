@@ -63,6 +63,14 @@ The sampled column is flat across a sixty-fourfold growth in degrees of freedom,
 settles at 27 faces and stays there. That, rather than the speed-up, is the claim: the cost is set
 by the faces kept, and the faces kept are set by the rank of the term, not by the mesh.
 
+Two records come out of a run. ``navier_stokes_ecsw_{velocity,pressure}`` holds the POD modes, the
+full-order field at one parameter, and each tolerance's reduced field and error -- all at the *same*
+parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` holds the selection
+itself: for every face the fit kept, its weight added to the cells on either side of it, as
+``ecsw_weight``, with ``ecsw_faces`` counting how many selected faces a cell touches. It is written
+on a piecewise-constant space rather than as cell data so that a face on a partition boundary still
+reaches the rank that owns the cell across it -- one rank and four draw the same picture.
+
 **One thing still scales with the mesh**: the weight fit is solved redundantly on every rank over a
 training matrix gathered whole. See the warning on ``local_ecsw_weights``, and the architecture in
 ``ExaDG ROM Next Steps.md``. It is offline, so it bounds the size of problem that can be trained
@@ -88,7 +96,7 @@ from exadg.mor.models.saddle_point import mpi_saddle_point_model
 from exadg.mor.reductors import ECSWStokesReductor, TensorGalerkinStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes.json"
-DEGREE, REFINEMENTS = 2, 6
+DEGREE, REFINEMENTS = 2, 4
 N_TRAIN, N_TEST, N_MODES = 24, 4, 4
 AMPLITUDES = (0.5, 1.5)
 TOLERANCES = (1.0e-1, 1.0e-2, 1.0e-3)
@@ -119,7 +127,7 @@ def main():
 
     reference = TensorGalerkinStokesReductor(model, **bases)
     reference_rom = reference.reduce()
-    exact, _ = worst_error(model, reference, reference_rom, test)
+    exact, plot_mu = worst_error(model, reference, reference_rom, test)
 
     print(f"ranks              : {mpi.size}")
     print(f"velocity dofs      : {velocity.dim}")
@@ -132,7 +140,15 @@ def main():
         f"  {'faster':>8}"
     )
 
-    worst_mu = None
+    # Everything is plotted at one parameter -- the reference ROM's worst -- so that the errors
+    # below are comparable to each other and the full-order field is written once rather than
+    # three times. The modes are views into the bases; nothing here is copied.
+    U_fom = model.solve(plot_mu)
+    fields = [model.solution_space.make_array([basis_u[k], basis_p[k]]) for k in range(N_MODES)]
+    names = [f"mode_{k + 1}" for k in range(N_MODES)]
+    fields.append(U_fom)
+    names.append("fom")
+
     for tolerance in TOLERANCES:
         reductor = ECSWStokesReductor(
             model, training_states=snapshots.blocks[0], tolerance=tolerance, **bases
@@ -140,7 +156,7 @@ def main():
         rom = reductor.reduce()
         momentum = rom.operator.momentum
 
-        error, worst_mu = worst_error(model, reductor, rom, test)
+        error, _ = worst_error(model, reductor, rom, test)
         print(
             f"  {tolerance:>9.0e}  {momentum.n_faces:>4d}/{momentum.n_candidates:<4d}  "
             f"{momentum.n_batches:>8d}  {momentum.training_residual:>9.2e}  {error:>11.4e}  "
@@ -149,13 +165,16 @@ def main():
 
         assert error < 2.0 * exact, "sampling the stabilisation changed the answer"
 
-        U_fom = model.solve(worst_mu)
-        U_rom = reductor.reconstruct(rom.solve(worst_mu))
-        model.visualize(
-            (U_fom, U_rom, U_fom - U_rom),
-            legend=("fom", "rom", "error"),
-            filename=f"output/pymor/navier_stokes_ecsw_{tolerance:.0e}",
-        )
+        tag = f"{tolerance:.0e}".replace("-", "_")
+        U_rom = reductor.reconstruct(rom.solve(plot_mu))
+        fields.extend([U_rom, U_fom - U_rom])
+        names.extend([f"rom_{tag}", f"error_{tag}"])
+
+        # Where in the domain the fit put its quadrature. Cell data: a face is not a cell, so what
+        # is drawn is the weight each cell carries, summed over the selected faces on its boundary.
+        momentum.write_selection(f"output/pymor/navier_stokes_ecsw_faces_{tag}")
+
+    model.visualize(fields, legend=names, filename="output/pymor/navier_stokes_ecsw")
 
     print(
         "\nThe stabilisation is reproduced from a small fraction of the faces without moving the\n"

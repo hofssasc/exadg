@@ -42,6 +42,7 @@ from pymor.operators.constructions import LincombOperator, VectorOperator
 from pymor.operators.interface import Operator
 from pymor.parameters.functionals import ConstantParameterFunctional, ProjectionParameterFunctional
 from pymor.solvers.interface import Solver
+from pymor.vectorarrays.interface import VectorArray
 
 from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace
 from exadg.mor.models.stationary import parameter_names
@@ -126,7 +127,9 @@ def _visualize_arguments(U, title, legend, filename, directory):
     Returns ``(arrays, names, base)``: the fields to write, one name each, and the output path
     without its suffix.
     """
-    arrays = U if isinstance(U, tuple) else (U,)
+    # Any sequence of arrays, or one array on its own. A VectorArray is itself iterable over its
+    # vectors, so it has to be recognised before the sequence case rather than after it.
+    arrays = (U,) if isinstance(U, VectorArray) else tuple(U)
 
     for array in arrays:
         # A time series would be several records rather than several fields; until an

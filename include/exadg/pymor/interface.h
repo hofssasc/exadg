@@ -306,6 +306,20 @@ public:
   virtual std::vector<double>
   contributions(std::vector<double> const & coefficients) = 0;
 
+  /**
+   * Draw the entities the installed weights select, as a VTU/PVTU record, and return its path.
+   *
+   * Optional, and a diagnostic: which entities a fit chose is the one thing about a
+   * hyper-reduction that a number cannot show. An entity is not in general a cell, so how it is
+   * drawn is the application's business -- a face term may well write cell data.
+   */
+  virtual std::string
+  write_selection(std::string const & /*directory*/, std::string const & /*basename*/)
+  {
+    AssertThrow(false, dealii::ExcMessage("This operator does not implement write_selection()."));
+
+    return {};
+  }
 };
 
 /**

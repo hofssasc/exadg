@@ -74,6 +74,11 @@ Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 | answers | `n_entities`, `set_weights`, `contributions`, `compiled` | `n_selected`, `projected`, `jacobian` |
 | when | offline — `contributions` walks the mesh | online — every residual and Jacobian |
 
+`SampledOperator::write_selection(directory, basename)` draws what the weights kept — for each
+selected face, its weight added to the cells on either side, on a **DG0 space** rather than as
+DataOut cell data, so a face on a partition boundary still reaches the rank owning the cell across
+it. `FullOrderMomentum.write_selection(filename)` dispatches it.
+
 `compiled()` does the pass; `set_weights` only records and invalidates, so a fit's discarded faces
 are never gathered. The compiled half is **not templated on a vector type** and is bound once in
 `core_bindings.cpp`'s module body, not per vector type. λ is reached through the static

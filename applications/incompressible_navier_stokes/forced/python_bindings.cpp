@@ -48,6 +48,8 @@
 
 // deal.II
 #include <deal.II/base/mpi.h>
+#include <deal.II/dofs/dof_tools.h>
+#include <deal.II/fe/fe_dgq.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
 
@@ -801,6 +803,103 @@ public:
   }
 
   /**
+   * The faces a weight vector selects, drawn as cell data.
+   *
+   * A face is not a cell, and a field is drawn on cells, so what is written is the weight a cell
+   * *carries*: for every selected face, its weight is added to the cells on either side of it.
+   * Two fields come out -- the summed weight, and how many selected faces the cell touches -- and
+   * a cell touching none is zero. That is enough to see where in the domain ECSW put its
+   * quadrature, which is the question a picture of this is asked to answer.
+   *
+   * Written on a piecewise-constant DG space rather than as DataOut cell data, because a face on
+   * a partition boundary is processed by one rank while the cell on its far side belongs to
+   * another. A plain per-cell array would drop that contribution -- DataOut writes only locally
+   * owned cells -- and the picture would depend on the partitioning. A distributed vector with
+   * compress(add) sends it to the owner instead, so one rank and four draw the same thing.
+   *
+   * Written here rather than handed back as a vector because it is a different space from the
+   * velocity's: routing it through Python would mean wrapping a rank-local vector as a
+   * VectorArray for one plot.
+   */
+  std::string
+  write_sampled_faces(std::vector<double> const & weights,
+                      std::string const &         directory,
+                      std::string const &         basename)
+  {
+    AssertThrow(weights.size() == n_faces(),
+                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
+                                   std::to_string(weights.size()) + "."));
+
+    using CellVector = dealii::LinearAlgebra::distributed::Vector<double>;
+
+    auto const &       matrix_free = pde_operator->get_matrix_free();
+    auto const &       velocity    = matrix_free.get_dof_handler(dof_index());
+    unsigned int const lanes       = dealii::VectorizedArray<Number>::size();
+    unsigned int const n_inner     = matrix_free.n_inner_face_batches();
+
+    dealii::FE_DGQ<dim>     constants(0);
+    dealii::DoFHandler<dim> cells(velocity.get_triangulation());
+    cells.distribute_dofs(constants);
+
+    CellVector weight(cells.locally_owned_dofs(),
+                      dealii::DoFTools::extract_locally_relevant_dofs(cells),
+                      mpi_comm);
+    CellVector count(weight);
+
+    auto mark = [&](unsigned int const cell, double const value) {
+      // MatrixFree numbers cells by batch and lane; an unfilled lane reads as invalid.
+      if(cell == dealii::numbers::invalid_unsigned_int)
+        return;
+
+      auto const from = matrix_free.get_cell_iterator(cell / lanes, cell % lanes, dof_index());
+      typename dealii::DoFHandler<dim>::active_cell_iterator const at(
+        &cells.get_triangulation(), from->level(), from->index(), &cells);
+
+      std::vector<dealii::types::global_dof_index> index(1);
+      at->get_dof_indices(index);
+
+      weight[index[0]] += value;
+      count[index[0]] += 1.0;
+    };
+
+    for(unsigned int batch = 0; batch * lanes < weights.size(); ++batch)
+      for(unsigned int lane = 0; lane < lanes; ++lane)
+      {
+        double const value = weights[batch * lanes + lane];
+        if(value == 0.0)
+          continue;
+
+        auto const & info = matrix_free.get_face_info(batch);
+
+        mark(info.cells_interior[lane], value);
+        if(batch < n_inner)
+          mark(info.cells_exterior[lane], value);
+      }
+
+    for(auto * field : {&weight, &count})
+    {
+      field->compress(dealii::VectorOperation::add);
+      field->update_ghost_values();
+    }
+
+    std::string const path =
+      (directory.empty() or directory.back() == '/') ? directory : directory + "/";
+
+    create_directories(path, mpi_comm);
+
+    dealii::DataOut<dim> data_out;
+    data_out.attach_dof_handler(cells);
+
+    // type_dof_data explicitly: on a degree-0 space there is one DoF per cell, so deal.II cannot
+    // tell DoF data from cell data by counting and refuses to guess.
+    data_out.add_data_vector(weight, "ecsw_weight", dealii::DataOut<dim>::type_dof_data);
+    data_out.add_data_vector(count, "ecsw_faces", dealii::DataOut<dim>::type_dof_data);
+    data_out.build_patches(*pde_operator->get_mapping());
+
+    return path + data_out.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+  }
+
+  /**
    * sum_f w_f S_f(u) as a full-order vector, over the weights last set.
    *
    * Not on the reduced model's path -- that projects inside the loop and never forms this -- but
@@ -1055,6 +1154,13 @@ public:
     contributions(std::vector<double> const & coefficients) override
     {
       return fom->stabilisation_contributions(ghosted, reconstruct(coefficients));
+    }
+
+    /// Draw the selected faces as cell data. Collective, and offline like everything with a mesh.
+    std::string
+    write_selection(std::string const & directory, std::string const & basename) override
+    {
+      return fom->write_sampled_faces(weights, directory, basename);
     }
 
   private:
