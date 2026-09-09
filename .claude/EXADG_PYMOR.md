@@ -96,6 +96,14 @@ are never gathered. The compiled half is **not templated on a vector type** and 
 
 ## Traps, each of which cost real time
 
+- **A velocity has two opposite ghost requirements.** As the `src` of `MatrixFree::loop` it must
+  *not* be ghosted — the loop exchanges ghosts itself, hence `ForcedFOM::owned()`. As the installed
+  **transport velocity** it *must* be, because only `evaluate_nonlinear_operator` calls
+  `update_ghost_values_velocity()`; `apply`/`vmult` assume the caller did it (ExaDG's own time
+  integrator does, at the call site). Hence `ForcedFOM::transported()`. Using `owned()` for both
+  made `C(w,w)` **50% wrong on four ranks** while every nonlinear path agreed to eight digits —
+  and it hid because a wrong Jacobian does not move a converged Newton solve, only its iteration
+  count. Found by running `convective_split.py` under MPI.
 - **ExaDG hands out pointers; the caller owns the lifetime.** Three bugs of this shape, all silent
   serially and fatal under MPI: `set_velocity_ptr` (`solve()` left the kernel pointing at its own
   local solution), `OperatorBase::reinit` keeping a `lazy_ptr` to a stack-local `AffineConstraints`,
@@ -133,7 +141,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `thermal_block_ei.py` | the restriction contract through pyMOR's own call path |
 | `stokes_rb.py` | adjoint identity, block system vs ExaDG's solve, exactness at $P$ modes |
 | `navier_stokes_rb.py` | the nonlinear path |
-| `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ — **serial only** |
+| `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ |
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
@@ -141,12 +149,8 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 Legitimately rank-dependent: Stokes' last row and the NS residual sit at their solver's tolerance
 floor; `navier_stokes_tensor`'s `tensor vs Galerkin` is a cancellation and sits at roundoff (4e-16
 on one rank, 7e-13 on four); `thermal_block_ei`'s first row is a singular reduced operator that
-raises on one rank and returns ~1e17 on four.
-
-`convective_split.py` cannot run under `pymor.tools.mpi` at all: it constructs `ForcedFOM2D`
-directly, and a FOM constructor is collective, so rank 0 blocks while the others wait in the event
-loop. Porting it would mean dispatching a dozen raw operator calls per rank — worth doing for the
-partition-boundary coverage it would add, but it is not a regression.
+raises on one rank and returns ~1e17 on four; face **counts** grow with the rank count because
+matrix-free pads its face batches per rank (144 → 184 at four).
 
 ## Known defects, not yet fixed
 

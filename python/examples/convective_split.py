@@ -39,24 +39,31 @@ operator the full-order model never solved.
 
 Four things are checked, and the third is the one that changes how the tensor must be built.
 
+Every check runs on all ranks, because that is where the bugs are. The identities themselves are
+local to a face or a cell, so a partition cannot change them -- which is exactly what makes them
+worth checking in parallel: a face on a partition boundary is the one place a flux can be
+evaluated against the wrong exterior state, and nothing else in the suite would say so. Running
+this at four ranks is what found the transport velocity's missing ghost exchange, which made
+``C(w, w)`` fifty per cent wrong while every nonlinear path agreed to eight digits.
+
+The raw operators speak ExaDG vectors, not pyMOR VectorArrays, so each check is dispatched whole
+rather than assembled from remote vector operations: ``reductors.dispatch`` runs it on every rank
+and only floats come back. Norms are ``l2_norm``, which is collective, so each rank computes the
+same global number and pyMOR keeps rank 0's.
+
 Run from the repository root::
 
     python python/examples/convective_split.py
-
-**Serial only**, unlike the other examples. It builds ``ForcedFOM2D`` directly rather than through
-``mpi_saddle_point_model``, because it probes the raw operator -- ``apply_convective``,
-``apply_stabilisation``, ``apply_trilinear`` -- and not a pyMOR model. A FOM constructor is
-collective, so under ``pymor.tools.mpi`` rank 0 would call it while the others sit in the event
-loop, and the run deadlocks. Every identity here is local to a face or a cell, so nothing it checks
-needs a partition; what a parallel run would add is coverage of faces on a partition boundary.
+    mpirun -n 4 python -m pymor.tools.mpi python/examples/convective_split.py
 """
 
 import numpy as np
 from pymor.core.logger import set_log_levels
 from pymor.parameters.base import Mu
+from pymor.tools import mpi
 
-from exadg import forced
-from exadg.mor.models.saddle_point import saddle_point_model
+from exadg.mor.models.saddle_point import mpi_saddle_point_model
+from exadg.mor.reductors import _bound_model, dispatch
 
 UPWIND = "applications/incompressible_navier_stokes/forced/input_navier_stokes.json"
 CENTRAL = "applications/incompressible_navier_stokes/forced/input_navier_stokes_central.json"
@@ -66,17 +73,19 @@ DEGREE, REFINEMENTS, N_SNAPSHOTS = 2, 3, 4
 def main():
     set_log_levels({"pymor": "ERROR", "exadg": "ERROR"})
 
-    upwind = forced.ForcedFOM2D(UPWIND, degree=DEGREE, refinements=REFINEMENTS)
-    central = forced.ForcedFOM2D(CENTRAL, degree=DEGREE, refinements=REFINEMENTS)
-
-    print(f"upwind factors     : {upwind.upwind_factor} and {central.upwind_factor}")
-    print(f"quadrature indices : {upwind.quadrature_indices}  (linearised, over-integrated)")
+    upwind = build(UPWIND, DEGREE, REFINEMENTS)
+    central = build(CENTRAL, DEGREE, REFINEMENTS)
 
     snapshots = solve_at(upwind, N_SNAPSHOTS)
-    u, v = snapshots[0], snapshots[1]
+    central_snapshots = solve_at(central, 2)
 
-    quadratic(central, snapshots)
-    polarisation(central, u, v)
+    print(f"ranks              : {mpi.size}")
+    print(f"upwind factors     : {info(upwind)[0]} and {info(central)[0]}")
+    print(f"quadrature indices : {[int(i) for i in info(upwind)[2:]]}  "
+          f"(linearised, over-integrated)")
+
+    quadratic(central, central_snapshots)
+    polarisation(central, central_snapshots)
     refinement()
     stabilisation(upwind, snapshots)
     face_sum(upwind, snapshots)
@@ -97,61 +106,170 @@ def main():
     )
 
 
-def solve_at(fom, count):
-    """Velocity snapshots at random forcing amplitudes."""
-    model, _ = saddle_point_model(fom)
-    rng = np.random.default_rng(0)
+def info(model):
+    """The model's scalars, gathered on every rank."""
+    return dispatch(model, local_info, model.solution_space.empty().blocks[0])
 
-    return [
-        model.solve(Mu(mu=m)).blocks[0].vectors[0].impl
-        for m in rng.uniform(0.5, 1.5, (count, fom.n_modes))
-    ]
+
+def build(input_file, degree, refinements):
+    """The pyMOR model, constructed collectively. The raw FOM is reached through dispatch."""
+    model, _ = mpi_saddle_point_model(
+        "forced", "ForcedFOM2D", input_file, degree=degree, refinements=refinements
+    )
+
+    return model
+
+
+def solve_at(model, count):
+    """Velocity snapshots at random forcing amplitudes, as one VectorArray."""
+    rng = np.random.default_rng(0)
+    snapshots = model.solution_space.empty()
+    for amplitudes in rng.uniform(0.5, 1.5, (count, model.parameters["mu"])):
+        snapshots.append(model.solve(Mu(mu=amplitudes)))
+
+    return snapshots.blocks[0]
+
+
+# --- the rank-local halves -----------------------------------------------------------------
+#
+# Each takes the bound ExaDG model and a VectorArray of snapshots, already resolved to this
+# rank's piece, and returns the global answer as a small array of floats. Nothing but floats
+# crosses back, so no ExaDG vector ever has to be wrapped for pyMOR.
 
 
 def relative(a, b):
-    """|a - b| / |b|, on ExaDG vectors."""
+    """|a - b| / |b|, on ExaDG vectors. Both norms are collective, so this is global."""
     difference = a.copy()
     difference.axpy(-1.0, b)
 
     return difference.norm() / b.norm()
 
 
-def quadratic(central, snapshots):
-    """N(alpha u) = alpha^2 N(u): the property that makes an exact tensor possible."""
-    print("\nis the central-flux operator exactly quadratic?")
-    for alpha in (2.0, 3.0, -1.0):
-        scaled = snapshots[0].copy()
+def add(a, b):
+    result = a.copy()
+    result.axpy(1.0, b)
+
+    return result
+
+
+def local_info(model, snapshots):
+    """Scalars the printing side needs: the upwind factor, the faces, the quadrature indices.
+
+    The face count is rank-local, so it is reduced *here*. Reducing it on the printing side would
+    be a collective call made by rank 0 alone, with the other ranks parked in pyMOR's event loop
+    and no matching call coming -- which does not fail, it hangs.
+
+    ``mpi`` is imported here rather than at module scope for the same reason ``reductors`` does it:
+    ranks 1..n-1 import this module from inside ``pymor.tools.mpi``, which is still initialising,
+    and a module-level ``from pymor.tools import mpi`` then binds the half-built package instead.
+    """
+    from pymor.tools import mpi
+
+    fom = _bound_model(model)
+    faces = mpi.comm.allreduce(fom.n_faces) if mpi.parallel else fom.n_faces
+
+    return np.array([fom.upwind_factor, faces, *fom.quadrature_indices], dtype=float)
+
+
+def local_quadratic(model, snapshots, alphas):
+    fom = _bound_model(model)
+    u = snapshots.vectors[0].impl
+
+    errors = []
+    for alpha in alphas:
+        scaled = u.copy()
         scaled.scal(alpha)
 
-        expected = central.apply_convective(snapshots[0])
+        expected = fom.apply_convective(u)
         expected.scal(alpha * alpha)
 
-        print(f"  N({alpha:>4}u) vs {alpha * alpha:>4} N(u)     : "
-              f"{relative(central.apply_convective(scaled), expected):.3e}")
+        errors.append(relative(fom.apply_convective(scaled), expected))
+
+    return np.array(errors)
 
 
-def polarisation(central, u, v):
+def local_polarisation(model, snapshots):
+    fom = _bound_model(model)
+    u, v = snapshots.vectors[0].impl, snapshots.vectors[1].impl
+
+    linear_in_w = fom.apply_trilinear(add(u, v), u)
+    parts = fom.apply_trilinear(u, u)
+    parts.axpy(1.0, fom.apply_trilinear(v, u))
+
+    lhs = fom.apply_convective(add(u, v))
+    lhs.axpy(-1.0, fom.apply_convective(u))
+    lhs.axpy(-1.0, fom.apply_convective(v))
+    rhs = fom.apply_trilinear(u, v)
+    rhs.axpy(1.0, fom.apply_trilinear(v, u))
+
+    return np.array([
+        relative(linear_in_w, parts),
+        relative(lhs, rhs),
+        relative(fom.apply_trilinear(u, u), fom.apply_convective(u)),
+    ])
+
+
+def local_gap(model, snapshots):
+    fom = _bound_model(model)
+    u = snapshots.vectors[0].impl
+
+    return np.array([relative(fom.apply_trilinear(u, u), fom.apply_convective(u))])
+
+
+def local_stabilisation(model, snapshots):
+    fom = _bound_model(model)
+
+    shares = []
+    for vector in snapshots.vectors:
+        full = fom.apply_convective(vector.impl)
+        S = full.copy()
+        S.axpy(-1.0, fom.apply_convective_central(vector.impl))
+        shares.append(S.norm() / full.norm())
+
+    return np.array(shares)
+
+
+def local_face_sum(model, snapshots):
+    fom = _bound_model(model)
+
+    errors = []
+    for vector in snapshots.vectors:
+        exact = fom.apply_convective(vector.impl)
+        exact.axpy(-1.0, fom.apply_convective_central(vector.impl))
+        errors.append(relative(fom.apply_stabilisation(vector.impl), exact))
+
+    return np.array(errors)
+
+
+# --- the checks ------------------------------------------------------------------------------
+
+
+def quadratic(central, snapshots):
+    """N(alpha u) = alpha^2 N(u): the property that makes an exact tensor possible."""
+    alphas = (2.0, 3.0, -1.0)
+
+    print("\nis the central-flux operator exactly quadratic?")
+    for alpha, error in zip(alphas, dispatch(central, local_quadratic, snapshots, alphas)):
+        print(f"  N({alpha:>4}u) vs {alpha * alpha:>4} N(u)     : {error:.3e}")
+
+
+def polarisation(central, snapshots):
     """Is ExaDG's linearly-implicit operator the bilinear form of the nonlinear one?
 
     It is trilinear, and it is not that form. The defect is exactly quadratic in u -- so the two
     are different bilinear maps, not one map integrated two ways. A tensor built from the wrong
     one reduces an operator nobody solves.
+
+    The first line is also the one that fails loudly when the transport velocity reaches the
+    linearised operator without its ghost values: C is then wrong on every partition boundary
+    while N, which updates them itself, is not.
     """
+    trilinear, polarised, against_n = dispatch(central, local_polarisation, snapshots)
+
     print("\nis ExaDG's linearly-implicit operator the polarisation of N?")
-
-    linear_in_w = central.apply_trilinear(add(u, v), u)
-    parts = central.apply_trilinear(u, u)
-    parts.axpy(1.0, central.apply_trilinear(v, u))
-    print(f"  C(w1+w2, v) vs sum         : {relative(linear_in_w, parts):.3e}")
-
-    lhs = central.apply_convective(add(u, v))
-    lhs.axpy(-1.0, central.apply_convective(u))
-    lhs.axpy(-1.0, central.apply_convective(v))
-    rhs = central.apply_trilinear(u, v)
-    rhs.axpy(1.0, central.apply_trilinear(v, u))
-    print(f"  N(u+v)-N(u)-N(v) vs C+C    : {relative(lhs, rhs):.3e}   <- not zero")
-    print(f"  C(u,u) vs N(u)             : "
-          f"{relative(central.apply_trilinear(u, u), central.apply_convective(u)):.3e}   <- not zero")
+    print(f"  C(w1+w2, v) vs sum         : {trilinear:.3e}")
+    print(f"  N(u+v)-N(u)-N(v) vs C+C    : {polarised:.3e}   <- not zero")
+    print(f"  C(u,u) vs N(u)             : {against_n:.3e}   <- not zero")
 
 
 def refinement():
@@ -164,36 +282,32 @@ def refinement():
     """
     print("\ndoes that gap converge away?")
     for degree, refinements in ((2, 2), (2, 3), (2, 4), (3, 3)):
-        fom = forced.ForcedFOM2D(CENTRAL, degree=degree, refinements=refinements)
-        u = solve_at(fom, 1)[0]
+        model = build(CENTRAL, degree, refinements)
+        gap = dispatch(model, local_gap, solve_at(model, 1))[0]
 
-        print(f"  degree {degree}, refinement {refinements}       : "
-              f"{relative(fom.apply_trilinear(u, u), fom.apply_convective(u)):.3e}")
+        print(f"  degree {degree}, refinement {refinements}       : {gap:.3e}")
 
 
 def stabilisation(upwind, snapshots):
     """How much of the operator is the term no tensor can hold."""
     print("\nshare of the operator carried by the Lax-Friedrichs term")
-    for i, u in enumerate(snapshots):
-        full = upwind.apply_convective(u)
-        S = full.copy()
-        S.axpy(-1.0, upwind.apply_convective_central(u))
-        print(f"  snapshot {i}                 : |S|/|N| = {S.norm() / full.norm():.4f}")
+    for i, share in enumerate(dispatch(upwind, local_stabilisation, snapshots)):
+        print(f"  snapshot {i}                 : |S|/|N| = {share:.4f}")
 
 
 def face_sum(upwind, snapshots):
     """The face-by-face stabilisation must add up to the operator it was split out of.
 
     This is the check the hyper-reduced path rests on: if a single face's contribution is wrong --
-    a boundary flux, a missing lane -- every weight fitted against it is wrong too, and nothing
-    downstream would say so.
-    """
-    print(f"\nsum over {upwind.n_faces} faces against N(u) - B(u, u)")
-    for i, u in enumerate(snapshots):
-        exact = upwind.apply_convective(u)
-        exact.axpy(-1.0, upwind.apply_convective_central(u))
+    a boundary flux, a missing lane, an exterior state read across a partition -- every weight
+    fitted against it is wrong too, and nothing downstream would say so.
 
-        print(f"  snapshot {i}                 : {relative(upwind.apply_stabilisation(u), exact):.3e}")
+    The face count is the one number here that legitimately grows with the rank count: matrix-free
+    pads its face batches per rank, and the padding slots contribute nothing.
+    """
+    print(f"\nsum over {int(info(upwind)[1])} faces against N(u) - B(u, u)")
+    for i, error in enumerate(dispatch(upwind, local_face_sum, snapshots)):
+        print(f"  snapshot {i}                 : {error:.3e}")
 
 
 def jacobian(upwind, central):
@@ -201,12 +315,16 @@ def jacobian(upwind, central):
 
     lambda is not differentiable, so ExaDG freezes it at the linearisation point instead of
     differentiating it. That is the same term the tensor cannot hold, showing up a second way.
+
+    This one needs no dispatch: it is pyMOR all the way down, and every operator in it is already
+    wrapped for MPI.
     """
     print("\nJacobian against a finite difference, best over eps in [1e-7, 1e-3]")
-    for fom, label in ((upwind, "upwind"), (central, "central")):
-        model, _ = saddle_point_model(fom)
+    for model, label in ((upwind, "upwind"), (central, "central")):
+        factor = info(model)[0]
+
         rng = np.random.default_rng(0)
-        U = model.solve(Mu(mu=rng.uniform(0.5, 1.5, fom.n_modes)))
+        U = model.solve(Mu(mu=rng.uniform(0.5, 1.5, model.parameters["mu"])))
 
         u = U.blocks[0]
         direction = u.copy()
@@ -219,14 +337,7 @@ def jacobian(upwind, central):
             ((A.apply(u + direction * eps) - A.apply(u)) * (1.0 / eps) - exact).norm()[0]
             for eps in (1e-3, 1e-4, 1e-5, 1e-6, 1e-7)
         )
-        print(f"  upwind_factor {fom.upwind_factor}  ({label:>7}) : {best / exact.norm()[0]:.3e}")
-
-
-def add(a, b):
-    result = a.copy()
-    result.axpy(1.0, b)
-
-    return result
+        print(f"  upwind_factor {factor}  ({label:>7}) : {best / exact.norm()[0]:.3e}")
 
 
 if __name__ == "__main__":

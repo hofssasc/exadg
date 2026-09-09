@@ -734,7 +734,10 @@ public:
     auto dst = std::make_shared<VectorType>();
     pde_operator->initialize_vector_velocity(*dst);
 
-    trilinear_operator.set_velocity_ptr(owned(w));
+    // w is the transport velocity and needs its ghosts; v is the loop's argument and must not
+    // have them. A dedicated member rather than the owned() ring, because set_velocity_ptr stores
+    // a pointer that stays installed after this call returns.
+    trilinear_operator.set_velocity_ptr(transported(w, trilinear_transport));
     trilinear_operator.apply(*dst, owned(v));
 
     return dst;
@@ -1185,6 +1188,11 @@ public:
   {
     installed_linearization = velocity;
 
+    // Every time, not once: evaluate_nonlinear_operator() ends by zeroing the ghost values of
+    // whatever velocity the kernel points at, so an intervening apply_convective() would strip
+    // the ghosts off this vector. Re-installing is cheap and this is the only place that knows.
+    installed_linearization->update_ghost_values();
+
     pde_operator->get_momentum_operator().set_solution_linearization(*installed_linearization);
   }
 
@@ -1204,6 +1212,30 @@ private:
    * copies also outlive the call, which matters because ExaDG stores the transport velocity by
    * pointer. ExaDG's own evaluate_nonlinear_residual_steady() path copies for the same reason.
    */
+  /**
+   * The given vector copied into one this model owns, with its ghost values *updated*.
+   *
+   * The counterpart of owned(), and the opposite requirement, on a different vector. A vector
+   * passed as the *argument* of MatrixFree::loop must not be ghosted, because the loop exchanges
+   * ghosts itself. A velocity installed as the kernel's *transport velocity* must be, because
+   * nothing in the linear path does it: only evaluate_nonlinear_operator() calls
+   * update_ghost_values_velocity(), while apply() and vmult() read the velocity through a face
+   * integrator and assume the caller has ghosted it. ExaDG's own time integrator does exactly
+   * that before solve_linear_problem() -- see time_int_bdf_coupled_solver.cpp.
+   *
+   * Getting this backwards is invisible serially, where there are no ghosts to be wrong, and
+   * wrong by tens of percent on the faces of a partition boundary.
+   */
+  VectorType &
+  transported(VectorType const & source, VectorType & destination)
+  {
+    pde_operator->initialize_vector_velocity(destination);
+    destination.copy_locally_owned_data_from(source);
+    destination.update_ghost_values();
+
+    return destination;
+  }
+
   VectorType &
   owned(VectorType const & source)
   {
@@ -1603,6 +1635,7 @@ private:
 
   // whatever ExaDG's momentum operator currently points at; see install_linearization()
   std::shared_ptr<VectorType> installed_linearization;
+  VectorType                  trilinear_transport;
 };
 
 template<int dim>
