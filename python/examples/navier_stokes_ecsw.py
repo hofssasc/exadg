@@ -65,11 +65,15 @@ by the faces kept, and the faces kept are set by the rank of the term, not by th
 
 Two records come out of a run. ``navier_stokes_ecsw_{velocity,pressure}`` holds the POD modes, the
 full-order field at one parameter, and each tolerance's reduced field and error -- all at the *same*
-parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` holds the selection
-itself: for every face the fit kept, its weight added to the cells on either side of it, as
-``ecsw_weight``, with ``ecsw_faces`` counting how many selected faces a cell touches. It is written
-on a piecewise-constant space rather than as cell data so that a face on a partition boundary still
-reaches the rank that owns the cell across it -- one rank and four draw the same picture.
+parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` is the selection itself:
+a surface mesh of the faces the fit kept, one cell per face, carrying ``ecsw_weight``. Open it
+alongside the velocity record to see where in the domain the quadrature went.
+
+.. note::
+   Colour the modes by a **component**, not by magnitude. POD modes are orthogonal as vector
+   fields -- pairwise cosine here is under 0.01 -- but their magnitudes are 76-83% correlated and
+   their norms agree to three digits, so magnitude, which is ParaView's default for a vector array,
+   makes all four look like the same picture. The difference is in the direction.
 
 **One thing still scales with the mesh**: the weight fit is solved redundantly on every rank over a
 training matrix gathered whole. See the warning on ``local_ecsw_weights``, and the architecture in
@@ -170,8 +174,8 @@ def main():
         fields.extend([U_rom, U_fom - U_rom])
         names.extend([f"rom_{tag}", f"error_{tag}"])
 
-        # Where in the domain the fit put its quadrature. Cell data: a face is not a cell, so what
-        # is drawn is the weight each cell carries, summed over the selected faces on its boundary.
+        # Where in the domain the fit put its quadrature: the selected faces themselves, as a
+        # surface mesh with one cell per face.
         momentum.write_selection(f"output/pymor/navier_stokes_ecsw_faces_{tag}")
 
     model.visualize(fields, legend=names, filename="output/pymor/navier_stokes_ecsw")

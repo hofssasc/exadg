@@ -48,8 +48,6 @@
 
 // deal.II
 #include <deal.II/base/mpi.h>
-#include <deal.II/dofs/dof_tools.h>
-#include <deal.II/fe/fe_dgq.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/vector_tools.h>
 
@@ -323,6 +321,32 @@ public:
 
   private:
     std::shared_ptr<ForcedFOM<dim>> fom;
+  };
+
+  /**
+   * A surface mesh of hand-built patches, one per selected face.
+   *
+   * DataOutInterface is the whole of what a VTU writer needs: patches and a name for each data
+   * set. Deriving from it rather than from DataOut is what lets a face carry a number of its own
+   * instead of a field sampled on it -- and it brings write_vtu_with_pvtu_record, so the parallel
+   * record costs nothing extra.
+   */
+  class SelectedFaces : public dealii::DataOutInterface<dim - 1, dim>
+  {
+  public:
+    std::vector<dealii::DataOutBase::Patch<dim - 1, dim>> patches;
+
+    std::vector<std::string>
+    get_dataset_names() const override
+    {
+      return {"ecsw_weight"};
+    }
+
+    std::vector<dealii::DataOutBase::Patch<dim - 1, dim>> const &
+    get_patches() const override
+    {
+      return patches;
+    }
   };
 
   /**
@@ -803,23 +827,21 @@ public:
   }
 
   /**
-   * The faces a weight vector selects, drawn as cell data.
+   * The faces a weight vector selects, drawn as a surface mesh of those faces.
    *
-   * A face is not a cell, and a field is drawn on cells, so what is written is the weight a cell
-   * *carries*: for every selected face, its weight is added to the cells on either side of it.
-   * Two fields come out -- the summed weight, and how many selected faces the cell touches -- and
-   * a cell touching none is zero. That is enough to see where in the domain ECSW put its
-   * quadrature, which is the question a picture of this is asked to answer.
+   * One cell per selected face -- a line in 2D, a quadrilateral in 3D -- carrying its weight.
+   * That is the object ECSW actually chose, so it is the object to draw: marking the cells on
+   * either side of a face answers a different question, and answers it twice over for a face
+   * whose neighbours are also selected.
    *
-   * Written on a piecewise-constant DG space rather than as DataOut cell data, because a face on
-   * a partition boundary is processed by one rank while the cell on its far side belongs to
-   * another. A plain per-cell array would drop that contribution -- DataOut writes only locally
-   * owned cells -- and the picture would depend on the partitioning. A distributed vector with
-   * compress(add) sends it to the owner instead, so one rank and four draw the same thing.
+   * deal.II has no "attach a number to a face" call. DataOutFaces draws faces but evaluates DoF
+   * *fields* on them, and there is no field here -- a weight is one number per face, belonging to
+   * no space. The way through is one level down: DataOutInterface asks only for patches, so each
+   * face is handed over as its own patch with a constant on it. Nothing is interpolated and no
+   * triangulation has to be built out of disconnected faces.
    *
-   * Written here rather than handed back as a vector because it is a different space from the
-   * velocity's: routing it through Python would mean wrapping a rank-local vector as a
-   * VectorArray for one plot.
+   * Rank-independent for free: matrix-free gives a shared face to exactly one rank, and that rank
+   * owns the interior cell, so every selected face is emitted exactly once.
    */
   std::string
   write_sampled_faces(std::vector<double> const & weights,
@@ -830,37 +852,11 @@ public:
                 dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
                                    std::to_string(weights.size()) + "."));
 
-    using CellVector = dealii::LinearAlgebra::distributed::Vector<double>;
-
     auto const &       matrix_free = pde_operator->get_matrix_free();
-    auto const &       velocity    = matrix_free.get_dof_handler(dof_index());
     unsigned int const lanes       = dealii::VectorizedArray<Number>::size();
-    unsigned int const n_inner     = matrix_free.n_inner_face_batches();
+    unsigned int const corners = dealii::GeometryInfo<dim - 1>::vertices_per_cell;
 
-    dealii::FE_DGQ<dim>     constants(0);
-    dealii::DoFHandler<dim> cells(velocity.get_triangulation());
-    cells.distribute_dofs(constants);
-
-    CellVector weight(cells.locally_owned_dofs(),
-                      dealii::DoFTools::extract_locally_relevant_dofs(cells),
-                      mpi_comm);
-    CellVector count(weight);
-
-    auto mark = [&](unsigned int const cell, double const value) {
-      // MatrixFree numbers cells by batch and lane; an unfilled lane reads as invalid.
-      if(cell == dealii::numbers::invalid_unsigned_int)
-        return;
-
-      auto const from = matrix_free.get_cell_iterator(cell / lanes, cell % lanes, dof_index());
-      typename dealii::DoFHandler<dim>::active_cell_iterator const at(
-        &cells.get_triangulation(), from->level(), from->index(), &cells);
-
-      std::vector<dealii::types::global_dof_index> index(1);
-      at->get_dof_indices(index);
-
-      weight[index[0]] += value;
-      count[index[0]] += 1.0;
-    };
+    SelectedFaces selection;
 
     for(unsigned int batch = 0; batch * lanes < weights.size(); ++batch)
       for(unsigned int lane = 0; lane < lanes; ++lane)
@@ -870,33 +866,38 @@ public:
           continue;
 
         auto const & info = matrix_free.get_face_info(batch);
+        unsigned int const cell = info.cells_interior[lane];
 
-        mark(info.cells_interior[lane], value);
-        if(batch < n_inner)
-          mark(info.cells_exterior[lane], value);
+        // MatrixFree numbers cells by batch and lane; an unfilled lane reads as invalid.
+        if(cell == dealii::numbers::invalid_unsigned_int)
+          continue;
+
+        auto const from = matrix_free.get_cell_iterator(cell / lanes, cell % lanes, dof_index());
+        auto const face = from->face(info.interior_face_no);
+
+        dealii::DataOutBase::Patch<dim - 1, dim> patch;
+        // A default-constructed patch carries no reference cell, and the VTU writer asks it how
+        // many vertices it has before anything else.
+        patch.reference_cell = dealii::ReferenceCells::get_hypercube<dim - 1>();
+        patch.n_subdivisions = 1;
+        patch.patch_index    = selection.patches.size();
+        patch.data.reinit(1, corners);
+
+        for(unsigned int corner = 0; corner < corners; ++corner)
+        {
+          patch.vertices[corner]  = face->vertex(corner);
+          patch.data(0, corner)   = value;
+        }
+
+        selection.patches.push_back(patch);
       }
-
-    for(auto * field : {&weight, &count})
-    {
-      field->compress(dealii::VectorOperation::add);
-      field->update_ghost_values();
-    }
 
     std::string const path =
       (directory.empty() or directory.back() == '/') ? directory : directory + "/";
 
     create_directories(path, mpi_comm);
 
-    dealii::DataOut<dim> data_out;
-    data_out.attach_dof_handler(cells);
-
-    // type_dof_data explicitly: on a degree-0 space there is one DoF per cell, so deal.II cannot
-    // tell DoF data from cell data by counting and refuses to guess.
-    data_out.add_data_vector(weight, "ecsw_weight", dealii::DataOut<dim>::type_dof_data);
-    data_out.add_data_vector(count, "ecsw_faces", dealii::DataOut<dim>::type_dof_data);
-    data_out.build_patches(*pde_operator->get_mapping());
-
-    return path + data_out.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+    return path + selection.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
   }
 
   /**

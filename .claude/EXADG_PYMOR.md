@@ -74,10 +74,12 @@ Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 | answers | `n_entities`, `set_weights`, `contributions`, `compiled` | `n_selected`, `projected`, `jacobian` |
 | when | offline — `contributions` walks the mesh | online — every residual and Jacobian |
 
-`SampledOperator::write_selection(directory, basename)` draws what the weights kept — for each
-selected face, its weight added to the cells on either side, on a **DG0 space** rather than as
-DataOut cell data, so a face on a partition boundary still reaches the rank owning the cell across
-it. `FullOrderMomentum.write_selection(filename)` dispatches it.
+`SampledOperator::write_selection(directory, basename)` draws what the weights kept: a **surface
+mesh of the selected faces**, one cell per face carrying its weight. deal.II has no "number on a
+face" API — `DataOutFaces` evaluates DoF *fields* on faces — so it derives from `DataOutInterface`
+and hands each face over as its own `Patch` (set `reference_cell`, or the writer aborts). Rank-
+independent for free: matrix-free gives a shared face to exactly one rank.
+`FullOrderMomentum.write_selection(filename)` dispatches it.
 
 `compiled()` does the pass; `set_weights` only records and invalidates, so a fit's discarded faces
 are never gathered. The compiled half is **not templated on a vector type** and is bound once in
