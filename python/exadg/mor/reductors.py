@@ -298,6 +298,22 @@ class FullOrderMomentum:
 
         return flat.reshape(-1, len(self.basis))
 
+    def detach(self):
+        """Drop the builder, keeping the compiled half. The reduced model becomes the deliverable.
+
+        Compiles first, because the builder is what knows how. Afterwards this momentum still
+        evaluates the residual and the Jacobian, but cannot be re-fitted, asked for training data
+        or asked to draw its selection -- and nothing it holds refers to the full-order model, so
+        the mesh, the matrix-free caches and the preconditioners can go.
+
+        Worth doing before timing a reduced solve as well as before shipping one: a co-resident
+        full-order model evicts the compiled arrays between calls, which costs more than the
+        arithmetic does.
+        """
+        self.compiled
+
+        self.builder = None
+
     def write_selection(self, filename):
         """Draw the faces the weights select, as a VTU/PVTU record, and return its path.
 
@@ -563,7 +579,15 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
        the solve is repeated once per rank. Only the active set is ever small, and only the active
        set needs gathering. See ``ExaDG ROM Next Steps.md`` in the vault for the architecture.
     """
+    import time
+
     from pymor.tools import mpi
+
+    # Timed in two halves because they answer different questions. Assembling walks the mesh once
+    # per training state and must scale with it; solving sees the mesh only as the width of the
+    # matrix, and would not grow with it if the candidates were distributed. Rank 0's clock, which
+    # is the whole of the fit since every rank does all of it.
+    started = time.perf_counter()
 
     n_faces = evaluator.n_entities
     local = np.vstack(
@@ -574,7 +598,11 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
     matrix = np.hstack(pieces)
     target = matrix.sum(axis=1)
 
+    assembled = time.perf_counter()
+
     weights = sparse_nnls(matrix, target, tolerance, max_entries)
+
+    solved = time.perf_counter()
 
     offset = sum(piece.shape[1] for piece in pieces[: mpi.rank]) if mpi.parallel else 0
     evaluator.set_weights(weights[offset : offset + n_faces].tolist())
@@ -583,6 +611,8 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
         (weights > 0.0).sum(),
         matrix.shape[1],
         np.linalg.norm(matrix @ weights - target) / np.linalg.norm(target),
+        assembled - started,
+        solved - assembled,
     ])
 
 
@@ -608,5 +638,9 @@ class ECSWMomentum(FullOrderMomentum):
         self.n_faces = int(fitted[0])
         self.n_candidates = int(fitted[1])
         self.training_residual = float(fitted[2])
+
+        # What the fit cost, split where the two halves scale differently. See local_ecsw_weights.
+        self.assembly_seconds = float(fitted[3])
+        self.nnls_seconds = float(fitted[4])
 
 

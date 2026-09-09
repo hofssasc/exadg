@@ -81,6 +81,20 @@ and hands each face over as its own `Patch` (set `reference_cell`, or the writer
 independent for free: matrix-free gives a shared face to exactly one rank.
 `FullOrderMomentum.write_selection(filename)` dispatches it.
 
+**Cost model, measured by `navier_stokes_scaling.py`** (degree 2, refinements 3–6, 64x in dofs):
+offline exponents `d log t / d log n` are FOM solve 0.89, POD 0.72, projection 0.85, ECSW data
+0.97 — and the ECSW **fit 0.60**, the known defect. Online: reduced solve 0.04, sampled S 0.07,
+S' 0.12.
+
+Two things make those online numbers honest, and both were found the hard way:
+- **Batches, not faces, are the unit of online work** — matrix-free evaluates 4–8 faces at once.
+  They go 15 → 23 → 27 → 27, *saturating* at the face count; per-batch cost is flat (1.56 → 1.19
+  µs). Wall clock at tens of µs otherwise looks like mesh dependence when it is batch growth.
+- **Detach before timing.** With the FOM co-resident its working set evicts the compiled arrays;
+  the *identical* work ran 38% slower at refinement 6 and unchanged at refinement 5.
+  `FullOrderMomentum.detach()` drops the builder, and using it moved the exponents from
+  0.13/0.17/0.17 to 0.04/0.07/0.12.
+
 `compiled()` does the pass; `set_weights` only records and invalidates, so a fit's discarded faces
 are never gathered. The compiled half is **not templated on a vector type** and is bound once in
 `core_bindings.cpp`'s module body, not per vector type. λ is reached through the static
@@ -151,6 +165,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ |
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
+| `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
 Legitimately rank-dependent: Stokes' last row and the NS residual sit at their solver's tolerance
