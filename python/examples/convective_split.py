@@ -42,6 +42,13 @@ Four things are checked, and the third is the one that changes how the tensor mu
 Run from the repository root::
 
     python python/examples/convective_split.py
+
+**Serial only**, unlike the other examples. It builds ``ForcedFOM2D`` directly rather than through
+``mpi_saddle_point_model``, because it probes the raw operator -- ``apply_convective``,
+``apply_stabilisation``, ``apply_trilinear`` -- and not a pyMOR model. A FOM constructor is
+collective, so under ``pymor.tools.mpi`` rank 0 would call it while the others sit in the event
+loop, and the run deadlocks. Every identity here is local to a face or a cell, so nothing it checks
+needs a partition; what a parallel run would add is coverage of faces on a partition boundary.
 """
 
 import numpy as np
@@ -181,9 +188,7 @@ def face_sum(upwind, snapshots):
     a boundary flux, a missing lane -- every weight fitted against it is wrong too, and nothing
     downstream would say so.
     """
-    upwind.set_weights([1.0] * upwind.n_faces)
-
-    print("\nsum over faces against N(u) - B(u, u)")
+    print(f"\nsum over {upwind.n_faces} faces against N(u) - B(u, u)")
     for i, u in enumerate(snapshots):
         exact = upwind.apply_convective(u)
         exact.axpy(-1.0, upwind.apply_convective_central(u))

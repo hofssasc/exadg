@@ -48,17 +48,20 @@ residual, and neither depends on the mesh any more.
 Both are read off a ``SampledOperator`` the model hands out, which speaks *reduced coefficients*
 rather than velocity vectors. That is what makes the online cost independent of the mesh: given a
 vector it would have to reconstruct ``V a`` everywhere before looking at a dozen faces; given
-coefficients it combines the basis traces it stored on those faces when the weights were installed.
-Nothing mesh-sized is touched and no deal.II integrator is called::
+coefficients it combines basis traces gathered on the sampled faces when the weights were fitted.
+Those traces, the weights and the face geometry are all the evaluation needs, so they are split
+off into a ``CompiledOperator`` that holds no reference to the discretisation. Nothing mesh-sized
+is touched and no deal.II integrator is called::
 
     refinement   dofs   faces   kept    full     sampled   speed-up
-             3   1152     144     12   0.020 ms   0.007 ms     3.1x
-             4   4608     544     14   0.078 ms   0.008 ms     9.3x
-             5  18432    2112     13   0.292 ms   0.010 ms    29.5x
-             6  73728    8320     12   1.149 ms   0.007 ms   159.5x
+             3   1152     144     21   0.040 ms   0.018 ms     2.2x
+             4   4608     544     27   0.132 ms   0.026 ms     5.1x
+             5  18432    2112     27   0.501 ms   0.030 ms    16.6x
+             6  73728    8320     27   2.644 ms   0.029 ms    90.7x
 
-The sampled column is flat across a sixty-fourfold growth in degrees of freedom. That, rather than
-the speed-up, is the claim.
+The sampled column is flat across a sixty-fourfold growth in degrees of freedom, because the fit
+settles at 27 faces and stays there. That, rather than the speed-up, is the claim: the cost is set
+by the faces kept, and the faces kept are set by the rank of the term, not by the mesh.
 
 **One thing still scales with the mesh**: the weight fit is solved redundantly on every rank over a
 training matrix gathered whole. See the warning on ``local_ecsw_weights``, and the architecture in
@@ -85,8 +88,8 @@ from exadg.mor.models.saddle_point import mpi_saddle_point_model
 from exadg.mor.reductors import ECSWStokesReductor, TensorGalerkinStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes.json"
-DEGREE, REFINEMENTS = 2, 3
-N_TRAIN, N_TEST, N_MODES = 12, 4, 4
+DEGREE, REFINEMENTS = 2, 6
+N_TRAIN, N_TEST, N_MODES = 24, 4, 4
 AMPLITUDES = (0.5, 1.5)
 TOLERANCES = (1.0e-1, 1.0e-2, 1.0e-3)
 
@@ -116,7 +119,7 @@ def main():
 
     reference = TensorGalerkinStokesReductor(model, **bases)
     reference_rom = reference.reduce()
-    exact = worst_error(model, reference, reference_rom, test)
+    exact, _ = worst_error(model, reference, reference_rom, test)
 
     print(f"ranks              : {mpi.size}")
     print(f"velocity dofs      : {velocity.dim}")
@@ -129,6 +132,7 @@ def main():
         f"  {'faster':>8}"
     )
 
+    worst_mu = None
     for tolerance in TOLERANCES:
         reductor = ECSWStokesReductor(
             model, training_states=snapshots.blocks[0], tolerance=tolerance, **bases
@@ -136,7 +140,7 @@ def main():
         rom = reductor.reduce()
         momentum = rom.operator.momentum
 
-        error = worst_error(model, reductor, rom, test)
+        error, worst_mu = worst_error(model, reductor, rom, test)
         print(
             f"  {tolerance:>9.0e}  {momentum.n_faces:>4d}/{momentum.n_candidates:<4d}  "
             f"{momentum.n_batches:>8d}  {momentum.training_residual:>9.2e}  {error:>11.4e}  "
@@ -144,6 +148,14 @@ def main():
         )
 
         assert error < 2.0 * exact, "sampling the stabilisation changed the answer"
+
+        U_fom = model.solve(worst_mu)
+        U_rom = reductor.reconstruct(rom.solve(worst_mu))
+        model.visualize(
+            (U_fom, U_rom, U_fom - U_rom),
+            legend=("fom", "rom", "error"),
+            filename=f"output/pymor/navier_stokes_ecsw_{tolerance:.0e}",
+        )
 
     print(
         "\nThe stabilisation is reproduced from a small fraction of the faces without moving the\n"
@@ -160,8 +172,8 @@ def main():
 def speed_up(exact_momentum, sampled_momentum, repeats=20):
     """How much cheaper one reduced stabilisation is than the same one over every face.
 
-    Modest at this size and growing with the mesh -- see the table in the module docstring. The
-    remaining floor is the reconstruction of V a, which is still a full-order operation.
+    Both go through a compiled operator, so this compares two array traversals of different
+    lengths: the sampled one is flat in the mesh, and the ratio grows with it.
     """
     coefficients = np.zeros(len(exact_momentum.basis))
     coefficients[0] = 1.0
@@ -181,13 +193,15 @@ def worst_error(model, reductor, rom, test):
     product = model.products["mixed"]
 
     worst = 0.0
+    worst_mu = None
     for mu in test:
         U = model.solve(mu)
-        worst = max(
-            worst, (U - reductor.reconstruct(rom.solve(mu))).norm(product)[0] / U.norm(product)[0]
-        )
+        error = (U - reductor.reconstruct(rom.solve(mu))).norm(product)[0] / U.norm(product)[0]
+        if error > worst:
+            worst = error
+            worst_mu = mu
 
-    return worst
+    return worst, worst_mu
 
 
 if __name__ == "__main__":

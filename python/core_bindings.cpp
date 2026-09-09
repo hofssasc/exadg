@@ -246,11 +246,9 @@ register_vector_type(py::module_ & module, std::string const & prefix)
   py::class_<SampledOperator<V>, std::shared_ptr<SampledOperator<V>>>(
     module, (prefix + "SampledOperator").c_str())
     .def_property_readonly("n_entities", &SampledOperator<V>::n_entities)
-    .def_property_readonly("n_selected", &SampledOperator<V>::n_selected)
     .def("set_weights", &SampledOperator<V>::set_weights, py::arg("weights"))
     .def("contributions", &SampledOperator<V>::contributions, py::arg("coefficients"))
-    .def("projected", &SampledOperator<V>::projected, py::arg("coefficients"))
-    .def("jacobian", &SampledOperator<V>::jacobian, py::arg("coefficients"));
+    .def("compiled", &SampledOperator<V>::compiled);
 
   py::class_<Functional<V>, std::shared_ptr<Functional<V>>>(module,
                                                             (prefix + "Functional").c_str())
@@ -365,6 +363,13 @@ PYBIND11_MODULE(_core, module)
     .def("apply", &RestrictedOperator::apply, py::arg("source_values"))
     .def_property_readonly("active_components", &RestrictedOperator::active_components)
     .def("set_coefficients", &RestrictedOperator::set_coefficients, py::arg("coefficients"));
+
+  // Not templated on a vector type, and bound once: the evaluation half of a sampled operator is
+  // arrays and nothing else, which is the point of it having its own class.
+  py::class_<CompiledOperator, std::shared_ptr<CompiledOperator>>(module, "CompiledOperator")
+    .def_property_readonly("n_selected", &CompiledOperator::n_selected)
+    .def("projected", &CompiledOperator::projected, py::arg("coefficients"))
+    .def("jacobian", &CompiledOperator::jacobian, py::arg("coefficients"));
 
   register_vector_type<VectorType>(module, "");
 }

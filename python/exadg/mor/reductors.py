@@ -173,21 +173,26 @@ def local_sampled(model, basis, weights):
     return evaluator
 
 
+def local_compiled(builder):
+    """Compile one rank's builder into the evaluation half, which refers to no model."""
+    return builder.compiled()
+
+
 def local_evaluate(evaluator, method, coefficients):
     """Call one of the evaluator's methods on every rank. Its result is already summed over them."""
     return np.array(getattr(evaluator, method)(list(coefficients)))
 
 
-def local_selected(evaluator):
-    """Faces the evaluator visits, summed over ranks."""
+def local_selected(compiled):
+    """Faces the compiled operator visits, summed over ranks."""
     from pymor.tools import mpi
 
-    count = evaluator.n_selected
+    count = compiled.n_selected
 
     return np.array([mpi.comm.allreduce(count) if mpi.parallel else count])
 
 
-def _make_evaluator(model, basis, weights):
+def _make_builder(model, basis, weights):
     """One :class:`SampledOperator` per rank, addressed by ObjectId when there is more than one."""
     from pymor.tools import mpi
 
@@ -200,7 +205,20 @@ def _make_evaluator(model, basis, weights):
     )
 
 
-def _evaluate(model, evaluator, method, coefficients):
+def _compile(builder):
+    """Compile each rank's builder, keeping the result by ``ObjectId`` under MPI.
+
+    Reads the weights the builder currently holds, so it has to happen after they are installed.
+    """
+    from pymor.tools import mpi
+
+    if not mpi.parallel:
+        return local_compiled(builder)
+
+    return mpi.call(mpi.function_call_manage, local_compiled, builder)
+
+
+def _evaluate(evaluator, method, coefficients):
     """Ask every rank's evaluator, and take the answer -- which each of them reduced already."""
     from pymor.tools import mpi
 
@@ -219,17 +237,29 @@ def _evaluate(model, evaluator, method, coefficients):
 class FullOrderMomentum:
     """The stabilisation and its Jacobian, over every face.
 
-    Both are read off a :class:`SampledOperator` the model hands out, which owns the basis and the
-    weights. That ownership is the point: a reduced model and the one it is measured against hold
-    one evaluator each and cannot disturb one another.
+    Two halves, split by phase. The *builder* is a :class:`SampledOperator` the model hands out:
+    it owns the basis and the weights, and reaching a face means walking the mesh. Compiling it
+    gathers what the selected faces contribute -- weights, quadrature measures, normals, basis
+    traces -- into flat arrays, and the :class:`CompiledOperator` that holds them refers to
+    nothing else. Every online evaluation goes through that, so the discretisation is out of the
+    loop and its cost is set by the faces kept rather than by the mesh.
 
-    :class:`ECSWMomentum` differs only in the weights it installs.
+    Each momentum owns its pair, which is the point: a reduced model and the one it is measured
+    against cannot disturb one another. :class:`ECSWMomentum` differs only in the weights.
     """
 
     def __init__(self, model, basis, weights=None):
-        self.model = model
         self.basis = basis
-        self.evaluator = _make_evaluator(model, basis, weights)
+        self.builder = _make_builder(model, basis, weights)
+        self._compiled = None
+
+    @property
+    def compiled(self):
+        """The evaluation half, built when first asked for and dropped when the weights change."""
+        if self._compiled is None:
+            self._compiled = _compile(self.builder)
+
+        return self._compiled
 
     @property
     def n_batches(self):
@@ -239,11 +269,11 @@ class FullOrderMomentum:
         batch costs the same as selecting all of them. Faces kept is the size of the fit; this is
         the size of the work.
         """
-        return int(_evaluate(self.model, self.evaluator, "n_selected", ()))
+        return int(_evaluate(self.compiled, "n_selected", ()))
 
     def stabilisation(self, coefficients):
         """``V^T sum_f w_f S_f(V a)``."""
-        return _evaluate(self.model, self.evaluator, "projected", coefficients)
+        return _evaluate(self.compiled, "projected", coefficients)
 
     def stabilisation_jacobian(self, coefficients):
         """``V^T (sum_f w_f S'_f(V a)) V``.
@@ -255,11 +285,11 @@ class FullOrderMomentum:
         """
         r = len(self.basis)
 
-        return _evaluate(self.model, self.evaluator, "jacobian", coefficients).reshape(r, r)
+        return _evaluate(self.compiled, "jacobian", coefficients).reshape(r, r)
 
     def contributions(self, coefficients):
         """``V^T S_f(V a)`` for every face, shape ``(n_faces, r)``. Offline: it touches the mesh."""
-        flat = _evaluate(self.model, self.evaluator, "contributions", coefficients)
+        flat = _evaluate(self.builder, "contributions", coefficients)
 
         return flat.reshape(-1, len(self.basis))
 
@@ -536,9 +566,9 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
 class ECSWMomentum(FullOrderMomentum):
     """:class:`FullOrderMomentum` with the stabilisation restricted to a weighted set of faces.
 
-    A drop-in: same two methods, same shapes. Only ``stabilisation`` changes -- the Jacobian is
-    still assembled at full order, so this is a statement about the residual and not yet a
-    speed-up. Sampling the Jacobian is the next step and reuses the same weights.
+    A drop-in: same methods, same shapes. Only the weights differ, and residual and Jacobian are
+    both evaluated over the faces they keep -- a frozen lambda makes ``S'`` a linear face operator
+    over the same faces, so one fit serves both.
     """
 
     def __init__(self, model, basis, states, tolerance=1.0e-2, max_entries=None):
@@ -546,7 +576,7 @@ class ECSWMomentum(FullOrderMomentum):
 
         from pymor.tools import mpi
 
-        arguments = (self.evaluator, [list(state) for state in states], tolerance, max_entries)
+        arguments = (self.builder, [list(state) for state in states], tolerance, max_entries)
         fitted = (
             local_ecsw_weights(*arguments) if not mpi.parallel
             else mpi.call(mpi.function_call, local_ecsw_weights, *arguments)

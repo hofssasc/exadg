@@ -805,7 +805,21 @@ public:
     scalar
     calculate_lambda(scalar const & uM_n, scalar const & uP_n) const
   {
-    return data.upwind_factor * 2.0 * std::max(std::abs(uM_n), std::abs(uP_n));
+    return lambda_of(data.upwind_factor, uM_n, uP_n);
+  }
+
+  /**
+   * The same quantity without a kernel to hold it.
+   *
+   * A hyper-reduced model evaluates this term long after the matrix-free machinery is gone, and a
+   * second copy of the formula would be a second definition of the stabilisation. Static so that
+   * the definition stays here, where the flux that uses it lives.
+   */
+  static inline DEAL_II_ALWAYS_INLINE //
+    scalar
+    lambda_of(double const upwind_factor, scalar const & uM_n, scalar const & uP_n)
+  {
+    return upwind_factor * 2.0 * std::max(std::abs(uM_n), std::abs(uP_n));
   }
 
   /*

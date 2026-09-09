@@ -66,6 +66,20 @@ mechanism that stabilises under-resolved flow, so it cannot be dropped.
 `B` is projected exactly; `S` is sampled on a weighted subset of faces. The same weights serve the
 Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 
+`S` is sampled through **two objects split by phase**, and the split is load-bearing:
+
+| | `SampledOperator<VectorType>` (builder) | `CompiledOperator` |
+|---|---|---|
+| holds | the FOM, the basis, the weights | arrays: weights, `JxW`, normals, lifts, basis traces; a comm; the upwind factor |
+| answers | `n_entities`, `set_weights`, `contributions`, `compiled` | `n_selected`, `projected`, `jacobian` |
+| when | offline — `contributions` walks the mesh | online — every residual and Jacobian |
+
+`compiled()` does the pass; `set_weights` only records and invalidates, so a fit's discarded faces
+are never gathered. The compiled half is **not templated on a vector type** and is bound once in
+`core_bindings.cpp`'s module body, not per vector type. λ is reached through the static
+`ConvectiveKernel::lambda_of`, so nothing on the online path holds a kernel — or a mesh.
+`FullOrderMomentum` in `reductors.py` mirrors this: `self.builder`, and a lazy `compiled` property.
+
 ## Rules that are load-bearing
 
 1. **Nothing is assumed.** Symmetry, invertibility, a restricted evaluation — each defaults to
@@ -119,14 +133,20 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `thermal_block_ei.py` | the restriction contract through pyMOR's own call path |
 | `stokes_rb.py` | adjoint identity, block system vs ExaDG's solve, exactness at $P$ modes |
 | `navier_stokes_rb.py` | the nonlinear path |
-| `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ |
+| `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ — **serial only** |
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
 Legitimately rank-dependent: Stokes' last row and the NS residual sit at their solver's tolerance
-floor; `thermal_block_ei`'s first row is a singular reduced operator that raises on one rank and
-returns ~1e17 on four.
+floor; `navier_stokes_tensor`'s `tensor vs Galerkin` is a cancellation and sits at roundoff (4e-16
+on one rank, 7e-13 on four); `thermal_block_ei`'s first row is a singular reduced operator that
+raises on one rank and returns ~1e17 on four.
+
+`convective_split.py` cannot run under `pymor.tools.mpi` at all: it constructs `ForcedFOM2D`
+directly, and a FOM constructor is collective, so rank 0 blocks while the others wait in the event
+loop. Porting it would mean dispatching a dozen raw operator calls per rank — worth doing for the
+partition-boundary coverage it would add, but it is not a regression.
 
 ## Known defects, not yet fixed
 
@@ -137,8 +157,8 @@ bounds the size of problem that can be trained rather than the cost of a reduced
 
 The architecture for the fix is in
 `~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**
-Two defects listed there are now fixed: the evaluator owns its basis and weights (no tokens), and
-it speaks reduced coefficients (no full-order reconstruction).
+Three defects listed there are now fixed: the evaluator owns its basis and weights (no tokens), it
+speaks reduced coefficients (no full-order reconstruction), and it is detached from the model.
 
 ## Vault
 

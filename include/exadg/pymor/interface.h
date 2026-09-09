@@ -57,6 +57,7 @@ namespace PyMOR
  *   OperatorCoupled's block system     SaddlePointModel                 a velocity/pressure problem
  *   cell matrices from FEValues        RestrictedOperator               you want empirical interpolation
  *   a residual summed over faces/cells SampledOperator                  you want ECSW
+ *   -- (the arrays it compiles to)     CompiledOperator                 with SampledOperator
  *   a functional of the solution       Functional                       the model has outputs
  *
  * Two rules run through the file.
@@ -223,6 +224,36 @@ public:
 };
 
 /**
+ * The evaluation half of a SampledOperator: arrays, and nothing else.
+ *
+ * Deliberately **not** templated on a vector type, because it has no use for one. Once the
+ * weights are installed the sampled operator is a fixed quantity of data -- weights, quadrature
+ * measures, normals, the basis traces on the entities that survived -- and evaluating it is
+ * arithmetic on that data. It needs no mesh, no MatrixFree, no DoFHandler and no solver.
+ *
+ * Splitting it out is what makes a reduced model a deliverable rather than a view onto a resident
+ * full-order one. Held on its own, it can be moved, kept after the model is destroyed, and (once
+ * its arrays are gathered) evaluated on one rank with no communication at all.
+ */
+class CompiledOperator
+{
+public:
+  virtual ~CompiledOperator() = default;
+
+  /// Entities the installed weights visit.
+  virtual std::size_t
+  n_selected() const = 0;
+
+  /// V^T sum_e w_e R_e(V a), length r.
+  virtual std::vector<double>
+  projected(std::vector<double> const & coefficients) const = 0;
+
+  /// V^T (sum_e w_e R'_e(V a)) V, row-major (r, r).
+  virtual std::vector<double>
+  jacobian(std::vector<double> const & coefficients) const = 0;
+};
+
+/**
  * An operator evaluated as a weighted sum over a few mesh entities, for hyper-reduction.
  *
  * The object a reduced model needs once its residual is too nonlinear to project exactly. An
@@ -251,13 +282,19 @@ public:
   virtual std::size_t
   n_entities() const = 0;
 
-  /// Entities the current weights actually visit.
-  virtual std::size_t
-  n_selected() const = 0;
-
   /// Install one weight per entity. Zero means "do not evaluate".
   virtual void
   set_weights(std::vector<double> const & weights) = 0;
+
+  /**
+   * The evaluation half, holding no reference to this model.
+   *
+   * Compiling reads the installed weights and gathers what the entities they select contribute,
+   * so it costs a pass over those entities and is invalidated by set_weights(). Keep the result
+   * and drop everything else: it is the whole of what a reduced model needs at run time.
+   */
+  virtual std::shared_ptr<CompiledOperator>
+  compiled() = 0;
 
   /**
    * V^T R_e(V a) for **every** entity, row-major (n_entities, r).
@@ -269,13 +306,6 @@ public:
   virtual std::vector<double>
   contributions(std::vector<double> const & coefficients) = 0;
 
-  /// V^T sum_e w_e R_e(V a), length r.
-  virtual std::vector<double>
-  projected(std::vector<double> const & coefficients) = 0;
-
-  /// V^T (sum_e w_e R'_e(V a)) V, row-major (r, r).
-  virtual std::vector<double>
-  jacobian(std::vector<double> const & coefficients) = 0;
 };
 
 /**
