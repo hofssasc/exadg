@@ -228,6 +228,8 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `navier_stokes_transient.py` | BDF coefficients and rates, s=0 vs steady, relaxation, step cost |
+| `navier_stokes_transient_rom.py` | HAPOD over (mu,t), ECSW over trajectories, the row sketch |
+| `navier_stokes_streaming.py` | the offline phase holding no snapshots: same fit, 26 vectors vs 396 |
 | `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 

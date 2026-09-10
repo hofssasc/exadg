@@ -51,11 +51,11 @@ velocity and pressure have different scales and a shared absolute tolerance woul
 things to each.
 
 .. note::
-   HAPOD can also **stream**: ``inc_hapod`` takes an iterable, so trajectories can be solved as it
-   asks for them and never all held at once. That is not free here and the example does not do it
-   -- ECSW needs the same states again once the basis exists, so streaming trades a second pass of
-   full-order solves (73.8 s against 0.03 s at this size) for the snapshot storage it avoids.
-   Worth it when memory is tighter than compute, which at refinement 6 in 3D it will be.
+   **This script keeps every trajectory**, which is what makes it readable and what stops it
+   scaling: 24 parameters at 641 levels and refinement 6 is nine gigabytes. It does not have to be
+   that way -- ``navier_stokes_streaming.py`` builds the same reduced model without ever holding a
+   snapshot, by carrying each level's coefficients through the basis updates instead of projecting
+   at the end. The fit it produces differs by a face or two and by 0.12 % in the reduced error.
 
 **The ECSW training matrix grows in its rows, not its columns.** ``G`` is
 ``(n_states * r) x n_faces``: refining the mesh widens it, and stepping in time lengthens it.
@@ -116,7 +116,7 @@ from exadg.mor.reductors import (
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes_transient.json"
 DEGREE, REFINEMENTS = 2, 3
 T, NT, ORDER = 4.0, 32, 2
-N_TRAIN, N_TEST = 6, 2
+N_TRAIN, N_TEST = 40, 4
 AMPLITUDES = (0.5, 1.5)
 SKETCHES = (None, 128, 32)
 TOLERANCE = 1.0e-2
