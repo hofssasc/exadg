@@ -7,3 +7,5 @@ build/
 programs/
 *exadg_revision.h
 output/
+__pycache__/
+*.pyc

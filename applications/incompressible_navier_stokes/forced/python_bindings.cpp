@@ -490,16 +490,25 @@ public:
   //  PyMOR::SaddlePointModel
   // ===========================================================================================
 
+  /**
+   * The velocity space -- the *same* object for as long as anyone holds it.
+   *
+   * Handing out a fresh space per call would be simpler and is wrong in a way that only shows up
+   * later: pyMOR compares vector spaces by the identity of what they wrap, so two models built
+   * over one discretisation would disagree about their own vectors, and a transient model could
+   * not be compared against the steady one it relaxes to. Cached weakly rather than owned, so
+   * that the model does not keep its spaces alive and the spaces do not keep the model alive.
+   */
   std::shared_ptr<PyMOR::Space<VectorType>>
   velocity_space() override
   {
-    return std::make_shared<VelocitySpace>(shared_self());
+    return cached<VelocitySpace>(velocity_space_cache);
   }
 
   std::shared_ptr<PyMOR::Space<VectorType>>
   pressure_space() override
   {
-    return std::make_shared<PressureSpace>(shared_self());
+    return cached<PressureSpace>(pressure_space_cache);
   }
 
   /// One group, holding the forcing amplitudes.
@@ -908,6 +917,20 @@ public:
   // a weight vector is indexed batch * lanes + lane. That numbering is local to a rank and to a
   // partitioning, which is fine while weights are trained and used in one run; saving them for a
   // different rank count would need a partition-independent name.
+
+  /// The one space of its kind, created on first use and re-created if it has been let go.
+  template<typename SpaceType>
+  std::shared_ptr<PyMOR::Space<VectorType>>
+  cached(std::weak_ptr<SpaceType> & slot)
+  {
+    if(auto existing = slot.lock())
+      return existing;
+
+    auto space = std::make_shared<SpaceType>(shared_self());
+    slot       = space;
+
+    return space;
+  }
 
   /// Number of face entities on this rank, interior and boundary.
   unsigned int
@@ -1835,6 +1858,10 @@ private:
   std::shared_ptr<OperatorCoupled<dim, Number>>     pde_operator;
 
   MassOperator<dim, 1, Number> pressure_mass;
+
+  // weak, so that model -> space -> model is not a cycle; see velocity_space()
+  std::weak_ptr<VelocitySpace> velocity_space_cache;
+  std::weak_ptr<PressureSpace> pressure_space_cache;
 
   // vectors handed to ExaDG that it may keep a pointer to; see owned()
   std::deque<VectorType> scratch;

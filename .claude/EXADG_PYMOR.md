@@ -73,6 +73,22 @@ the steady problem; `models/saddle_point.py` writes that down once as `STEADY`.
 and a FOM stepped by `TimeIntBDF` against a ROM stepped by pyMOR would be two discretisations rather
 than a measurement. The history reaches ExaDG inside `f`.
 
+`models/instationary_saddle_point.py` is that loop: `InstationarySaddlePointModel(InstationaryModel)`
+-- the same relation pyMOR's own `SaddlePointModel` has to `StationaryModel` -- plus `BDFTimeStepper`
+(orders 1 and 2 measured at 1.01 and 2.11). Each step is assembled as
+`LincombOperator([mass, A], [gamma_0/dt, 1])` and handed a solver: `ExaDGStepSolver` for the FOM,
+`None` for a ROM so pyMOR's Newton takes it. That is what makes "same scheme both sides" structural.
+
+The mass is `blockdiag(M, 0)`, so there is **no initial pressure argument** -- it would be
+annihilated -- and the BDF history is velocity alone. The handle route differs from the stationary
+model's: `local_fom(model)` reads `model.time_stepper.solver.fom`, because the block operator has no
+solver; what is inverted is the step.
+
+**Transient needs `SchurComplementPreconditioner::CahouetChabard`.** With `InverseMassMatrix` the
+cost per step *grows* with s (0.91x, 1.35x, 3.32x a steady solve at s = 2, 8, 32); with
+Cahouet-Chabard it falls (0.69x, 0.45x, 0.38x). The Schur complement tends to a pressure Laplacian
+scaled by 1/s, not a mass matrix.
+
 `velocity_mass()` is declared separately from `velocity_product()` even though `forced` returns the
 same handle: a velocity product may legitimately be the H1 product, and reading the time
 derivative's operator off the inner product would then be wrong without failing.
@@ -200,6 +216,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `convective_split.py` | the split is exact; the face sum adds up; the Jacobian's frozen λ |
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
+| `navier_stokes_transient.py` | BDF coefficients and rates, s=0 vs steady, relaxation, step cost |
 | `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 

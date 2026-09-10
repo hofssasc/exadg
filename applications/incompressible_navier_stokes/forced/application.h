@@ -348,10 +348,16 @@ private:
     this->param.multigrid_data_velocity_block.coarse_problem.solver =
       MultigridCoarseGridSolver::Chebyshev;
 
-    // For Stokes the Schur complement is spectrally equivalent to the pressure mass matrix
-    // scaled by the inverse viscosity, which is what this preconditioner applies.
+    // Steady: the Schur complement is spectrally equivalent to the pressure mass matrix scaled by
+    // the inverse viscosity, which is what InverseMassMatrix applies.
+    //
+    // Unsteady: it is not. The Schur complement of [[s M + A, B^T], [B, 0]] tends to
+    // -(1/s) B M^-1 B^T -- a pressure Laplacian scaled by 1/s -- as the step shrinks, so a mass
+    // matrix becomes a worse and worse approximation the finer the time step. Cahouet-Chabard is
+    // the sum of the two limits and is what that regime asks for.
     this->param.preconditioner_pressure_block =
-      SchurComplementPreconditioner::InverseMassMatrix;
+      is_unsteady() ? SchurComplementPreconditioner::CahouetChabard :
+                      SchurComplementPreconditioner::InverseMassMatrix;
 
     this->param.solver_info_data.interval_time_steps = 1;
   }

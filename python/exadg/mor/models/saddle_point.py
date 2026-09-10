@@ -446,7 +446,7 @@ def _handle(model, attribute, what):
 
     if handle is None:
         raise TypeError(
-            f"{model.name} carries no {what}: its operator's solver is "
+            f"{model.name} does not carry {what}: its operator's solver is "
             f"{type(solver).__name__}, so it was not built by exadg.mor.models.saddle_point."
         )
 
