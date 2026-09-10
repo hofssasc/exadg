@@ -63,6 +63,8 @@ from exadg.mor.models.saddle_point import (
     MPIExaDGSaddlePointVisualizer,
     exadg_model,
     exadg_models_id,
+    install_coefficients,
+    local_coefficient_names,
 )
 from exadg.mor.models.stationary import parameter_names
 
@@ -236,6 +238,11 @@ class ExaDGStepSolver(Solver):
 
         guess = None if initial_guess is None else _velocity_of(initial_guess).vectors[0].impl
 
+        # The parameter does reach the application after all, but only the part of it the
+        # application owns: a coefficient of the operator, which its Newton iteration reads from
+        # its own objects. The right-hand side is still taken from the vector pyMOR passes.
+        install_coefficients(self.fom, mu)
+
         velocities, pressures = [], []
         for i in range(len(f)):
             result = self.fom.solve(
@@ -290,10 +297,13 @@ def steps_for_cfl(model, cfl, T):
     return max(1, ceil(T / time_step_for_cfl(model, cfl)))
 
 
-def _local_step_solve(model, f, g, mass_scaling, time, guess):
+def _local_step_solve(model, f, g, mass_scaling, time, guess, coefficients):
     """Solve one step on every rank. Called through mpi.call, so arguments arrive as objects."""
     fom = exadg_model(model)
     velocity_space, pressure_space = model.operator.source.subspaces
+
+    for name, value in coefficients.items():
+        fom.set_coefficient(name, value)
 
     velocities, pressures = [], []
     for i in range(len(f)):
@@ -324,7 +334,7 @@ class MPIExaDGStepSolver(Solver):
     collective, so entering it on rank 0 alone hangs.
     """
 
-    def __init__(self, models_id, mass_scaling=0.0, time=0.0):
+    def __init__(self, models_id, coefficients=(), mass_scaling=0.0, time=0.0):
         self.__auto_init(locals())
 
     def at_step(self, mass_scaling, time):
@@ -334,10 +344,18 @@ class MPIExaDGStepSolver(Solver):
         from pymor.tools import mpi
 
         f, g = V.blocks
+
+        # Resolved here rather than inside the call: mu is rank 0's, and the names come from the
+        # model, so what crosses to the other ranks is a plain dict of numbers.
+        coefficients = {} if mu is None else {
+            name: float(mu[name][0]) for name in self.coefficients if name in mu
+        }
+
         pair = mpi.call(
             mpi.function_call_manage, _local_step_solve, self.models_id,
             f.impl.obj_id, g.impl.obj_id, self.mass_scaling, self.time,
             None if initial_guess is None else _velocity_of(initial_guess).impl.obj_id,
+            coefficients,
         )
 
         velocity_space, pressure_space = operator.source.subspaces
@@ -573,7 +591,14 @@ def mpi_instationary_saddle_point_model(module_name, class_name, *args, **kwargs
     stepper = model.time_stepper
     model = model.with_(
         time_stepper=BDFTimeStepper(
-            stepper.nt, order=stepper.order, solver=MPIExaDGStepSolver(models_id)
+            stepper.nt,
+            order=stepper.order,
+            solver=MPIExaDGStepSolver(
+                models_id,
+                # Asked of the application rather than read off the wrapped operator, whose
+                # blocks are no longer reachable once mpi_wrap_model has been through it.
+                coefficients=mpi.call(mpi.function_call, local_coefficient_names, models_id),
+            ),
         ),
         visualizer=MPIExaDGSaddlePointVisualizer(
             models_id, directory=model_kwargs.get("directory", "output/pymor")

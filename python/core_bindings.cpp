@@ -343,6 +343,17 @@ register_vector_type(py::module_ & module, std::string const & prefix)
          py::arg("mass_scaling"))
     .def("split_momentum", &SaddlePointModel<V>::split_momentum)
     .def("sampled_momentum", &SaddlePointModel<V>::sampled_momentum, py::arg("basis"))
+    .def("coefficients",
+         &SaddlePointModel<V>::coefficients,
+         "Names of the operator coefficients this model lets a caller set. The operator is "
+         "affine in each of them.")
+    .def("get_coefficient", &SaddlePointModel<V>::get_coefficient, py::arg("name"))
+    .def("set_coefficient",
+         &SaddlePointModel<V>::set_coefficient,
+         py::arg("name"),
+         py::arg("value"),
+         "Install a coefficient before evaluating or solving. The application's own solver reads "
+         "it from objects the Python layer does not own, so it has to be set rather than passed.")
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)

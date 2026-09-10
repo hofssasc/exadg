@@ -119,6 +119,13 @@ public:
    * operator no longer affine in the parameter. Viscosity is the coefficient the operator is
    * linear in, so a Reynolds sweep is an affine sweep.
    */
+  /** The Reynolds number is the parameter here, and the viscosity is how it is set. */
+  bool
+  viscosity_is_parameter() const override
+  {
+    return true;
+  }
+
   double
   reynolds_number() const
   {

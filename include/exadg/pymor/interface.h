@@ -633,6 +633,41 @@ public:
     return {};
   }
 
+  /**
+   * Coefficients of the operator that a caller may set, by name.
+   *
+   * A parameter carried by the right-hand side needs nothing here: velocity_rhs_components()
+   * gives its affine decomposition and the Python layer forms the combination itself, never
+   * telling the application which parameter it is solving at. A parameter that changes the
+   * *operator* cannot be handled that way. The residual, the Jacobian and the solve all belong to
+   * this application, and its Newton iteration reads the coefficient out of objects the Python
+   * layer does not own -- so the only way to solve at a new value is to install it first.
+   *
+   * The operator is expected to be affine in each coefficient declared here. That is what lets a
+   * reduced model project once per coefficient and assemble online, rather than reprojecting at
+   * every parameter value -- which would need the full-order operator and would be no reduction
+   * at all. An application that cannot honour this should not declare the coefficient.
+   */
+  virtual std::vector<std::string>
+  coefficients() const
+  {
+    return {};
+  }
+
+  virtual double
+  get_coefficient(std::string const & name) const
+  {
+    AssertThrow(false, dealii::ExcMessage("There is no coefficient named '" + name + "'."));
+
+    return 0.0;
+  }
+
+  virtual void
+  set_coefficient(std::string const & name, double const /*value*/)
+  {
+    AssertThrow(false, dealii::ExcMessage("There is no coefficient named '" + name + "'."));
+  }
+
   /// A, the (1,1) block at this step's mass scaling: velocity in, velocity out.
   virtual std::shared_ptr<LinearOperator<VectorType>>
   momentum(double mass_scaling) = 0;

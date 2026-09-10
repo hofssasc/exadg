@@ -67,12 +67,17 @@ from pymor.algorithms.gram_schmidt import gram_schmidt
 from pymor.models.basic import StationaryModel
 from pymor.operators.interface import Operator
 from pymor.operators.numpy import NumpyMatrixOperator
+from pymor.parameters.base import Mu
 from pymor.reductors.basic import ProjectionBasedReductor
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.vectorarrays.constructions import cat_arrays
 from pymor.vectorarrays.numpy import NumpyVectorSpace
 
-from exadg.mor.models.saddle_point import exadg_model, exadg_models_id
+from exadg.mor.models.saddle_point import (
+    exadg_model,
+    exadg_models_id,
+    local_coefficient_names,
+)
 
 
 def dispatch(model, function, basis, *args):
@@ -155,14 +160,32 @@ def convective_tensor(split, basis):
     return tensor, linear, constant
 
 
-def local_momentum_blocks(model, basis):
-    """The three pieces of the momentum block, on one rank.
+def local_momentum_blocks(model, basis, coefficient=None, value=None, polynomial=True):
+    """The momentum block's pieces at one operator coefficient, on one rank.
 
-    Returns ``(tensor, viscous, constant)``: the convective tensor, the affine block beside it,
-    and that block's value at zero. Both halves of the subtraction come from the model's declared
-    ``SplitOperator``; nothing here names a convective operator.
+    Returns a dict of projections, not an assembled block: which pieces move with the coefficient
+    and which do not is the caller's business, and assembling here would hide it.
+
+        tensor, linear, quadratic_constant   the polynomial half, from :func:`convective_tensor`
+        coupled                              ``<phi_i, (A - N)(phi_j)>``
+        coupled_at_zero                      ``<phi_i, (A - N)(0)>``
+
+    ``A - N`` is what is left of the momentum operator once the whole nonlinear term is removed.
+    It is affine in the velocity, so those last two settle it -- and ``N(0)`` is evaluated rather
+    than assumed to vanish, because a flow driven through an inhomogeneous Dirichlet boundary has
+    a convective flux at zero velocity and a body-force problem does not.
+
+    ``coefficient`` names an operator coefficient to install first; the caller varies it to
+    recover the affine decomposition. It is installed on the application rather than passed as a
+    parameter because that is where the application reads it from; see
+    :func:`~exadg.mor.models.saddle_point.install_coefficients`. ``polynomial=False`` skips the
+    tensor, which no coefficient moves, so a second probe pays only for the half that does.
     """
-    split = exadg_model(model).split_momentum()
+    fom = exadg_model(model)
+    if coefficient is not None:
+        fom.set_coefficient(coefficient, value)
+
+    split = fom.split_momentum()
     momentum = model.operator.blocks[0, 0]
 
     if split is None:
@@ -176,30 +199,126 @@ def local_momentum_blocks(model, basis):
             [basis.space.make_vector(split.apply(v.impl)) for v in vectors]
         )
 
-    tensor, linear, quadratic_constant = convective_tensor(split, basis)
-
-    # Everything the tensor does not represent, collected into one block:
-    #
-    #     M(v) = A(v) - N(v) + Q(v) - B(v, v)
-    #
-    # A - N is what is left of the momentum operator once the whole nonlinear term is removed,
-    # and Q - B is the part of the polynomial half that is not quadratic. Both are affine in the
-    # velocity, so r + 1 evaluations determine M, and the reduced residual
-    # B(a, a) + M(a) + S(a) is then exactly the projected full-order one.
-    #
-    # N(0) is evaluated rather than assumed to vanish: a flow driven through an inhomogeneous
-    # Dirichlet boundary has a convective flux at zero velocity and a body-force problem does not.
-    # Only (A - N)(0) is subtracted off the columns, never the whole constant -- c is already
-    # absent from `linear`, and taking it out again per column would leave it weighted by the sum
-    # of the reduced coefficients rather than by one, which cancels at exactly one point of the
-    # reduced space. Every correction here is identically zero for the homogeneous case.
     zero = basis.space.zeros(1)
-    at_zero = basis.inner(momentum.apply(zero) - nonlinear(zero.vectors)).ravel()
+    mu = None if coefficient is None else Mu(**{coefficient: value})
 
-    constant = at_zero + quadratic_constant
-    viscous = basis.inner(momentum.apply(basis) - nonlinear(basis.vectors)) + linear - at_zero[:, None]
+    blocks = dict(
+        coupled=basis.inner(momentum.apply(basis, mu=mu) - nonlinear(basis.vectors)),
+        coupled_at_zero=basis.inner(momentum.apply(zero, mu=mu) - nonlinear(zero.vectors)).ravel(),
+    )
 
-    return tensor, viscous, constant
+    if polynomial:
+        tensor, linear, quadratic_constant = convective_tensor(split, basis)
+        blocks.update(tensor=tensor, linear=linear, quadratic_constant=quadratic_constant)
+
+    return blocks
+
+
+def assemble_momentum_blocks(blocks, polynomial=None):
+    """``(viscous, constant)`` from one probe's projections.
+
+    Everything the tensor does not represent, collected into one block:
+
+        M(v) = A(v) - N(v) + Q(v) - B(v, v)
+
+    affine in ``v``, so ``r + 1`` evaluations determine it and the reduced residual
+    ``B(a, a) + M(a) + S(a)`` is exactly the projected full-order one.
+
+    Only ``(A - N)(0)`` is subtracted off the columns, never the whole constant: ``c`` is already
+    absent from ``linear``, and taking it out again per column would leave it weighted by the sum
+    of the reduced coefficients rather than by one -- which cancels at exactly one point of the
+    reduced space, so a model checked only at its training parameter would look right.
+
+    ``polynomial`` supplies the coefficient-free half for a probe that skipped it. Pass None to
+    leave it out entirely, which is what a *slope* wants: it cancels in the difference.
+    """
+    viscous = blocks["coupled"] - blocks["coupled_at_zero"][:, None]
+    constant = blocks["coupled_at_zero"]
+
+    if polynomial is not None:
+        linear, quadratic_constant = polynomial
+        viscous = viscous + linear
+        constant = constant + quadratic_constant
+
+    return viscous, constant
+
+
+def affine_momentum_blocks(fom, velocity):
+    """The momentum block as an affine function of the application's operator coefficient.
+
+    Returns ``(tensor, viscous, constant, coefficient)``, where ``viscous`` and ``constant`` are
+    each a pair ``(base, slope)`` to be read as ``base + value * slope``, and ``coefficient`` is
+    the parameter's name or ``None`` if the application declares none.
+
+    The decomposition is recovered by probing rather than derived, and this is deliberate. That
+    the momentum operator is affine in the coefficient is a property of the application's
+    discretisation -- for a viscosity it holds because the interior penalty parameter is geometric
+    and every viscous flux carries the viscosity as a factor, measured at 1.9e-14 -- but reading
+    the decomposition off that reasoning would mean this function knowing which term is which and
+    what the boundary condition contributes to each. Two probes and a difference need to know
+    none of it, and are exact for anything genuinely affine.
+
+    The probes are at 0 and 1, so the base and the slope are each read rather than extrapolated,
+    and only the first pays for the tensor. The application is left at the value it arrived with:
+    two models can share one discretisation, and a probe that changed it would move the other.
+    """
+    names = dispatch(fom, local_coefficients, velocity)
+
+    if not names:
+        blocks = dispatch(fom, local_momentum_blocks, velocity)
+        polynomial = (blocks["linear"], blocks["quadratic_constant"])
+        viscous, constant = assemble_momentum_blocks(blocks, polynomial)
+
+        return blocks["tensor"], (viscous, None), (constant, None), None
+
+    if len(names) > 1:
+        raise NotImplementedError(
+            f"the application declares {len(names)} operator coefficients {list(names)}; the "
+            f"reduced momentum block is assembled from one"
+        )
+
+    coefficient = names[0]
+    original = dispatch(fom, local_get_coefficient, velocity, coefficient)
+    try:
+        base = dispatch(fom, local_momentum_blocks, velocity, coefficient, 0.0)
+        unit = dispatch(fom, local_momentum_blocks, velocity, coefficient, 1.0, False)
+    finally:
+        dispatch(fom, local_set_coefficient, velocity, coefficient, original)
+
+    polynomial = (base["linear"], base["quadratic_constant"])
+    base_viscous, base_constant = assemble_momentum_blocks(base, polynomial)
+
+    # The polynomial half is coefficient-free, so it cancels in the slope and is left out of both
+    # sides of the difference rather than added to each.
+    slope_viscous, slope_constant = [
+        unit_block - base_block
+        for unit_block, base_block in zip(
+            assemble_momentum_blocks(unit), assemble_momentum_blocks(base)
+        )
+    ]
+
+    return (
+        base["tensor"],
+        (base_viscous, slope_viscous),
+        (base_constant, slope_constant),
+        coefficient,
+    )
+
+
+# The three below take ``basis`` only so that they can go through dispatch(), which addresses
+# the application on every rank. Reaching for exadg_model() here instead would work serially and
+# hang in parallel, which is the failure this indirection exists to prevent.
+def local_coefficients(model, basis):
+    """Names of the operator coefficients the application declares."""
+    return local_coefficient_names(model)
+
+
+def local_get_coefficient(model, basis, coefficient):
+    return exadg_model(model).get_coefficient(coefficient)
+
+
+def local_set_coefficient(model, basis, coefficient, value):
+    exadg_model(model).set_coefficient(coefficient, value)
 
 
 def local_sampled(model, basis, weights):
@@ -386,6 +505,10 @@ class FullOrderMomentum:
         return mpi.call(mpi.function_call, local_write_selection, *arguments)
 
 
+def _affine(blocks):
+    return blocks if isinstance(blocks, tuple) else (blocks, None)
+
+
 class ReducedSaddlePointOperator(Operator):
     """The projected block system, with the convective term contracted from its tensor.
 
@@ -397,23 +520,46 @@ class ReducedSaddlePointOperator(Operator):
 
     with ``C`` the convective tensor, ``K`` and ``c`` the viscous block and its constant part, and
     ``S`` supplied by a collaborator so that it can be hyper-reduced later.
+
+    ``K`` and ``c`` may each be a pair ``(base, slope)``, in which case they are affine in the
+    application's operator coefficient and the model is parametric in it. Nothing else is: the
+    tensor, the divergence and the stabilisation are all coefficient-free, the last of them
+    because a Lax-Friedrichs lambda is built from the velocity alone. So the whole parameter
+    dependence of the reduced system is two small dense matrices, assembled online at a cost
+    independent of the mesh -- which is the point of insisting the operator be affine in it.
     """
 
     linear = False
 
-    def __init__(self, tensor, viscous, constant, divergence, momentum, name="A_r"):
+    def __init__(self, tensor, viscous, constant, divergence, momentum, coefficient=None,
+                 name="A_r"):
         self.tensor = tensor
-        self.viscous = viscous
-        self.constant = constant
         self.divergence = divergence
         self.momentum = momentum
+        self.coefficient = coefficient
         self.name = name
+
+        # Each may arrive as a bare array or as a (base, slope) pair; only a pair is parametric.
+        self.viscous, self.viscous_slope = _affine(viscous)
+        self.constant, self.constant_slope = _affine(constant)
 
         self.n_velocity = tensor.shape[0]
         self.n_pressure = divergence.shape[0]
 
         self.source = self.range = NumpyVectorSpace(self.n_velocity + self.n_pressure)
-        self.parameters_own = {}
+        self.parameters_own = {} if coefficient is None else {coefficient: 1}
+
+    def _at(self, mu):
+        """The viscous block and the constant at this parameter."""
+        if self.coefficient is None:
+            return self.viscous, self.constant
+
+        value = float(mu[self.coefficient][0])
+
+        return (
+            self.viscous + value * self.viscous_slope,
+            self.constant + value * self.constant_slope,
+        )
 
     def _split(self, coefficients):
         return coefficients[: self.n_velocity], coefficients[self.n_velocity :]
@@ -421,14 +567,16 @@ class ReducedSaddlePointOperator(Operator):
     def apply(self, U, mu=None):
         assert U in self.source
 
+        viscous, constant = self._at(mu)
+
         images = []
         for column in U.to_numpy().T:
             a_u, a_p = self._split(column)
 
             velocity = (
                 np.einsum("ijk,j,k->i", self.tensor, a_u, a_u)
-                + self.viscous @ a_u
-                + self.constant
+                + viscous @ a_u
+                + constant
                 + self.momentum.stabilisation(a_u)
                 + self.divergence.T @ a_p
             )
@@ -447,10 +595,11 @@ class ReducedSaddlePointOperator(Operator):
 
         a_u, _ = self._split(U.to_numpy()[:, 0])
         n, n_u = self.source.dim, self.n_velocity
+        viscous, _ = self._at(mu)
 
         matrix = np.zeros((n, n))
         matrix[:n_u, :n_u] = (
-            self.viscous
+            viscous
             + 2.0 * np.einsum("ikj,k->ij", self.tensor, a_u)
             + self.momentum.stabilisation_jacobian(a_u)
         )
@@ -495,7 +644,7 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
         # mpi_wrap_model has already made collective.
         divergence = RB_p.inner(fom.operator.blocks[1, 0].apply(velocity))
 
-        tensor, viscous, constant = dispatch(fom, local_momentum_blocks, velocity)
+        tensor, viscous, constant, coefficient = affine_momentum_blocks(fom, velocity)
 
         operator = ReducedSaddlePointOperator(
             tensor=tensor,
@@ -503,6 +652,7 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
             constant=constant,
             divergence=divergence,
             momentum=self.build_momentum(velocity),
+            coefficient=coefficient,
         )
 
         return {

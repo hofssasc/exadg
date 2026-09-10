@@ -55,6 +55,25 @@ from exadg.mor.models.stationary import parameter_names
 STEADY = dict(mass_scaling=0.0, time=0.0)
 
 
+def install_coefficients(fom, mu):
+    """Push the operator coefficients this application owns onto it, from a parameter.
+
+    A parameter carried by the right-hand side never reaches the application at all: the model
+    holds its affine components and forms the combination itself, so ExaDG is only ever handed an
+    assembled vector. A parameter that changes the *operator* has to go the other way. The
+    residual, the Jacobian and the solve are the application's, and its Newton iteration reads the
+    coefficient out of objects this layer does not own, so the only way to evaluate at a value is
+    to install it first.
+
+    Called before every evaluation rather than when the parameter changes, because there is no
+    single place a change would pass through -- two models over one discretisation share the
+    application, and the last one to solve is the one whose value is installed.
+    """
+    for name in fom.coefficients():
+        if mu is not None and name in mu:
+            fom.set_coefficient(name, float(mu[name][0]))
+
+
 class ExaDGNonlinearMomentum(Operator):
     """A(u), the momentum block of a Navier-Stokes system.
 
@@ -77,11 +96,15 @@ class ExaDGNonlinearMomentum(Operator):
         self.name = name
 
         self.source = self.range = space
-        self.parameters_own = {}
+
+        # A coefficient the application holds is a parameter of this operator: it is what makes
+        # the momentum block, and with it the model, parametric in something other than a forcing.
+        self.parameters_own = {name: 1 for name in fom.coefficients()}
 
     def apply(self, U, mu=None):
         assert U in self.source
 
+        install_coefficients(self.fom, mu)
         zero_pressure = self.pressure_space.impl.zero_vector()
 
         return self.range.make_array([
@@ -101,6 +124,8 @@ class ExaDGNonlinearMomentum(Operator):
         residual.
         """
         assert len(U) == 1
+
+        install_coefficients(self.fom, mu)
 
         return ExaDGOperator(
             self.space,
@@ -176,6 +201,10 @@ class ExaDGCoupledSolver(Solver):
     def _solve(self, operator, V, mu, initial_guess):
         velocity_space, pressure_space = operator.source.subspaces
         f, g = V.blocks
+
+        # Only the part of the parameter the application owns; the right-hand side stays the
+        # vector pyMOR passed.
+        install_coefficients(self.fom, mu)
 
         blocks = _solve_blocks(self.fom, velocity_space, pressure_space, f, g)
 
@@ -350,11 +379,24 @@ def _pressure_rhs(space, fom):
     return _as_operator(space, pressure_rhs)
 
 
-def _local_coupled_solve(model, f, g):
+def _local_coupled_solve(model, f, g, coefficients):
     """Solve on every rank. Called through mpi.call, so the arguments arrive as local objects."""
     velocity_space, pressure_space = model.operator.source.subspaces
+    fom = model.operator.solver.fom
 
-    return _solve_blocks(model.operator.solver.fom, velocity_space, pressure_space, f, g)
+    for name, value in coefficients.items():
+        fom.set_coefficient(name, value)
+
+    return _solve_blocks(fom, velocity_space, pressure_space, f, g)
+
+
+def local_coefficient_names(model):
+    """Names of the operator coefficients the application owns, from a *rank-local* model.
+
+    Shaped for ``mpi.call``, and shared by everything that has to resolve a parameter before
+    dispatching a solve.
+    """
+    return list(exadg_model(model).coefficients())
 
 
 def _take(pair, index):
@@ -381,9 +423,18 @@ class MPIExaDGCoupledSolver(Solver):
         from pymor.tools import mpi
 
         f, g = V.blocks
+
+        # Resolved here rather than inside the call: mu is rank 0's, so a plain dict of numbers
+        # is what crosses to the other ranks.
+        coefficients = {} if mu is None else {
+            name: float(mu[name][0])
+            for name in mpi.call(mpi.function_call, local_coefficient_names, self.models_id)
+            if name in mu
+        }
+
         pair = mpi.call(
             mpi.function_call_manage, _local_coupled_solve, self.models_id,
-            f.impl.obj_id, g.impl.obj_id,
+            f.impl.obj_id, g.impl.obj_id, coefficients,
         )
 
         velocity_space, pressure_space = operator.source.subspaces

@@ -867,11 +867,70 @@ public:
     pde_operator->set_viscosity(viscosity);
   }
 
+  /*
+   * Whether the viscosity is a parameter of this study or a constant of it.
+   *
+   * The operator is affine in the viscosity either way -- that is a property of the
+   * discretisation, settled by set_viscosity() -- so this says nothing about what is possible and
+   * everything about what is being asked. Declaring it makes every solve carry a value for it, so
+   * an application whose parameters are elsewhere should leave this alone: a forced flow at a
+   * fixed Reynolds number gains nothing from a parameter it never varies, and would have to name
+   * one at every call.
+   */
+  virtual bool
+  viscosity_is_parameter() const
+  {
+    return false;
+  }
+
+  /*
+   * The viscosity, declared as an operator coefficient so that a reduced model can find it.
+   *
+   * It is the only one an incompressible flow has: the momentum operator is exactly affine in it
+   * and in nothing else it owns. The inflow is a boundary condition rather than a coefficient,
+   * and scaling that would rescale the convective term too.
+   */
+  std::vector<std::string>
+  coefficients() const override
+  {
+    if(not viscosity_is_parameter())
+      return {};
+
+    return {"viscosity"};
+  }
+
+  double
+  get_coefficient(std::string const & name) const override
+  {
+    check_coefficient(name);
+
+    return get_viscosity();
+  }
+
+  void
+  set_coefficient(std::string const & name, double const value) override
+  {
+    check_coefficient(name);
+
+    set_viscosity(value);
+  }
+
   double
   get_upwind_factor() const
   {
     return application->get_parameters().upwind_factor;
   }
+
+private:
+  static void
+  check_coefficient(std::string const & name)
+  {
+    AssertThrow(name == "viscosity",
+                dealii::ExcMessage("An incompressible flow has no coefficient named '" + name +
+                                   "'; the only one is 'viscosity'."));
+  }
+
+public:
 
   // ===========================================================================================
   //  The Lax-Friedrichs stabilisation, as a sum over faces
@@ -1307,8 +1366,9 @@ public:
           c.measure[k * n_q + q] = integrator_m.JxW(q);
 
           // the state-independent part of a boundary face's exterior value: with a mirror
-          // condition u_p = -u_m + 2g, this is the 2g. Zero on an interior face and, here, zero
-          // on every boundary face too -- but read rather than assumed.
+          // condition u_p = -u_m + 2g, this is the 2g. Zero on an interior face, and zero on a
+          // boundary face only where the data is homogeneous -- an inflow makes it the term that
+          // carries the prescribed velocity into lambda and into the flux.
           if(not interior)
             c.lift[k * n_q + q] = fom->exterior_value(
               q, integrator_m, face, FaceVector(), ExaDG::OperatorType::full);
