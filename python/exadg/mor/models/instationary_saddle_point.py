@@ -61,6 +61,7 @@ from exadg.mor.models.saddle_point import (
     ExaDGNonlinearMomentum,
     ExaDGSaddlePointVisualizer,
     MPIExaDGSaddlePointVisualizer,
+    exadg_model,
 )
 from exadg.mor.models.stationary import parameter_names
 
@@ -253,32 +254,9 @@ class ExaDGStepSolver(Solver):
         ]), {}
 
 
-def local_fom(model):
-    """The ExaDG handle behind a *rank-local* instationary model.
-
-    Not the same route as
-    :func:`~exadg.mor.models.saddle_point.exadg_model`, and the difference is the point: on the
-    stationary model the handle rides on the block operator's solver, because that operator is
-    what pyMOR inverts. Here the block operator has no solver at all -- what is inverted is the
-    *step*, ``gamma/dt M + A``, which the time stepper assembles and hands its own solver. So the
-    handle rides on the stepper.
-    """
-    solver = getattr(model.time_stepper, "solver", None)
-    fom = getattr(solver, "fom", None)
-
-    if fom is None:
-        raise TypeError(
-            f"{model.name} does not carry a local ExaDG model: its time stepper's solver is "
-            f"{type(solver).__name__}, so it was not built by "
-            f"exadg.mor.models.instationary_saddle_point."
-        )
-
-    return fom
-
-
 def _local_step_solve(model, f, g, mass_scaling, time, guess):
     """Solve one step on every rank. Called through mpi.call, so arguments arrive as objects."""
-    fom = local_fom(model)
+    fom = exadg_model(model)
     velocity_space, pressure_space = model.operator.source.subspaces
 
     velocities, pressures = [], []

@@ -81,8 +81,19 @@ than a measurement. The history reaches ExaDG inside `f`.
 
 The mass is `blockdiag(M, 0)`, so there is **no initial pressure argument** -- it would be
 annihilated -- and the BDF history is velocity alone. The handle route differs from the stationary
-model's: `local_fom(model)` reads `model.time_stepper.solver.fom`, because the block operator has no
-solver; what is inverted is the step.
+model's, and `exadg_model()` knows both: the stationary model keeps its solver on the block
+operator, the instationary one on the **time stepper**, because what is inverted is the step.
+
+`InstationaryTensorStokesReductor` / `InstationaryECSWStokesReductor` are a `_Instationary` mixin in
+front of the stationary reductors. They project `mass` and `initial_data` and build an
+`InstationaryModel` whose stepper is `fom.time_stepper.with_(solver=None)` -- that one substitution
+is the whole difference in how FOM and ROM are advanced. The reduced spatial operator is unchanged;
+the mass term stays *outside* it, because the stepper varies its coefficient.
+
+pyMOR asserts more than it needs: `SupremizerGalerkinStokesReductor.__init__` demands a
+`SaddlePointModel` (stationary by its own hierarchy) while only using two subspaces, `blocks[1,0]`
+and a velocity product. The mixin reproduces that setup and calls `ProjectionBasedReductor.__init__`
+directly.
 
 **Transient needs `SchurComplementPreconditioner::CahouetChabard`.** With `InverseMassMatrix` the
 cost per step *grows* with s (0.91x, 1.35x, 3.32x a steady solve at s = 2, 8, 32); with
@@ -232,10 +243,19 @@ matrix-free pads its face batches per rank (144 → 184 at four).
 every `projected()` / `jacobian()`, and nothing serialises. `detach()` drops the mesh, not the
 communicator.
 
-**The ECSW weight fit gathers the whole training matrix on every rank.** Not slow — 0.02–0.22 s at
-2D refinement 6, ~0.03% of offline wall time — but the memory is the wall: 1.2 GB for a transient 2D
-training set, 5.7 GB for steady 3D. Transient grows the *rows*, 3D the *columns*, and they need
-different treatments.
+**The ECSW weight fit still gathers the columns on every rank.** The *rows* are handled --
+`sketch_rows` streams a Gaussian sketch as the matrix is assembled, measured at a twelfth of the
+memory for the same fit over trajectories. The columns are not, and that is what a 3D mesh grows
+(5.7 GB per rank at 10^6 faces).
+
+**Never read a sketched fit's residual off its own sketch.** NNLS minimises over it, so the number
+is in-sample and biased low -- a six-row sketch reported 5e-16 while being 28% wrong. A second,
+independent sketch rides along in the same pass and is what gets reported; it tracks the truth to
+about 10% over four orders of magnitude. `local_ecsw_weights` warns when the support exceeds half
+the sketch.
+
+**Time-series output is still missing.** Both visualizers refuse a trajectory and `Space::write_vtu`
+has no time argument.
 
 Status, order and the architecture for each are in
 `~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**

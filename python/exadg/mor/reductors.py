@@ -67,6 +67,7 @@ from pymor.algorithms.gram_schmidt import gram_schmidt
 from pymor.models.basic import StationaryModel
 from pymor.operators.interface import Operator
 from pymor.operators.numpy import NumpyMatrixOperator
+from pymor.reductors.basic import ProjectionBasedReductor
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.vectorarrays.constructions import cat_arrays
 from pymor.vectorarrays.numpy import NumpyVectorSpace
@@ -512,6 +513,132 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
         return ECSWMomentum(self.fom, velocity, states, self.tolerance, self.max_entries,
                             sketch_rows=self.sketch_rows, audit_rows=self.audit_rows,
                             seed=self.seed)
+
+
+class _Instationary:
+    """The two extra pieces an instationary reduced model needs, and the model itself.
+
+    Mixed in front of a stationary reductor rather than subclassed from it, so that the tensor
+    and the hyper-reduced variants get it in the same way and neither has to know about the
+    other. ``super()`` therefore reaches the stationary ``project_operators``, which does all the
+    work that is not about time: the supremizer enrichment, the convective tensor, the viscous
+    block and the divergence.
+
+    What time adds is small, and that is the point of having carried the *step* through
+    ``interface.h`` rather than a time integrator. The spatial operator is unchanged -- the mass
+    term is not folded into it, because the stepper combines the two itself as
+    ``LincombOperator([mass, A], [gamma_0/dt, 1])`` and must be able to vary the coefficient.
+    """
+
+    def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
+                 check_orthonormality=None, check_tol=None):
+        """Set up the bases the way the stationary reductor does, without its type assertion.
+
+        ``SupremizerGalerkinStokesReductor.__init__`` asserts ``isinstance(fom, SaddlePointModel)``
+        -- which is a *stationary* model, by pyMOR's own class hierarchy. Its actual requirements
+        are weaker and an instationary saddle point meets all of them: a two-block solution space,
+        a (2,1) block to build supremizers from, and a velocity product to build them in. So the
+        setup is reproduced here rather than the model being dressed up as something it is not.
+        """
+        RB_u = fom.solution_space.subspaces[0].empty() if RB_u is None else RB_u
+        RB_p = fom.solution_space.subspaces[1].empty() if RB_p is None else RB_p
+
+        assert RB_u in fom.solution_space.subspaces[0]
+        assert RB_p in fom.solution_space.subspaces[1]
+
+        self.u_product = u_product
+        self.supremizers = fom.solution_space.subspaces[0].empty()
+
+        ProjectionBasedReductor.__init__(
+            self, fom, {"RB_u": RB_u, "RB_p": RB_p}, {"RB_u": u_product, "RB_p": p_product},
+            check_orthonormality=check_orthonormality, check_tol=check_tol,
+        )
+
+    def project_operators(self):
+        from pymor.algorithms.projection import project
+
+        projected = super().project_operators()
+        basis = self._block_basis
+
+        projected["mass"] = project(self.fom.mass, basis, basis)
+        projected["initial_data"] = project(self.fom.initial_data, basis, None)
+
+        self._check_mass(projected["mass"])
+
+        return projected
+
+    def _check_mass(self, mass):
+        """The reduced mass should be the identity on the velocity block. Verified, not assumed.
+
+        It is, because the enriched velocity basis is orthonormalised in ``u_product`` and this
+        application's ``u_product`` is the mass matrix. Both halves of that can change --
+        somebody orthonormalises in H1, or an application's velocity product stops being its mass
+        -- and neither would fail, they would just make the reduced time derivative wrong. So the
+        projection is done properly and the identity is checked rather than exploited.
+        """
+        n_u = self.rom_velocity_dimension()
+        block = mass.matrix[:n_u, :n_u]
+        deviation = np.abs(block - np.eye(n_u)).max()
+
+        if deviation > 1.0e-10:
+            self.logger.warning(
+                f"the reduced velocity mass deviates from the identity by {deviation:.2e}; the "
+                f"basis is not orthonormal in the mass product. Not an error -- the projected "
+                f"matrix is used either way -- but it means u_product is not the mass matrix."
+            )
+
+    def rom_velocity_dimension(self):
+        """Velocity modes after supremizer enrichment."""
+        return len(self.bases["RB_u"]) + len(self.supremizers)
+
+    def build_rom(self, projected_operators, error_estimator):
+        from pymor.models.basic import InstationaryModel
+
+        fom = self.fom
+
+        return InstationaryModel(
+            T=fom.T,
+            # The same stepper, minus the solver: a reduced step is a small dense system, so
+            # pyMOR's Newton takes it. That one substitution is the whole difference between how
+            # the two models are advanced, which is what makes them comparable.
+            time_stepper=fom.time_stepper.with_(solver=None),
+            num_values=fom.num_values,
+            error_estimator=error_estimator,
+            **projected_operators,
+        )
+
+
+class InstationaryTensorStokesReductor(_Instationary, TensorGalerkinStokesReductor):
+    """:class:`TensorGalerkinStokesReductor` over a trajectory rather than a steady state.
+
+    Same reduced spatial operator -- an exact convective tensor, the viscous block, and the
+    stabilisation over every face -- stepped by the full-order model's own scheme.
+    """
+
+
+class InstationaryECSWStokesReductor(_Instationary, ECSWStokesReductor):
+    """:class:`ECSWStokesReductor` over a trajectory.
+
+    The training states are now the states of trajectories, so there are ``n_steps`` times as many
+    of them as there are parameters and the fit's training matrix grows in its *row* dimension.
+    That is what ``sketch_rows`` is for; see :func:`local_ecsw_weights`.
+    """
+
+    def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
+                 training_states=None, tolerance=1.0e-2, max_entries=None, sketch_rows=None,
+                 audit_rows=64, seed=0, **kwargs):
+        # The ECSW settings are set here rather than through ECSWStokesReductor.__init__, because
+        # that one chains into the stationary base whose type assertion this class exists to
+        # sidestep. Same fields, same defaults; build_momentum is inherited and reads them.
+        _Instationary.__init__(self, fom, RB_u=RB_u, RB_p=RB_p, u_product=u_product,
+                               p_product=p_product, **kwargs)
+
+        self.training_states = training_states
+        self.tolerance = tolerance
+        self.max_entries = max_entries
+        self.sketch_rows = sketch_rows
+        self.audit_rows = audit_rows
+        self.seed = seed
 
 
 def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
