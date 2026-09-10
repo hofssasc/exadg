@@ -228,8 +228,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `navier_stokes_transient.py` | BDF coefficients and rates, s=0 vs steady, relaxation, step cost |
-| `navier_stokes_transient_rom.py` | HAPOD over (mu,t), ECSW over trajectories, the row sketch |
-| `navier_stokes_streaming.py` | the offline phase holding no snapshots: same fit, 26 vectors vs 396 |
+| `navier_stokes_transient_rom.py` | the streamed offline phase, timings, error to the FOM; `--chunks` / `--sketches` compare |
 | `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
@@ -280,6 +279,14 @@ compress often, ask for one decade more than you need.
 
 Still mesh-scale: `contributions()` walks the mesh once per training state. Streaming removes the
 storage and the second solve pass, not the face loops.
+
+**The three tolerances control different things.** `BASIS_TOLERANCE` is a *projection* error on
+the training snapshots, and the reduced error comes out 2.5-15x larger -- so a ROM error below 1e-2
+needs about 3e-3, below 1e-3 needs about 1e-4. `TOLERANCE` (ECSW) is nearly free to tighten: at a
+basis tolerance of 3e-4, going 1e-2 -> 3e-4 takes the fit from 38 faces to 89 and moves the ROM
+error by 0.02%. What *does* become visible below ~1e-3 is the **basis**: two compression routes
+meeting the same certified bound land on different subspaces, and the stored/streamed gap goes from
+0.3% to 8.8% -- with the streamed one ahead, so it is a difference and not a penalty.
 
 **Time series come out as a `.pvd`.** Both visualizers take a trajectory: one record per level plus
 a ParaView collection, `times=` optional. Written in Python -- `write_vtu_with_pvtu_record` appends a
