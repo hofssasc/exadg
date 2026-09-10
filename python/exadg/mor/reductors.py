@@ -471,6 +471,33 @@ class TensorGalerkinStokesReductor(SupremizerGalerkinStokesReductor):
         return StationaryModel(error_estimator=error_estimator, **projected_operators)
 
 
+def _check_training(states, coefficients):
+    if (states is None) == (coefficients is None):
+        raise ValueError(
+            "give exactly one of training_states (snapshots, projected here) or "
+            "training_snapshots (already projected, so no snapshot has to be kept)"
+        )
+
+
+def training_points(reductor, velocity):
+    """Where in the reduced space the weights are fitted, however the caller supplied the states.
+
+    From snapshots: ``V^T M u_i``, the projection of each onto the enriched space -- the basis is
+    orthonormal in ``u_product``, so that is all it takes.
+
+    From :class:`~exadg.mor.basis.CompressedSnapshots`: the same projection, evaluated as
+    ``(V^T M W_k) c`` against each trajectory's own basis. Snapshot-free, and it happens *here*
+    rather than in the caller for a reason worth stating -- ``velocity`` is the **enriched** basis,
+    and the supremizers in it are directions no velocity POD contains. A caller who projected onto
+    their own basis and handed over the numbers would be silently training in a subspace the
+    reduced model does not live in.
+    """
+    if reductor.training_snapshots is not None:
+        return reductor.training_snapshots.project(velocity, reductor.u_product)
+
+    return reductor.u_product.apply2(velocity, reductor.training_states).T
+
+
 class ECSWStokesReductor(TensorGalerkinStokesReductor):
     """:class:`TensorGalerkinStokesReductor` with the stabilisation hyper-reduced by ECSW.
 
@@ -484,6 +511,13 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
         training_states: Velocity snapshots to fit on. Their coefficients on the enriched basis
             are what the weights have to reproduce. For a transient model these are the states of
             whole trajectories, so there are many more of them than there are parameters.
+        training_snapshots: The same states, compressed -- a
+            :class:`~exadg.mor.basis.CompressedSnapshots`. Mutually exclusive with
+            ``training_states``, and the reason a streaming offline phase is possible at all: the
+            fit never needs a snapshot, only where in the reduced space to evaluate, and
+            ``SampledOperator::contributions`` reconstructs from the basis it already holds. With
+            snapshots this reductor projects them itself, which needs them kept or re-solved; with
+            compressed ones it projects those instead, at the same cost and none of the storage.
         tolerance: Relative residual at which the fit stops; larger means fewer faces.
         max_entries: Hard cap on the number of faces kept.
         sketch_rows: Fit on a Gaussian sketch of the training matrix's rows; see
@@ -493,12 +527,15 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
     """
 
     def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
-                 training_states=None, tolerance=1.0e-2, max_entries=None, sketch_rows=None,
-                 audit_rows=64, seed=0, **kwargs):
+                 training_states=None, training_snapshots=None, tolerance=1.0e-2,
+                 max_entries=None, sketch_rows=None, audit_rows=64, seed=0, **kwargs):
         super().__init__(fom, RB_u=RB_u, RB_p=RB_p, u_product=u_product, p_product=p_product,
                          **kwargs)
 
+        _check_training(training_states, training_snapshots)
+
         self.training_states = training_states
+        self.training_snapshots = training_snapshots
         self.tolerance = tolerance
         self.max_entries = max_entries
         self.sketch_rows = sketch_rows
@@ -506,13 +543,11 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
         self.seed = seed
 
     def build_momentum(self, velocity):
-        # The basis is orthonormal in u_product, so this is the projection of each snapshot onto
-        # the enriched space -- the states the reduced model will actually be evaluated near.
-        states = self.u_product.apply2(velocity, self.training_states).T
-
-        return ECSWMomentum(self.fom, velocity, states, self.tolerance, self.max_entries,
-                            sketch_rows=self.sketch_rows, audit_rows=self.audit_rows,
-                            seed=self.seed)
+        return ECSWMomentum(
+            self.fom, velocity, training_points(self, velocity), self.tolerance,
+            self.max_entries, sketch_rows=self.sketch_rows, audit_rows=self.audit_rows,
+            seed=self.seed,
+        )
 
 
 class _Instationary:
@@ -625,15 +660,18 @@ class InstationaryECSWStokesReductor(_Instationary, ECSWStokesReductor):
     """
 
     def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
-                 training_states=None, tolerance=1.0e-2, max_entries=None, sketch_rows=None,
-                 audit_rows=64, seed=0, **kwargs):
+                 training_states=None, training_snapshots=None, tolerance=1.0e-2,
+                 max_entries=None, sketch_rows=None, audit_rows=64, seed=0, **kwargs):
         # The ECSW settings are set here rather than through ECSWStokesReductor.__init__, because
         # that one chains into the stationary base whose type assertion this class exists to
         # sidestep. Same fields, same defaults; build_momentum is inherited and reads them.
         _Instationary.__init__(self, fom, RB_u=RB_u, RB_p=RB_p, u_product=u_product,
                                p_product=p_product, **kwargs)
 
+        _check_training(training_states, training_snapshots)
+
         self.training_states = training_states
+        self.training_snapshots = training_snapshots
         self.tolerance = tolerance
         self.max_entries = max_entries
         self.sketch_rows = sketch_rows

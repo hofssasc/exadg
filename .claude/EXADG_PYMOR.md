@@ -261,6 +261,24 @@ replicated, exactly like the ECSW fit. `inc_hapod` compresses trajectory by traj
 `eps` is absolute, so scale it by the rms snapshot norm. It can also stream, at the price of a
 second pass of FOM solves -- ECSW needs the same states once the basis exists.
 
+**The offline phase streams** -- `exadg/mor/basis.py`. The blocker was never ECSW: *any*
+hyper-reduction trains at `a_i = V^T M u_i`, and V is unknown until every trajectory is seen, so
+the naive ordering needs the snapshots twice (9 GB at production, or a second solve pass).
+Projection is linear, so coefficients are *carried* through each basis update -- `c' = (V^T M W) c`
+-- and no snapshot is ever needed. `streaming_basis` returns `CompressedSnapshots` and **not**
+coefficients on the global basis: supremizers are directions no velocity POD contains, so a
+projection made before the enrichment cannot be extended to it. The reductor takes it as
+`training_snapshots=`; `training_states=` is unchanged.
+
+Measured against keeping everything (6 trajectories x 33 levels): 26 vectors held against 396, the
+same basis dimensions, faces 18-21 against 18, and ROM error 3.9483e-02 against 3.9434e-02 -- 0.12%.
+The face selection *does* shift by a face or two and it does not matter. Accumulation over 129
+updates costs 7x the error for 21x less memory, and stays at the order of the tolerance asked for:
+compress often, ask for one decade more than you need.
+
+Still mesh-scale: `contributions()` walks the mesh once per training state. Streaming removes the
+storage and the second solve pass, not the face loops.
+
 **Time series come out as a `.pvd`.** Both visualizers take a trajectory: one record per level plus
 a ParaView collection, `times=` optional. Written in Python -- `write_vtu_with_pvtu_record` appends a
 counter of its own, and a collection makes the record names irrelevant. `float()` the timestep or

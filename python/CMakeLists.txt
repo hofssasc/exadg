@@ -47,7 +47,7 @@ EXADG_ADD_PYTHON_MODULE(_core core_bindings.cpp)
 
 # The model order reduction subpackage is plain Python and is copied rather than configured.
 # COPYONLY keeps the build tree in step when a source file changes.
-FOREACH(_mor_source __init__.py binding.py reductors.py)
+FOREACH(_mor_source __init__.py binding.py reductors.py basis.py)
   CONFIGURE_FILE(exadg/mor/${_mor_source}
                  ${EXADG_PYTHON_PACKAGE_DIR}/exadg/mor/${_mor_source} COPYONLY)
 ENDFOREACH()
