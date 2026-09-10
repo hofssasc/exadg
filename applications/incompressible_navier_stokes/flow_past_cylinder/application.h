@@ -373,6 +373,19 @@ private:
       // convection-dominated flow; it is the price of projectability as the interface stands.
       this->param.use_divergence_penalty = false;
       this->param.use_continuity_penalty = false;
+
+      // A block-Jacobi smoother builds its block diagonal from separate cell and face loops,
+      // which ExaDG only supports on one rank -- it aborts in parallel and asks for cell-based
+      // face loops instead. Those are not free here: the hyper-reduction samples face batches
+      // directly, so changing how faces are traversed changes what it counts. A point-Jacobi
+      // smoother needs no block diagonal at all, costs iterations rather than correctness, and
+      // leaves the face machinery alone. Chebyshev is not the alternative it is for the forced
+      // problem: this block keeps its convective term, so it is not symmetric and Chebyshev's
+      // eigenvalue estimate has nothing to work with.
+      this->param.multigrid_data_velocity_block.smoother_data.preconditioner =
+        PreconditionerSmoother::PointJacobi;
+      this->param.multigrid_data_velocity_block.coarse_problem.preconditioner =
+        MultigridCoarseGridPreconditioner::PointJacobi;
     }
   }
 

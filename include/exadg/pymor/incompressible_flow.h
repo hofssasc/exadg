@@ -689,8 +689,14 @@ public:
       // the vector this model would have assembled, which is what pressure_rhs() hands out and
       // therefore what a caller stepping this model passes back.
       {
-        VectorType difference(g);
-        difference -= continuity_rhs();
+        // Compared on the locally owned data alone. A vector arriving from Python may carry ghost
+        // entries and this one does not, and deal.II's arithmetic requires the two partitionings
+        // to agree -- serially there are no ghosts and the distinction does not arise, which is
+        // exactly how it hides.
+        VectorType difference;
+        pde_operator->initialize_vector_pressure(difference);
+        difference.copy_locally_owned_data_from(g);
+        difference.add(-1.0, continuity_rhs());
 
         if(difference.l2_norm() > 1.0e-10 * std::max(1.0, continuity_rhs().l2_norm()))
           return false;
