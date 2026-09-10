@@ -481,27 +481,37 @@ class ECSWStokesReductor(TensorGalerkinStokesReductor):
 
     Args:
         training_states: Velocity snapshots to fit on. Their coefficients on the enriched basis
-            are what the weights have to reproduce.
+            are what the weights have to reproduce. For a transient model these are the states of
+            whole trajectories, so there are many more of them than there are parameters.
         tolerance: Relative residual at which the fit stops; larger means fewer faces.
         max_entries: Hard cap on the number of faces kept.
+        sketch_rows: Fit on a Gaussian sketch of the training matrix's rows; see
+            :func:`local_ecsw_weights`. ``None`` fits on the matrix itself.
+        seed: Of the sketch.
         Everything else as for the base class.
     """
 
     def __init__(self, fom, RB_u=None, RB_p=None, u_product=None, p_product=None,
-                 training_states=None, tolerance=1.0e-2, max_entries=None, **kwargs):
+                 training_states=None, tolerance=1.0e-2, max_entries=None, sketch_rows=None,
+                 audit_rows=64, seed=0, **kwargs):
         super().__init__(fom, RB_u=RB_u, RB_p=RB_p, u_product=u_product, p_product=p_product,
                          **kwargs)
 
         self.training_states = training_states
         self.tolerance = tolerance
         self.max_entries = max_entries
+        self.sketch_rows = sketch_rows
+        self.audit_rows = audit_rows
+        self.seed = seed
 
     def build_momentum(self, velocity):
         # The basis is orthonormal in u_product, so this is the projection of each snapshot onto
         # the enriched space -- the states the reduced model will actually be evaluated near.
         states = self.u_product.apply2(velocity, self.training_states).T
 
-        return ECSWMomentum(self.fom, velocity, states, self.tolerance, self.max_entries)
+        return ECSWMomentum(self.fom, velocity, states, self.tolerance, self.max_entries,
+                            sketch_rows=self.sketch_rows, audit_rows=self.audit_rows,
+                            seed=self.seed)
 
 
 def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
@@ -565,21 +575,70 @@ def sparse_nnls(matrix, target, tolerance=1.0e-2, max_entries=None):
     return weights
 
 
-def local_ecsw_weights(evaluator, states, tolerance, max_entries):
+def row_sketch(n_rows, n_sketch, seed=0):
+    """A Gaussian sketch ``S`` of shape ``(n_sketch, n_rows)``, identical on every rank.
+
+    ``S`` mixes the *rows* of the training matrix, which are training states, not faces. Every
+    rank holds all of those rows for its own columns, so every rank must apply the same ``S`` --
+    hence a seeded generator rather than a drawn one. A different sketch per rank would fit a
+    different problem on each and the gathered matrix would be nonsense.
+
+    Scaled by ``1/sqrt(n_sketch)`` so that ``||S x|| ~ ||x||``, which is what lets a residual
+    measured on the sketch be read as an estimate of the real one.
+    """
+    return np.random.default_rng(seed).standard_normal((n_sketch, n_rows)) / np.sqrt(n_sketch)
+
+
+def local_ecsw_weights(evaluator, states, tolerance, max_entries, sketch_rows=None,
+                       audit_rows=64, seed=0):
     """Fit the weights on one rank and install them there.
 
     Each rank assembles the columns for the faces it owns, all ranks agree on the global fit, and
     each installs the weights belonging to its own faces -- which is where those faces are.
 
-    .. warning::
-       **The fit is redundant across ranks and this has to change.**
+    The training matrix is ``(n_train * r) x n_faces``. Both dimensions grow, and for different
+    reasons: refining the mesh widens it, and training on a *trajectory* rather than on a set of
+    steady states lengthens it by the number of time steps. The second is the one that bites
+    first -- 24 parameters at 640 BDF-2 steps and r = 8 is 122880 rows, or 7.6 GB at refinement 6
+    in 2D -- and it is what ``sketch_rows`` is for.
 
-       Every rank gathers the *entire* training matrix and solves the *same* non-negative least
-       squares. Correct -- the problem is deterministic, so all ranks agree without a scatter --
-       but it scales in neither direction: the gathered matrix is
-       ``(n_train * r) x n_faces_global`` **on every rank**, its width grows with the mesh, and
-       the solve is repeated once per rank. Only the active set is ever small, and only the active
-       set needs gathering. See ``ExaDG ROM Next Steps.md`` in the vault for the architecture.
+    Args:
+        sketch_rows: If given, fit on ``S G`` rather than on ``G``, with ``S`` a Gaussian sketch
+            of that many rows. The sketch is applied to each state's block **as it is assembled**,
+            so ``G`` is never formed: memory falls from ``(n_train r) x n_faces`` to
+            ``sketch_rows x n_faces``. ``None`` fits on the matrix itself.
+        audit_rows: Rows of a *second, independent* sketch, used only to measure the residual.
+            Never fitted against, which is the point -- see below.
+        seed: Of the sketches. Fixed so that a fit is reproducible and identical across ranks.
+
+    Returns:
+        ``(kept, candidates, residual, assembly_seconds, nnls_seconds, sketched)``, the residual
+        relative and **measured out of sample** whenever a sketch is used.
+
+    .. warning::
+       **Never report the residual of a sketched fit on its own sketch.** NNLS *minimises* over
+       ``S G``, so ``||S(G xi - b)||`` is an in-sample quantity and is biased low -- and the bias
+       grows exactly where a warning would be wanted. Measured at refinement 4, 24 states, r = 8
+       (192 rows), against the true residual on the unsketched matrix::
+
+           sketch    faces    on its own sketch    true
+           exact        27             9.63e-03    9.63e-03
+           96           21             9.72e-03    1.52e-02
+           24           14             7.03e-03    4.17e-02
+           6             6             5.35e-16    2.77e-01
+
+       The last row is the degenerate case: with six rows, six columns fit exactly and the fit
+       reports machine zero while being 28% wrong. Johnson-Lindenstrauss bounds ``||Sx||`` for a
+       *fixed* ``x``, and the minimiser is not fixed -- it is chosen after seeing ``S``.
+
+       So a second sketch is drawn, accumulated in the same pass, and never fitted against. ``xi``
+       is fixed by the time it is used, so the bound applies and the number is honest.
+
+    .. warning::
+       **The columns are still gathered whole on every rank.** Sketching fixes the row dimension,
+       which is what a transient training set grows; it does not distribute the candidates, which
+       is what a 3D mesh grows. Both are needed for a large 3D run -- see ``ExaDG ROM Next
+       Steps.md`` in the vault, where the column architecture is written out.
     """
     import time
 
@@ -592,13 +651,40 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
     started = time.perf_counter()
 
     n_faces = evaluator.n_entities
-    local = np.vstack(
-        [np.array(evaluator.contributions(list(state))).reshape(n_faces, -1).T for state in states]
-    )
+    states = [list(state) for state in states]
+    n_modes = len(states[0])
+
+    if sketch_rows is None:
+        local = np.vstack([
+            np.array(evaluator.contributions(state)).reshape(n_faces, n_modes).T
+            for state in states
+        ])
+        audit = None
+    else:
+        # Streamed: each state's block is sketched into both accumulators and discarded, so the
+        # full matrix is never resident. That is the whole point -- forming G and multiplying by S
+        # afterwards would need exactly the memory the sketch exists to avoid. The second sketch
+        # rides along for free, since the expensive part is the face loop, not the multiply.
+        n_rows = len(states) * n_modes
+        sketch = row_sketch(n_rows, sketch_rows, seed)
+        check = row_sketch(n_rows, audit_rows, seed + 1)
+
+        local = np.zeros((sketch_rows, n_faces))
+        audit = np.zeros((audit_rows, n_faces))
+        for i, state in enumerate(states):
+            block = np.array(evaluator.contributions(state)).reshape(n_faces, n_modes).T
+            columns = slice(i * n_modes, (i + 1) * n_modes)
+            local += sketch[:, columns] @ block
+            audit += check[:, columns] @ block
 
     pieces = mpi.comm.allgather(local) if mpi.parallel else [local]
     matrix = np.hstack(pieces)
+
+    # S(G 1) = (SG) 1, so the target is the fitted matrix's own column sum either way.
     target = matrix.sum(axis=1)
+
+    if audit is not None:
+        audit = np.hstack(mpi.comm.allgather(audit) if mpi.parallel else [audit])
 
     assembled = time.perf_counter()
 
@@ -606,15 +692,32 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries):
 
     solved = time.perf_counter()
 
+    if audit is None:
+        witness, witness_target = matrix, target
+    else:
+        witness, witness_target = audit, audit.sum(axis=1)
+
+    kept = int((weights > 0.0).sum())
+    if sketch_rows is not None and 2 * kept > sketch_rows:
+        import warnings
+
+        warnings.warn(
+            f"the fit kept {kept} faces from a sketch of {sketch_rows} rows; below about twice "
+            f"the support the sketch stops constraining the fit and the residual it reports "
+            f"collapses towards zero while the true one grows. Raise sketch_rows.",
+            stacklevel=2,
+        )
+
     offset = sum(piece.shape[1] for piece in pieces[: mpi.rank]) if mpi.parallel else 0
     evaluator.set_weights(weights[offset : offset + n_faces].tolist())
 
     return np.array([
-        (weights > 0.0).sum(),
+        kept,
         matrix.shape[1],
-        np.linalg.norm(matrix @ weights - target) / np.linalg.norm(target),
+        np.linalg.norm(witness @ weights - witness_target) / np.linalg.norm(witness_target),
         assembled - started,
         solved - assembled,
+        0.0 if sketch_rows is None else 1.0,
     ])
 
 
@@ -624,14 +727,21 @@ class ECSWMomentum(FullOrderMomentum):
     A drop-in: same methods, same shapes. Only the weights differ, and residual and Jacobian are
     both evaluated over the faces they keep -- a frozen lambda makes ``S'`` a linear face operator
     over the same faces, so one fit serves both.
+
+    ``sketch_rows`` fits on a Gaussian sketch of the training matrix's rows rather than on the
+    matrix; see :func:`local_ecsw_weights` for what that costs and what it buys. Non-negativity is
+    imposed on the weights either way, so the stability argument for ECSW is untouched -- it is
+    the least-squares objective that is sketched, not the constraint.
     """
 
-    def __init__(self, model, basis, states, tolerance=1.0e-2, max_entries=None):
+    def __init__(self, model, basis, states, tolerance=1.0e-2, max_entries=None,
+                 sketch_rows=None, audit_rows=64, seed=0):
         super().__init__(model, basis)
 
         from pymor.tools import mpi
 
-        arguments = (self.builder, [list(state) for state in states], tolerance, max_entries)
+        arguments = (self.builder, [list(state) for state in states], tolerance, max_entries,
+                     sketch_rows, audit_rows, seed)
         fitted = (
             local_ecsw_weights(*arguments) if not mpi.parallel
             else mpi.call(mpi.function_call, local_ecsw_weights, *arguments)
@@ -644,5 +754,9 @@ class ECSWMomentum(FullOrderMomentum):
         # What the fit cost, split where the two halves scale differently. See local_ecsw_weights.
         self.assembly_seconds = float(fitted[3])
         self.nnls_seconds = float(fitted[4])
+
+        #: Whether `training_residual` was measured on a sketch rather than on the matrix itself.
+        self.sketched = bool(fitted[5])
+        self.n_training_states = len(states)
 
 
