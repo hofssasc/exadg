@@ -123,6 +123,21 @@ public:
     return param;
   }
 
+  /*
+   * Set the kinematic viscosity after the parameters have been read.
+   *
+   * The Reynolds number is the natural parameter of an incompressible flow, and this coefficient
+   * is what carries it. Several preconditioners read it from here at apply time, so it has to be
+   * kept in step with SpatialOperatorBase::set_viscosity(), which is what reaches the operators.
+   */
+  void
+  set_viscosity(double const viscosity)
+  {
+    AssertThrow(viscosity >= 0.0, dealii::ExcMessage("Viscosity must not be negative."));
+
+    param.viscosity = viscosity;
+  }
+
   std::shared_ptr<BoundaryDescriptor<dim> const>
   get_boundary_descriptor() const
   {

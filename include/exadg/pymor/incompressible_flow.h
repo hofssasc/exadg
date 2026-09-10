@@ -840,6 +840,33 @@ public:
     return application->get_max_velocity();
   }
 
+  /*
+   * The kinematic viscosity, as a parameter rather than a constant of the discretisation.
+   *
+   * Setting it changes the operators in place. That is exact, not an approximation: the viscous
+   * operator is linear in the viscosity -- the interior penalty parameter is geometric and every
+   * flux carries the viscosity as a factor -- so nothing about the mesh, the sparsity or the
+   * quadrature depends on the value. It is the only way to keep one set of vector spaces across a
+   * Reynolds sweep, which is what lets trajectories at different parameters share a basis.
+   *
+   * The multigrid levels hold their own copies and pick the new value up when the preconditioner
+   * is next updated, so a run that varies the viscosity wants update_preconditioner_coupled.
+   */
+  double
+  get_viscosity() const
+  {
+    return application->get_parameters().viscosity;
+  }
+
+  void
+  set_viscosity(double const viscosity)
+  {
+    // Both halves are needed: the preconditioners read the parameter directly at apply time, and
+    // the operators read the copy that was taken when they were set up.
+    application->set_viscosity(viscosity);
+    pde_operator->set_viscosity(viscosity);
+  }
+
   double
   get_upwind_factor() const
   {

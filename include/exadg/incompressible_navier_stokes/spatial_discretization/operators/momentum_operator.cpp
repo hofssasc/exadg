@@ -162,6 +162,17 @@ MomentumOperator<dim, Number>::get_viscous_kernel_data() const
 }
 
 template<int dim, typename Number>
+void
+MomentumOperator<dim, Number>::set_viscosity(double const viscosity)
+{
+  if(operator_data.viscous_problem)
+  {
+    operator_data.viscous_kernel_data.viscosity = viscosity;
+    viscous_kernel->set_viscosity(viscosity);
+  }
+}
+
+template<int dim, typename Number>
 typename MomentumOperator<dim, Number>::VectorType const &
 MomentumOperator<dim, Number>::get_velocity() const
 {

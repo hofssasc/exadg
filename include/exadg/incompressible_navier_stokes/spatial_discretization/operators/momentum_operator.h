@@ -102,6 +102,12 @@ public:
   Operators::ViscousKernelData
   get_viscous_kernel_data() const;
 
+  /*
+   * Set a new constant kinematic viscosity. Does nothing if the operator has no viscous term.
+   */
+  void
+  set_viscosity(double const viscosity);
+
   VectorType const &
   get_velocity() const;
 

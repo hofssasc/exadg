@@ -933,6 +933,21 @@ SpatialOperatorBase<dim, Number>::get_constraint_u() const
 }
 
 template<int dim, typename Number>
+void
+SpatialOperatorBase<dim, Number>::set_viscosity(double const viscosity)
+{
+  AssertThrow(param.viscous_problem(),
+              dealii::ExcMessage("There is no viscous term whose viscosity could be set."));
+  AssertThrow(not param.use_divergence_penalty and not param.use_continuity_penalty,
+              dealii::ExcMessage("The penalty kernels cache the viscosity when they are set up "
+                                 "and would keep the old value."));
+
+  viscous_kernel_data.viscosity = viscosity;
+  viscous_kernel->set_viscosity(viscosity);
+  momentum_operator.set_viscosity(viscosity);
+}
+
+template<int dim, typename Number>
 dealii::VectorizedArray<Number>
 SpatialOperatorBase<dim, Number>::get_viscosity_boundary_face(unsigned int const face,
                                                               unsigned int const q) const

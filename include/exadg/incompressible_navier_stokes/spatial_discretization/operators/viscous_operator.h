@@ -121,6 +121,25 @@ public:
     return this->data;
   }
 
+  /*
+   * Set a new constant kinematic viscosity.
+   *
+   * Nothing else has to be recomputed: the interior penalty parameter is purely geometric and
+   * every viscous flux carries the viscosity as a factor, so the operator is exactly linear in
+   * it. Note that operators holding their own copy of this kernel -- the multigrid levels -- are
+   * not reached from here and have to be set individually.
+   */
+  void
+  set_viscosity(double const viscosity)
+  {
+    AssertThrow(viscosity >= 0.0, dealii::ExcMessage("Viscosity must not be negative."));
+    AssertThrow(not data.viscosity_is_variable,
+                dealii::ExcMessage("The viscosity is computed by a viscosity model and cannot be "
+                                   "set to a constant value."));
+
+    data.viscosity = viscosity;
+  }
+
   bool
   get_use_velocity_own_storage() const
   {

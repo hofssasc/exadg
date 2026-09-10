@@ -119,6 +119,23 @@ MultigridPreconditioner<dim, Number>::update()
     });
   }
 
+  // The constant viscosity is a parameter of the problem rather than a property of the
+  // discretisation, so it may have changed since the levels were built -- and each level operator
+  // holds its own copy of the viscous kernel.
+  bool viscosity_has_changed = false;
+  if(data.viscous_problem and not data.viscous_kernel_data.viscosity_is_variable)
+  {
+    double const viscosity = pde_operator->get_viscous_kernel_data().viscosity;
+
+    viscosity_has_changed = viscosity != data.viscous_kernel_data.viscosity;
+    if(viscosity_has_changed)
+    {
+      data.viscous_kernel_data.viscosity = viscosity;
+      this->for_all_levels(
+        [&](unsigned int const level) { this->get_operator(level)->set_viscosity(viscosity); });
+    }
+  }
+
   // Update data storage of nonlinear convective and viscous terms if needed.
   bool const update_convective_data =
     mg_operator_type == MultigridOperatorType::ReactionConvectionDiffusion;
@@ -173,7 +190,7 @@ MultigridPreconditioner<dim, Number>::update()
   // In case the operators have been updated, we also need to update the smoothers and the coarse
   // grid solver. This is generic functionality implemented in the base class.
   if(mesh_is_moving or data.unsteady_problem or update_convective_data or update_viscous_data or
-     this->update_needed)
+     viscosity_has_changed or this->update_needed)
   {
     this->update_smoothers();
     this->update_coarse_solver();

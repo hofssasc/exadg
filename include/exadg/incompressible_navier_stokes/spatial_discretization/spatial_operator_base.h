@@ -235,6 +235,21 @@ public:
   dealii::VectorizedArray<Number>
   get_viscosity_boundary_face(unsigned int const face, unsigned int const q) const;
 
+  /*
+   * Set a new constant kinematic viscosity on the operators built over this discretisation.
+   *
+   * The Reynolds number is the natural parameter of an incompressible flow and this coefficient
+   * is what carries it. Nothing about the discretisation depends on it, so no rebuild is needed:
+   * the viscous operator is exactly linear in the viscosity and the interior penalty parameter is
+   * purely geometric.
+   *
+   * Two things are *not* reached from here. Parameters::viscosity is read directly by some
+   * preconditioners and has to be set alongside, and the multigrid levels hold their own copies
+   * of the viscous kernel, which they pick up when the preconditioner is next updated.
+   */
+  void
+  set_viscosity(double const viscosity);
+
   // Multiphysics coupling via "Cached" boundary conditions
   std::shared_ptr<ContainerInterfaceData<1, dim, double>>
   get_container_interface_data();
