@@ -95,54 +95,72 @@ def dispatch(model, function, basis, *args):
 
 
 def convective_tensor(split, basis):
-    """``C[i,j,k] = <phi_i, Q(phi_j, phi_k)>`` for the polynomial half of a nonlinear term.
+    """The polynomial half of a nonlinear term, split into its quadratic, linear and constant parts.
+
+    ``apply_polynomial`` is a polynomial of degree two in the velocity, but not a *pure* quadratic
+    form. A flow driven through an inhomogeneous Dirichlet boundary carries the prescribed value
+    into the convective flux, so
+
+        Q(u) = B(u, u) + L u + c,      c = Q(0)
+
+    with the boundary data contributing to all three. With homogeneous data ``L`` and ``c``
+    vanish and only ``B`` remains -- which is why the identity ``B(a, a) = Q(a)`` and the plain
+    polarisation ``B(a, b) = [Q(a + b) - Q(a) - Q(b)] / 2`` are right for a body-force problem and
+    wrong the moment there is an inflow. The corrected polarisation carries ``Q(0)``,
+
+        B(a, b) = [Q(a + b) - Q(a) - Q(b) + Q(0)] / 2
+
+    and the diagonal is no longer free: ``B(a, a)`` needs ``Q(2a)``.
 
     Args:
-        split: The model's ``SplitOperator``. ``apply_polynomial`` is exactly quadratic, which is
-            what makes the tensor exact rather than a fit -- and it is the operator's own
-            polynomial half rather than a linearisation that happens to be multilinear.
+        split: The model's ``SplitOperator``, whose own polynomial half this is -- not a
+            linearisation that happens to be multilinear.
         basis: The velocity basis, **after** supremizer enrichment -- it has to be the basis the
             rest of the model is projected onto.
 
     Returns:
-        ``numpy.ndarray`` of shape ``(r, r, r)``, symmetric in its last two indices.
+        ``(tensor, linear, constant)``: the ``(r, r, r)`` tensor, symmetric in its last two
+        indices, and the projections ``<phi_i, L phi_j>`` and ``<phi_i, c>`` of the two parts that
+        are not quadratic. The caller folds those into the affine block, where they belong.
 
-    Costs ``r + r(r-1)/2`` applications of the polynomial half, plus the projections.
+    Costs ``1 + r + r(r + 1)/2`` applications of the polynomial half, plus the projections.
     """
     phi = [v.impl for v in basis.vectors]
     r = len(phi)
 
+    at_zero = split.apply_polynomial(basis.space.zero_vector().impl)
     diagonal = [split.apply_polynomial(p) for p in phi]
 
     tensor = np.zeros((r, r, r))
     for j in range(r):
         for k in range(j, r):
-            if j == k:
-                # Q(a, a) = Q(a) exactly, so the diagonal costs no extra evaluation
-                image = diagonal[j]
-            else:
-                sum_jk = phi[j].copy()
-                sum_jk.axpy(1.0, phi[k])
+            sum_jk = phi[j].copy()
+            sum_jk.axpy(1.0, phi[k])
 
-                image = split.apply_polynomial(sum_jk)
-                image.axpy(-1.0, diagonal[j])
-                image.axpy(-1.0, diagonal[k])
-                image.scal(0.5)
+            image = split.apply_polynomial(sum_jk)
+            image.axpy(-1.0, diagonal[j])
+            image.axpy(-1.0, diagonal[k])
+            image.axpy(1.0, at_zero)
+            image.scal(0.5)
 
             for i in range(r):
                 tensor[i, j, k] = tensor[i, k, j] = phi[i].inner(image)
 
-    return tensor
+    # L phi_j = Q(phi_j) - B(phi_j, phi_j) - c, read off in the projection rather than as a
+    # vector: the diagonal of the tensor is exactly <phi_i, B(phi_j, phi_j)>.
+    constant = np.array([phi[i].inner(at_zero) for i in range(r)])
+    linear = np.array([[phi[i].inner(diagonal[j]) for j in range(r)] for i in range(r)])
+    linear -= np.einsum("ijj->ij", tensor) + constant[:, None]
+
+    return tensor, linear, constant
 
 
 def local_momentum_blocks(model, basis):
-    """The three parameter-independent pieces of the momentum block, on one rank.
+    """The three pieces of the momentum block, on one rank.
 
-    Returns ``(tensor, viscous, constant)``: the convective tensor, the projected viscous block,
-    and the operator's value at zero. The viscous block is isolated by removing the whole
-    nonlinear term from the momentum operator, which is legitimate because what remains is affine
-    in the velocity -- so ``r`` applications determine it. Both halves of that subtraction come
-    from the model's declared ``SplitOperator``; nothing here names a convective operator.
+    Returns ``(tensor, viscous, constant)``: the convective tensor, the affine block beside it,
+    and that block's value at zero. Both halves of the subtraction come from the model's declared
+    ``SplitOperator``; nothing here names a convective operator.
     """
     split = exadg_model(model).split_momentum()
     momentum = model.operator.blocks[0, 0]
@@ -153,13 +171,35 @@ def local_momentum_blocks(model, basis):
             "half to build a tensor from"
         )
 
-    nonlinear = basis.space.make_array(
-        [basis.space.make_vector(split.apply(v.impl)) for v in basis.vectors]
-    )
-    constant = basis.inner(momentum.apply(basis.space.zeros(1))).ravel()
-    viscous = basis.inner(momentum.apply(basis) - nonlinear) - constant[:, None]
+    def nonlinear(vectors):
+        return basis.space.make_array(
+            [basis.space.make_vector(split.apply(v.impl)) for v in vectors]
+        )
 
-    return convective_tensor(split, basis), viscous, constant
+    tensor, linear, quadratic_constant = convective_tensor(split, basis)
+
+    # Everything the tensor does not represent, collected into one block:
+    #
+    #     M(v) = A(v) - N(v) + Q(v) - B(v, v)
+    #
+    # A - N is what is left of the momentum operator once the whole nonlinear term is removed,
+    # and Q - B is the part of the polynomial half that is not quadratic. Both are affine in the
+    # velocity, so r + 1 evaluations determine M, and the reduced residual
+    # B(a, a) + M(a) + S(a) is then exactly the projected full-order one.
+    #
+    # N(0) is evaluated rather than assumed to vanish: a flow driven through an inhomogeneous
+    # Dirichlet boundary has a convective flux at zero velocity and a body-force problem does not.
+    # Only (A - N)(0) is subtracted off the columns, never the whole constant -- c is already
+    # absent from `linear`, and taking it out again per column would leave it weighted by the sum
+    # of the reduced coefficients rather than by one, which cancels at exactly one point of the
+    # reduced space. Every correction here is identically zero for the homogeneous case.
+    zero = basis.space.zeros(1)
+    at_zero = basis.inner(momentum.apply(zero) - nonlinear(zero.vectors)).ravel()
+
+    constant = at_zero + quadratic_constant
+    viscous = basis.inner(momentum.apply(basis) - nonlinear(basis.vectors)) + linear - at_zero[:, None]
+
+    return tensor, viscous, constant
 
 
 def local_sampled(model, basis, weights):
@@ -287,9 +327,19 @@ class FullOrderMomentum:
         """``V^T (sum_f w_f S'_f(V a)) V``.
 
         ExaDG freezes lambda when it linearises -- it is not differentiable -- so ``S'`` is a
-        linear face operator over the same faces, and the weights carry over unchanged. Together
-        with the tensor and the viscous block it reproduces ``V^T A'(V a) V`` to machine precision
-        at every refinement -- the decomposition is exact, not merely consistent.
+        linear face operator over the same faces, and the weights carry over unchanged.
+
+        With homogeneous boundary data, this and the tensor and the affine block reproduce
+        ``V^T A'(V a) V`` to machine precision (9.8e-16 on the forced problem). With an
+        inhomogeneous inflow they reach 3.5e-04, and the gap is *here*: the tensor half and the
+        affine half were each checked against a central difference of their own operator -- both
+        exact, since one is quadratic and the other affine -- and the residual ``S`` itself
+        matches ``N - Q`` at 2.2e-16. Only the frozen-lambda derivative differs from ExaDG's.
+
+        It does not move a solution. What defines the reduced solution is the residual, which is
+        exact; and ExaDG's own Jacobian is already not the derivative of its own residual -- both
+        sit 22.7% from a finite difference of it, for the same frozen lambda. The cost is Newton
+        iterations, which were already linear rather than quadratic for that reason.
         """
         r = len(self.basis)
 
