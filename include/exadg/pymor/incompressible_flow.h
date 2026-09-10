@@ -1,0 +1,1833 @@
+/*  ______________________________________________________________________
+ *
+ *  ExaDG - High-Order Discontinuous Galerkin for the Exa-Scale
+ *
+ *  Copyright (C) 2021 by the ExaDG authors
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ *  ______________________________________________________________________
+ */
+
+/*
+ * The shared half of an ExaDG flow binding.
+ *
+ * `forced`'s binding was 1995 lines of which 77 touched its application: the blocks, the split,
+ * the sampled stabilisation and the step are properties of ExaDG's coupled operator rather than
+ * of any problem posed on it. They live here, and an application's own file supplies only what
+ * its parameters are.
+ */
+
+#ifndef EXADG_PYMOR_INCOMPRESSIBLE_FLOW_H_
+#define EXADG_PYMOR_INCOMPRESSIBLE_FLOW_H_
+
+// pybind11
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+// deal.II
+#include <deal.II/base/mpi.h>
+#include <deal.II/numerics/data_out.h>
+#include <deal.II/numerics/vector_tools.h>
+
+// ExaDG
+#include <exadg/incompressible_navier_stokes/driver.h>
+#include <exadg/incompressible_navier_stokes/spatial_discretization/operator_coupled.h>
+#include <exadg/operators/mass_operator.h>
+#include <exadg/pymor/interface.h>
+#include <exadg/utilities/create_directories.h>
+
+// C/C++
+#include <deque>
+
+namespace ExaDG
+{
+namespace IncNS
+{
+using Number          = double;
+using VectorType      = dealii::LinearAlgebra::distributed::Vector<Number>;
+using BlockVectorType = dealii::LinearAlgebra::distributed::BlockVector<Number>;
+
+namespace detail
+{
+/// Redirects std::cout while a model is being built, so a notebook does not get ExaDG's banner.
+class SuppressOutput
+{
+public:
+  explicit SuppressOutput(bool const active) : buffer(nullptr)
+  {
+    if(active)
+      buffer = std::cout.rdbuf(sink.rdbuf());
+  }
+
+  ~SuppressOutput()
+  {
+    if(buffer != nullptr)
+      std::cout.rdbuf(buffer);
+  }
+
+  SuppressOutput(SuppressOutput const &) = delete;
+  SuppressOutput &
+  operator=(SuppressOutput const &) = delete;
+
+private:
+  std::ostringstream sink;
+  std::streambuf *   buffer;
+};
+
+} // namespace detail
+
+/**
+ * Any ExaDG coupled incompressible flow, as a PyMOR::SaddlePointModel.
+ *
+ * Everything here is generic over the application: the three blocks, the mass matrices, the
+ * convective split, the sampled stabilisation and its compiled half, the step, and the VTU
+ * writer. What an application supplies is its *parameterisation* -- what its parameters are and
+ * how the operator or the right-hand side depends on them -- which is exactly the handful of
+ * methods PyMOR::SaddlePointModel leaves defaulted: parameter_shape, velocity_rhs,
+ * velocity_rhs_components and pressure_rhs.
+ *
+ * Templated on the concrete application rather than on ApplicationBase so that a subclass can
+ * reach its own accessors. Nothing here needs them: everything is read from get_parameters(),
+ * which every application has.
+ */
+template<int dim, typename ApplicationType>
+class IncNSSaddlePoint : public PyMOR::SaddlePointModel<VectorType>
+{
+public:
+  typedef FaceIntegrator<dim, dim, Number>                        FaceIntegratorU;
+  typedef dealii::Tensor<1, dim, dealii::VectorizedArray<Number>> FaceVector;
+
+  IncNSSaddlePoint(std::string const & input_file,
+                   unsigned int const  degree,
+                   unsigned int const  refinements,
+                   bool const          verbose = false)
+    : mpi_comm(MPI_COMM_WORLD)
+  {
+    detail::SuppressOutput const suppress(not verbose);
+
+    application = std::make_shared<ApplicationType>(input_file, mpi_comm);
+    application->set_parameters_convergence_study(degree, refinements, 0);
+
+    // is_throughput_study = true: Driver then builds the spatial operator and stops, creating
+    // neither a postprocessor nor a time integrator. Both would be dead weight -- the loop belongs
+    // to the caller (see PyMOR::SaddlePointModel) and this model writes its own VTU records.
+    driver = std::make_unique<Driver<dim, Number>>(mpi_comm, application, true, true);
+    driver->setup();
+
+    pde_operator = std::dynamic_pointer_cast<OperatorCoupled<dim, Number>>(
+      driver->get_pde_operator());
+
+    AssertThrow(pde_operator.get() != nullptr,
+                dealii::ExcMessage("This model needs the coupled solver; set "
+                                   "TemporalDiscretization::BDFCoupledSolution."));
+
+    // The pressure inner product. ExaDG carries a velocity mass operator but no pressure one,
+    // since nothing in a monolithic solve needs it; a POD of pressure snapshots does.
+    MassOperatorData<dim, Number> pressure_mass_data;
+    pressure_mass_data.dof_index  = pde_operator->get_dof_index_pressure();
+    pressure_mass_data.quad_index = pde_operator->get_quad_index_pressure();
+
+    pressure_mass.initialize(pde_operator->get_matrix_free(),
+                             pde_operator->get_matrix_free().get_affine_constraints(
+                               pde_operator->get_dof_index_pressure()),
+                             pressure_mass_data);
+
+    setup_central_convective_operators();
+  }
+
+  // ===========================================================================================
+  //  Spaces
+  // ===========================================================================================
+
+  /// The velocity space. make_admissible() is a no-op: a discontinuous Galerkin velocity space
+  /// imposes its boundary conditions weakly and constrains no degree of freedom.
+  class VelocitySpace : public PyMOR::Space<VectorType>
+  {
+  public:
+    explicit VelocitySpace(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    dealii::types::global_dof_index
+    n_dofs() const override
+    {
+      return fom->pde_operator->get_dof_handler_u().n_dofs();
+    }
+
+    std::shared_ptr<VectorType>
+    zero_vector() const override
+    {
+      auto vector = std::make_shared<VectorType>();
+      fom->pde_operator->initialize_vector_velocity(*vector);
+      *vector = 0.0;
+
+      return vector;
+    }
+
+    std::string
+    write_vtu(std::string const &                              directory,
+              std::string const &                              basename,
+              std::vector<std::shared_ptr<VectorType>> const & fields,
+              std::vector<std::string> const &                 names) const override
+    {
+      return fom->write_fields(fom->pde_operator->get_dof_handler_u(),
+                               directory,
+                               basename,
+                               fields,
+                               names,
+                               true /* vector valued */);
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  class PressureSpace : public PyMOR::Space<VectorType>
+  {
+  public:
+    explicit PressureSpace(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    dealii::types::global_dof_index
+    n_dofs() const override
+    {
+      return fom->pde_operator->get_dof_handler_p().n_dofs();
+    }
+
+    std::shared_ptr<VectorType>
+    zero_vector() const override
+    {
+      auto vector = std::make_shared<VectorType>();
+      fom->pde_operator->initialize_vector_pressure(*vector);
+      *vector = 0.0;
+
+      return vector;
+    }
+
+    std::string
+    write_vtu(std::string const &                              directory,
+              std::string const &                              basename,
+              std::vector<std::shared_ptr<VectorType>> const & fields,
+              std::vector<std::string> const &                 names) const override
+    {
+      return fom->write_fields(fom->pde_operator->get_dof_handler_p(),
+                               directory,
+                               basename,
+                               fields,
+                               names,
+                               false /* scalar */);
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  // ===========================================================================================
+  //  The three blocks
+  // ===========================================================================================
+
+  /// A = s M + viscous (+ convective, once the equation is Navier-Stokes), the (1,1) block.
+  class Momentum : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    Momentum(std::shared_ptr<IncNSSaddlePoint> fom, double const mass_scaling)
+      : fom(fom), mass_scaling(mass_scaling)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      // Installed on every apply rather than once, because the operator is shared: ExaDG's
+      // solve_nonlinear_problem() and solve_linear_problem() both set this factor on the same
+      // object, so an operator that trusted its constructor would evaluate at whatever the last
+      // solve left behind.
+      fom->pde_operator->get_momentum_operator().set_scaling_factor_mass_operator(mass_scaling);
+      fom->pde_operator->get_momentum_operator().vmult(dst, src);
+    }
+
+    /// Only while there is no convective term: mass and viscous are both symmetric, u . grad u
+    /// is not. The Navier-Stokes step has to override apply_transpose() rather than flip this.
+    bool
+    is_symmetric() const override
+    {
+      return not fom->application->get_parameters().convective_problem();
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "A";
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+    double const                    mass_scaling;
+  };
+
+  /**
+   * B, the (2,1) block: velocity in, pressure out.
+   *
+   * ExaDG applies -s div here and +s grad in the (1,2) block, s being
+   * scaling_factor_continuity, so that the assembled matrix is symmetric. pyMOR builds its (1,2)
+   * block as AdjointOperator(B), which therefore has to reproduce +s grad exactly -- that is an
+   * identity between two separately implemented operators, so the example checks it rather than
+   * assuming it.
+   */
+  class Divergence : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    explicit Divergence(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      fom->pde_operator->get_divergence_operator().apply(dst, src);
+      dst *= -fom->scaling_factor_continuity();
+    }
+
+    /// Different operator, not the same one: never claim symmetry here.
+    bool
+    is_symmetric() const override
+    {
+      return false;
+    }
+
+    void
+    apply_transpose(VectorType & dst, VectorType const & src) const override
+    {
+      fom->pde_operator->get_gradient_operator().apply(dst, src);
+      dst *= fom->scaling_factor_continuity();
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "B";
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  /**
+   * A surface mesh of hand-built patches, one per selected face.
+   *
+   * DataOutInterface is the whole of what a VTU writer needs: patches and a name for each data
+   * set. Deriving from it rather than from DataOut is what lets a face carry a number of its own
+   * instead of a field sampled on it -- and it brings write_vtu_with_pvtu_record, so the parallel
+   * record costs nothing extra.
+   */
+  class SelectedFaces : public dealii::DataOutInterface<dim - 1, dim>
+  {
+  public:
+    std::vector<dealii::DataOutBase::Patch<dim - 1, dim>> patches;
+
+    std::vector<std::string>
+    get_dataset_names() const override
+    {
+      return {"ecsw_weight"};
+    }
+
+    std::vector<dealii::DataOutBase::Patch<dim - 1, dim>> const &
+    get_patches() const override
+    {
+      return patches;
+    }
+  };
+
+  /**
+   * A'(u), the (1,1) block linearised at a given velocity.
+   *
+   * The linearisation velocity is stored here and re-installed before every apply, rather than
+   * set once when the operator is handed out. pyMOR holds Jacobians at several states during a
+   * Newton iteration, and an operator that read whatever ExaDG happened to have installed would
+   * quietly become the Jacobian at somebody else's state.
+   *
+   * ExaDG keeps a *pointer* to the linearisation velocity -- set_solution_linearization()
+   * forwards to set_velocity_ptr() -- so the vector has to outlive every use of it. pyMOR
+   * discards a Jacobian as soon as its Newton step is done, so a vector owned by this object
+   * would leave ExaDG dereferencing freed memory, which it does: a segmentation fault inside
+   * update_ghost_values. The model owns it instead, and the model outlives every operator it
+   * hands out.
+   */
+  class Jacobian : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    Jacobian(std::shared_ptr<IncNSSaddlePoint> fom,
+             std::shared_ptr<VectorType>     velocity,
+             double const                    mass_scaling)
+      : fom(fom), linearization(velocity), mass_scaling(mass_scaling)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      fom->install_linearization(linearization);
+
+      auto & momentum = fom->pde_operator->get_momentum_operator();
+      momentum.set_scaling_factor_mass_operator(mass_scaling);
+      momentum.vmult(dst, src);
+    }
+
+    /// The convective term is not self-adjoint; the transpose would have to be implemented.
+    bool
+    is_symmetric() const override
+    {
+      return false;
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "A'(u)";
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+
+    std::shared_ptr<VectorType> const linearization;
+    double const                      mass_scaling;
+  };
+
+  /// The velocity mass matrix. Block diagonal for a discontinuous space, so the inverse is
+  /// elementwise -- which is what makes supremizer enrichment affordable.
+  class VelocityMass : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    explicit VelocityMass(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      fom->pde_operator->apply_mass_operator(dst, src);
+    }
+
+    bool
+    is_symmetric() const override
+    {
+      return true;
+    }
+
+    bool
+    has_inverse() const override
+    {
+      return true;
+    }
+
+    std::shared_ptr<VectorType>
+    apply_inverse(VectorType const & rhs) const override
+    {
+      auto dst = std::make_shared<VectorType>();
+      fom->pde_operator->initialize_vector_velocity(*dst);
+      fom->pde_operator->apply_inverse_mass_operator(*dst, rhs);
+
+      return dst;
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "velocity mass";
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  class PressureMass : public PyMOR::LinearOperator<VectorType>
+  {
+  public:
+    explicit PressureMass(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    void
+    apply(VectorType & dst, VectorType const & src) const override
+    {
+      fom->pressure_mass.vmult(dst, src);
+    }
+
+    bool
+    is_symmetric() const override
+    {
+      return true;
+    }
+
+    std::string
+    get_name() const override
+    {
+      return "pressure mass";
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  // ===========================================================================================
+  //  PyMOR::SaddlePointModel
+  // ===========================================================================================
+
+  /**
+   * The velocity space -- the *same* object for as long as anyone holds it.
+   *
+   * Handing out a fresh space per call would be simpler and is wrong in a way that only shows up
+   * later: pyMOR compares vector spaces by the identity of what they wrap, so two models built
+   * over one discretisation would disagree about their own vectors, and a transient model could
+   * not be compared against the steady one it relaxes to. Cached weakly rather than owned, so
+   * that the model does not keep its spaces alive and the spaces do not keep the model alive.
+   */
+  std::shared_ptr<PyMOR::Space<VectorType>>
+  velocity_space() override
+  {
+    return cached<VelocitySpace>(velocity_space_cache);
+  }
+
+  std::shared_ptr<PyMOR::Space<VectorType>>
+  pressure_space() override
+  {
+    return cached<PressureSpace>(pressure_space_cache);
+  }
+
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  momentum(double const mass_scaling) override
+  {
+    require_mass_admissible(mass_scaling);
+
+    return std::make_shared<Momentum>(shared_self(), mass_scaling);
+  }
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  divergence() override
+  {
+    return std::make_shared<Divergence>(shared_self());
+  }
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  velocity_product() override
+  {
+    return std::make_shared<VelocityMass>(shared_self());
+  }
+
+  /// The same operator this application uses as its velocity product, but said rather than
+  /// inferred: see PyMOR::SaddlePointModel::velocity_mass.
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  velocity_mass() override
+  {
+    return std::make_shared<VelocityMass>(shared_self());
+  }
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  pressure_product() override
+  {
+    return std::make_shared<PressureMass>(shared_self());
+  }
+
+
+
+
+  bool
+  is_nonlinear() const override
+  {
+    return application->get_parameters().nonlinear_problem_has_to_be_solved();
+  }
+
+  /**
+   * Refuse a mass term this model cannot carry.
+   *
+   * ExaDG decides at setup whether the momentum operator has a mass kernel at all --
+   * MomentumOperatorData::unsteady_problem is read from SolverType, and without it the volume
+   * flux is never added. set_scaling_factor_mass_operator() then accepts any value and changes
+   * nothing. So a nonzero scaling on a model configured steady is not a small error: it is a
+   * steady solve returned as though it were a step, which is the one failure mode this interface
+   * exists to prevent. Refusing costs a sentence; accepting costs a plausible wrong answer.
+   */
+  /// Whether the momentum operator was built with a mass kernel. Decided at setup, by the
+  /// input file's Regime; see require_mass_admissible.
+  bool
+  is_unsteady() const
+  {
+    return application->get_parameters().solver_type == SolverType::Unsteady;
+  }
+
+  void
+  require_mass_admissible(double const mass_scaling) const
+  {
+    AssertThrow(mass_scaling == 0.0 or is_unsteady(),
+                dealii::ExcMessage(
+                  "mass_scaling = " + std::to_string(mass_scaling) +
+                  " needs SolverType::Unsteady. This model is configured steady, and ExaDG "
+                  "creates the momentum operator's mass kernel at setup from that flag -- so the "
+                  "scaling factor would be accepted and silently ignored."));
+  }
+
+  /**
+   * s M u + N(u, p), without the right-hand side.
+   *
+   * The two regimes use different ExaDG entry points, and the unsteady one is the simpler.
+   * evaluate_nonlinear_residual() subtracts a right-hand side the *caller* assembled and
+   * evaluates no forcing of its own, which is exactly this interface's contract -- so it is
+   * handed a zero vector and nothing has to be undone. evaluate_nonlinear_residual_steady()
+   * evaluates the body force internally (operator_coupled.cpp, rhs_operator.evaluate), so the
+   * steady branch adds it back; both terms read the same amplitudes and cancel exactly whatever
+   * those are, which is what keeps this a function of (u, p) alone.
+   */
+  bool
+  apply_nonlinear(VectorType const & u,
+                  VectorType const & p,
+                  VectorType &       du,
+                  VectorType &       dp,
+                  double const       mass_scaling,
+                  double const       time) override
+  {
+    if(not is_nonlinear())
+      return false;
+
+    require_mass_admissible(mass_scaling);
+
+    BlockVectorType state, residual;
+    pde_operator->initialize_block_vector_velocity_pressure(state);
+    pde_operator->initialize_block_vector_velocity_pressure(residual);
+
+    state.block(0) = u;
+    state.block(1) = p;
+
+    if(is_unsteady())
+    {
+      VectorType no_rhs(u);
+      no_rhs = 0.0;
+
+      pde_operator->evaluate_nonlinear_residual(residual, state, &no_rhs, time, mass_scaling);
+
+      du = residual.block(0);
+    }
+    else
+    {
+      pde_operator->evaluate_nonlinear_residual_steady(residual, state, time);
+
+      VectorType body_force(u);
+      body_force = 0.0;
+      pde_operator->evaluate_add_body_force_term(body_force, time);
+
+      du = residual.block(0);
+      du += body_force;
+    }
+
+    dp = residual.block(1);
+
+    return true;
+  }
+
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  jacobian_momentum(VectorType const & velocity, double const mass_scaling) override
+  {
+    if(not is_nonlinear())
+      return nullptr;
+
+    require_mass_admissible(mass_scaling);
+
+    return std::make_shared<Jacobian>(shared_self(),
+                                      std::make_shared<VectorType>(velocity),
+                                      mass_scaling);
+  }
+
+  /**
+   * The full-order coupled solve for the given right-hand side, at one step's mass scaling.
+   *
+   * Mirrors DriverSteadyProblems::do_solve() rather than calling it, for one reason: that driver
+   * keeps its solution between calls and would warm-start the next parameter from the previous
+   * one, whatever the caller wanted. Here the guess is the caller's -- nullptr for a snapshot,
+   * which has to be a function of its parameter alone, and the previous step for a time loop.
+   */
+  bool
+  solve(VectorType const & f,
+        VectorType const & g,
+        VectorType &       u,
+        VectorType &       p,
+        double const       mass_scaling,
+        double const       time,
+        VectorType const * initial_guess) override
+  {
+    require_mass_admissible(mass_scaling);
+
+    BlockVectorType solution;
+    pde_operator->initialize_block_vector_velocity_pressure(solution);
+    solution = 0.0;
+
+    if(initial_guess != nullptr)
+      solution.block(0).copy_locally_owned_data_from(*initial_guess);
+
+    // A Krylov or Newton failure is an answer, not a crash. deal.II throws
+    // SolverControl::NoConvergence, and letting it escape aborts the interpreter -- which is a
+    // poor way to tell a greedy that one training parameter is out of reach. Declining is what
+    // the interface promises, and what lets a caller skip that parameter and carry on.
+    try
+    {
+    if(application->get_parameters().nonlinear_problem_has_to_be_solved())
+    {
+      // ExaDG's nonlinear solve takes the body force alone; the pressure equation of a steady
+      // incompressible problem has no right-hand side to give it.
+      if(g.l2_norm() != 0.0)
+        return false;
+
+      // scaling_factor_mass is passed rather than left to default: solve_nonlinear_problem()
+      // installs it on the shared momentum operator, and its default is 1.0.
+      pde_operator->solve_nonlinear_problem(solution,
+                                            f,
+                                            application->get_parameters()
+                                              .update_preconditioner_coupled,
+                                            time,
+                                            mass_scaling);
+    }
+    else
+    {
+      BlockVectorType rhs;
+      pde_operator->initialize_block_vector_velocity_pressure(rhs);
+      rhs.block(0) = f;
+      rhs.block(1) = g;
+
+      VectorType transport_velocity;
+
+      pde_operator->solve_linear_problem(solution,
+                                         rhs,
+                                         transport_velocity,
+                                         application->get_parameters()
+                                           .update_preconditioner_coupled,
+                                         mass_scaling);
+    }
+
+    }
+    catch(dealii::ExceptionBase const &)
+    {
+      return false;
+    }
+
+    pde_operator->adjust_pressure_level_if_undefined(solution.block(1), time);
+
+    u = solution.block(0);
+    p = solution.block(1);
+
+    // Newton pointed the convective kernel at `solution` through set_velocity_ptr, and `solution`
+    // is about to go out of scope. Anything that later evaluates the convective operator --
+    // apply_convective(), say -- begins by updating that vector's ghost values and would write
+    // into freed memory. Serially it survives; on more than one rank it corrupts the heap.
+    // Hand the kernel something this model owns instead.
+    install_linearization(std::make_shared<VectorType>(solution.block(0)));
+
+    return true;
+  }
+
+
+  // ===========================================================================================
+  //  The convective term, split into a trilinear part and a stabilisation
+  // ===========================================================================================
+  //
+  // The convective operator is a polynomial in the velocity except for one term. In divergence
+  // form the volume integral and the central part of the numerical flux are exactly trilinear,
+  //
+  //     C(w, u, v) = -( (w x u) : grad v )_K + ( (w.n) {u} . v )_dK,
+  //
+  // so a reduced model can represent them as a third-order tensor C_ijk = C(phi_i, phi_j, phi_k),
+  // built once offline and contracted online at a cost independent of the mesh. What is left is
+  //
+  //     S(u) = N(u) - C(u, u, .)
+  //
+  // the Lax-Friedrichs stabilisation, whose lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|) is
+  // not a polynomial -- it is a maximum of absolute values. S is what hyper-reduction has to
+  // handle, and isolating it is what lets a reduced model treat the two parts differently
+  // without approximating either by accident.
+  //
+  // Both operators below are built on the *same* MatrixFree and the *same* quadrature rule as
+  // the solver's own convective operator, so the split is exact rather than nearly exact.
+
+  /**
+   * C(w, v): ExaDG's linearly-implicit convective operator with a central flux -- linear in v,
+   * and linear in w, both to machine precision.
+   *
+   * It is *not* the polarisation of the nonlinear operator. C(u, u) and N(u) at the same upwind
+   * factor differ -- 3.5e-05 relative at degree 2, refinement 3 -- and that difference is itself
+   * exactly quadratic, so the two are different bilinear maps rather than the same one evaluated
+   * differently. They are consistent with the same continuous form and the gap converges away at
+   * roughly h^5, which bounds what the distinction costs without removing it. Do not build a
+   * reduced third-order tensor from this: polarise N instead,
+   *
+   *     B(a, b) = 0.5 * ( N(a + b) - N(a) - N(b) ),
+   *
+   * which is by construction the bilinear form of the operator being reduced. This method is
+   * kept because it is the evidence for that distinction, and because it is what ExaDG itself
+   * would apply for a linearly-implicit time scheme.
+   */
+  std::shared_ptr<VectorType>
+  apply_trilinear(VectorType const & w, VectorType const & v)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    // w is the transport velocity and needs its ghosts; v is the loop's argument and must not
+    // have them. A dedicated member rather than the owned() ring, because set_velocity_ptr stores
+    // a pointer that stays installed after this call returns.
+    trilinear_operator.set_velocity_ptr(transported(w, trilinear_transport));
+    trilinear_operator.apply(*dst, owned(v));
+
+    return dst;
+  }
+
+  /// N(u) with a central flux: the nonlinear convective operator at upwind_factor = 0. Equals
+  /// apply_trilinear(u, u) if the trilinear form really is the same operator.
+  std::shared_ptr<VectorType>
+  apply_convective_central(VectorType const & u)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    central_operator.evaluate_nonlinear_operator(*dst, owned(u), 0.0 /* time */);
+
+    return dst;
+  }
+
+  /// N(u) as the solver actually evaluates it, at this application's upwind factor.
+  std::shared_ptr<VectorType>
+  apply_convective(VectorType const & u)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    pde_operator->get_convective_operator().evaluate_nonlinear_operator(
+      *dst, owned(u), 0.0 /* time */);
+
+    return dst;
+  }
+
+  /**
+   * The time step this mesh admits at the given CFL number.
+   *
+   * ExaDG's own calculation, not a reimplementation of it: calculate_time_step_cfl_global() reads
+   * the element sizes out of the MatrixFree, together with the velocity degree and the parameters'
+   * max_velocity and cfl_exponent_fe_degree_velocity, and returns the step at CFL = 1. The caller
+   * scales it and rounds it into a step count, which is what adjust_time_step_to_hit_end_time()
+   * does inside ExaDG's own time integrator.
+   *
+   * Exposed because a step count fixed independently of the mesh is a trap: refine and the same
+   * count silently becomes a different CFL, so a convergence study measures two things at once.
+   */
+  double
+  time_step_for_cfl(double const cfl) const
+  {
+    return cfl * pde_operator->calculate_time_step_cfl_global();
+  }
+
+  double
+  get_max_velocity() const
+  {
+    return application->get_max_velocity();
+  }
+
+  double
+  get_upwind_factor() const
+  {
+    return application->get_parameters().upwind_factor;
+  }
+
+  // ===========================================================================================
+  //  The Lax-Friedrichs stabilisation, as a sum over faces
+  // ===========================================================================================
+  //
+  // S(u) = N(u) - B(u, u) is what is left of the convective operator once its trilinear part is
+  // taken out, and it lives entirely on faces: 0.5 * lambda * jump(u), with
+  // lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|). A face is therefore the natural sampling
+  // unit for hyper-reduction, and the two entry points below are what ECSW needs -- one to train
+  // on, one to evaluate with the weights it produces.
+  //
+  // A face is identified by (batch, lane): matrix-free processes faces in vectorised batches, so
+  // a weight vector is indexed batch * lanes + lane. That numbering is local to a rank and to a
+  // partitioning, which is fine while weights are trained and used in one run; saving them for a
+  // different rank count would need a partition-independent name.
+
+  /// The one space of its kind, created on first use and re-created if it has been let go.
+  template<typename SpaceType>
+  std::shared_ptr<PyMOR::Space<VectorType>>
+  cached(std::weak_ptr<SpaceType> & slot)
+  {
+    if(auto existing = slot.lock())
+      return existing;
+
+    auto space = std::make_shared<SpaceType>(shared_self());
+    slot       = space;
+
+    return space;
+  }
+
+  /// Number of face entities on this rank, interior and boundary.
+  unsigned int
+  n_faces() const
+  {
+    auto const & matrix_free = pde_operator->get_matrix_free();
+
+    return (matrix_free.n_inner_face_batches() + matrix_free.n_boundary_face_batches()) *
+           dealii::VectorizedArray<Number>::size();
+  }
+
+  /**
+   * The faces a weight vector selects, drawn as a surface mesh of those faces.
+   *
+   * One cell per selected face -- a line in 2D, a quadrilateral in 3D -- carrying its weight.
+   * That is the object ECSW actually chose, so it is the object to draw: marking the cells on
+   * either side of a face answers a different question, and answers it twice over for a face
+   * whose neighbours are also selected.
+   *
+   * deal.II has no "attach a number to a face" call. DataOutFaces draws faces but evaluates DoF
+   * *fields* on them, and there is no field here -- a weight is one number per face, belonging to
+   * no space. The way through is one level down: DataOutInterface asks only for patches, so each
+   * face is handed over as its own patch with a constant on it. Nothing is interpolated and no
+   * triangulation has to be built out of disconnected faces.
+   *
+   * Rank-independent for free: matrix-free gives a shared face to exactly one rank, and that rank
+   * owns the interior cell, so every selected face is emitted exactly once.
+   */
+  std::string
+  write_sampled_faces(std::vector<double> const & weights,
+                      std::string const &         directory,
+                      std::string const &         basename)
+  {
+    AssertThrow(weights.size() == n_faces(),
+                dealii::ExcMessage("Expected " + std::to_string(n_faces()) + " weights, got " +
+                                   std::to_string(weights.size()) + "."));
+
+    auto const &       matrix_free = pde_operator->get_matrix_free();
+    unsigned int const lanes       = dealii::VectorizedArray<Number>::size();
+    unsigned int const corners = dealii::GeometryInfo<dim - 1>::vertices_per_cell;
+
+    SelectedFaces selection;
+
+    for(unsigned int batch = 0; batch * lanes < weights.size(); ++batch)
+      for(unsigned int lane = 0; lane < lanes; ++lane)
+      {
+        double const value = weights[batch * lanes + lane];
+        if(value == 0.0)
+          continue;
+
+        auto const & info = matrix_free.get_face_info(batch);
+        unsigned int const cell = info.cells_interior[lane];
+
+        // MatrixFree numbers cells by batch and lane; an unfilled lane reads as invalid.
+        if(cell == dealii::numbers::invalid_unsigned_int)
+          continue;
+
+        auto const from = matrix_free.get_cell_iterator(cell / lanes, cell % lanes, dof_index());
+        auto const face = from->face(info.interior_face_no);
+
+        dealii::DataOutBase::Patch<dim - 1, dim> patch;
+        // A default-constructed patch carries no reference cell, and the VTU writer asks it how
+        // many vertices it has before anything else.
+        patch.reference_cell = dealii::ReferenceCells::get_hypercube<dim - 1>();
+        patch.n_subdivisions = 1;
+        patch.patch_index    = selection.patches.size();
+        patch.data.reinit(1, corners);
+
+        for(unsigned int corner = 0; corner < corners; ++corner)
+        {
+          patch.vertices[corner]  = face->vertex(corner);
+          patch.data(0, corner)   = value;
+        }
+
+        selection.patches.push_back(patch);
+      }
+
+    std::string const path =
+      (directory.empty() or directory.back() == '/') ? directory : directory + "/";
+
+    create_directories(path, mpi_comm);
+
+    return path + selection.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+  }
+
+  /**
+   * sum_f w_f S_f(u) as a full-order vector, over the weights last set.
+   *
+   * Not on the reduced model's path -- that projects inside the loop and never forms this -- but
+   * it is how the face loop is checked against N(u) - B(u, u), which is a statement about every
+   * degree of freedom rather than about r projections of them.
+   */
+  std::shared_ptr<VectorType>
+  apply_stabilisation(VectorType const & u)
+  {
+    auto dst = std::make_shared<VectorType>();
+    pde_operator->initialize_vector_velocity(*dst);
+
+    ScopedMode const mode(*this);
+    run_face_loop(*dst, owned(u));
+
+    return dst;
+  }
+
+  /**
+   * V^T S_f(u) for every face, row-major of shape (n_faces, n_basis).
+   *
+   * This is the matrix ECSW's non-negative least squares fits: its column sums are the exact
+   * projected stabilisation, and a sparse weight vector reproducing them is a rule for evaluating
+   * S on a handful of faces instead of all of them.
+   *
+   * The projection is done here rather than by integrating and scattering, because
+   * V_i^T S_f = \int_F flux . (V_i,m - V_i,p) is a quadrature sum over the face alone -- no
+   * assembly into a global vector is needed to get one face's contribution.
+   */
+  std::vector<double>
+  stabilisation_contributions(std::vector<VectorType> const & basis, VectorType const & u)
+  {
+    std::vector<double> matrix(static_cast<std::size_t>(n_faces()) * basis.size(), 0.0);
+
+    ScopedMode const mode(*this);
+    training_basis  = &basis;
+    training_matrix = &matrix;
+
+    VectorType dummy;
+    pde_operator->initialize_vector_velocity(dummy);
+    run_face_loop(dummy, owned(u));
+
+    return matrix;
+  }
+
+  /// The two quadrature rules the convective term is evaluated with: the one used by apply()
+  /// (linearised/linearly implicit) and the one used by evaluate_nonlinear_operator().
+  std::pair<unsigned int, unsigned int>
+  quadrature_indices() const
+  {
+    return {pde_operator->get_quad_index_velocity_linearized(),
+            pde_operator->get_quad_index_velocity_overintegration()};
+  }
+
+  /**
+   * The Lax-Friedrichs stabilisation on the selected faces, as data.
+   *
+   * Holds weights, quadrature measures, normals, boundary lifts and the basis traces on those
+   * faces -- and one double, the upwind factor. **No model, no mesh, no MatrixFree, no solver.**
+   * Built by Stabilisation::set_weights() and usable after everything else is gone, which is what
+   * makes the reduced model a deliverable rather than a view onto a resident full-order one.
+   */
+  class CompiledStabilisation : public PyMOR::CompiledOperator
+  {
+  public:
+    std::size_t
+    n_selected() const override
+    {
+      return weight.size();
+    }
+
+    std::vector<double>
+    projected(std::vector<double> const & coefficients) const override
+    {
+      std::vector<double> result(n_modes, 0.0);
+
+      for(std::size_t k = 0; k < weight.size(); ++k)
+        for(unsigned int q = 0; q < n_points; ++q)
+        {
+          auto const flux = weight[k] * measure[k * n_points + q] * flux_at(k, q, coefficients);
+
+          for(unsigned int i = 0; i < n_modes; ++i)
+            result[i] += lanes_sum(flux * test[(k * n_modes + i) * n_points + q]);
+        }
+
+      return reduced(result);
+    }
+
+    std::vector<double>
+    jacobian(std::vector<double> const & coefficients) const override
+    {
+      std::vector<double> result(n_modes * n_modes, 0.0);
+
+      for(std::size_t k = 0; k < weight.size(); ++k)
+        for(unsigned int q = 0; q < n_points; ++q)
+        {
+          // lambda is frozen when ExaDG linearises, so S' is linear and this is all of it
+          auto const scale =
+            weight[k] * measure[k * n_points + q] * (0.5 * lambda_at(k, q, coefficients));
+
+          // not symmetric in general: on a boundary face the trial jump is mirrored and the test
+          // function is not, so both loops run in full
+          for(unsigned int i = 0; i < n_modes; ++i)
+            for(unsigned int j = 0; j < n_modes; ++j)
+              result[i * n_modes + j] += lanes_sum(
+                scale * (trial(k, j, q) * test[(k * n_modes + i) * n_points + q]));
+        }
+
+      return reduced(result);
+    }
+
+  private:
+    friend class IncNSSaddlePoint;
+
+    FaceVector
+    state(std::vector<double> const &     coefficients,
+          std::vector<FaceVector> const & traces,
+          std::size_t const               k,
+          unsigned int const              q) const
+    {
+      FaceVector value;
+      for(unsigned int i = 0; i < n_modes; ++i)
+        value += coefficients[i] * traces[(k * n_modes + i) * n_points + q];
+
+      return value;
+    }
+
+    /// The increment's jump: mirrored on a boundary face, an ordinary jump on an interior one.
+    FaceVector
+    trial(std::size_t const k, unsigned int const i, unsigned int const q) const
+    {
+      std::size_t const at = (k * n_modes + i) * n_points + q;
+
+      return trace_m[at] - trace_p[at];
+    }
+
+    dealii::VectorizedArray<Number>
+    lambda_at(std::size_t const k, unsigned int const q,
+              std::vector<double> const & coefficients) const
+    {
+      auto const u_m = state(coefficients, trace_m, k, q);
+      auto const u_p = state(coefficients, trace_p, k, q) + lift[k * n_points + q];
+      auto const n   = normal[k * n_points + q];
+
+      return Operators::ConvectiveKernel<dim, Number>::lambda_of(upwind_factor, u_m * n, u_p * n);
+    }
+
+    FaceVector
+    flux_at(std::size_t const k, unsigned int const q,
+            std::vector<double> const & coefficients) const
+    {
+      auto const u_m = state(coefficients, trace_m, k, q);
+      auto const u_p = state(coefficients, trace_p, k, q) + lift[k * n_points + q];
+
+      return (0.5 * lambda_at(k, q, coefficients)) * (u_m - u_p);
+    }
+
+    static double
+    lanes_sum(dealii::VectorizedArray<Number> const & value)
+    {
+      double sum = 0.0;
+      for(unsigned int lane = 0; lane < dealii::VectorizedArray<Number>::size(); ++lane)
+        sum += value[lane];
+
+      return sum;
+    }
+
+    /// Sum over ranks: each holds the faces it owns, and the answer is over all of them.
+    std::vector<double>
+    reduced(std::vector<double> & values) const
+    {
+      dealii::Utilities::MPI::sum(dealii::ArrayView<double const>(values.data(), values.size()),
+                                  mpi_comm,
+                                  dealii::ArrayView<double>(values.data(), values.size()));
+
+      return values;
+    }
+
+    MPI_Comm     mpi_comm       = MPI_COMM_SELF;
+    double       upwind_factor  = 0.0;
+    unsigned int n_modes        = 0;
+    unsigned int n_points       = 0;
+
+    std::vector<dealii::VectorizedArray<Number>> weight;
+    std::vector<dealii::VectorizedArray<Number>> measure;
+    std::vector<FaceVector>                      normal;
+    std::vector<FaceVector>                      lift;
+    std::vector<FaceVector>                      trace_m;
+    std::vector<FaceVector>                      trace_p;
+    std::vector<FaceVector>                      test;
+  };
+
+  /**
+   * The Lax-Friedrichs stabilisation over a weighted subset of faces.
+   *
+   * Owns everything one reduced model needs -- basis, weights, and the geometry and basis traces
+   * of the faces those weights select -- so a model may hand out several without them
+   * interfering. Nothing here is shared, which is why nothing has to be invalidated.
+   *
+   * Speaks reduced coefficients. Given a velocity vector it would have to reconstruct V a over
+   * the whole mesh before looking at a dozen faces, and that reconstruction would then be the
+   * dominant cost; given coefficients the compiled half combines the basis traces it holds,
+   * touching no mesh-sized array and calling no deal.II integrator.
+   */
+  class Stabilisation : public PyMOR::SampledOperator<VectorType>
+  {
+  public:
+    Stabilisation(std::shared_ptr<IncNSSaddlePoint>                  fom,
+                  std::vector<std::shared_ptr<VectorType>> const & basis)
+      : fom(fom), n_modes(basis.size())
+    {
+      ghosted.resize(basis.size());
+      for(unsigned int i = 0; i < basis.size(); ++i)
+      {
+        fom->pde_operator->initialize_vector_velocity(ghosted[i]);
+        ghosted[i].copy_locally_owned_data_from(*basis[i]);
+        ghosted[i].update_ghost_values();
+      }
+
+      set_weights(std::vector<double>(n_entities(), 1.0));
+    }
+
+    std::size_t
+    n_entities() const override
+    {
+      return fom->n_faces();
+    }
+
+    /// Compile on first use: the weights arrive from a fit, and only the last set is worth a pass.
+    std::shared_ptr<PyMOR::CompiledOperator>
+    compiled() override
+    {
+      if(not data)
+        compile();
+
+      return data;
+    }
+
+    void
+    set_weights(std::vector<double> const & values) override
+    {
+      AssertThrow(values.size() == n_entities(),
+                  dealii::ExcMessage("Expected " + std::to_string(n_entities()) +
+                                     " weights, got " + std::to_string(values.size()) + "."));
+
+      weights = values;
+      data.reset();
+    }
+
+    /// The training data, over every face. Offline: it reconstructs V a and touches the mesh.
+    std::vector<double>
+    contributions(std::vector<double> const & coefficients) override
+    {
+      return fom->stabilisation_contributions(ghosted, reconstruct(coefficients));
+    }
+
+    /// Draw the selected faces as cell data. Collective, and offline like everything with a mesh.
+    std::string
+    write_selection(std::string const & directory, std::string const & basename) override
+    {
+      return fom->write_sampled_faces(weights, directory, basename);
+    }
+
+  private:
+    /// Select the faces the weights keep, and gather everything on them that is state-independent.
+    void
+    compile()
+    {
+      auto const &       matrix_free = fom->pde_operator->get_matrix_free();
+      unsigned int const lanes       = dealii::VectorizedArray<Number>::size();
+      unsigned int const n_inner     = matrix_free.n_inner_face_batches();
+
+      std::vector<unsigned int> selected;
+      for(unsigned int batch = 0; batch * lanes < weights.size(); ++batch)
+        for(unsigned int lane = 0; lane < lanes; ++lane)
+          if(weights[batch * lanes + lane] != 0.0)
+          {
+            selected.push_back(batch);
+            break;
+          }
+
+      FaceIntegratorU integrator_m(matrix_free, true, fom->dof_index(), fom->quad_index());
+      FaceIntegratorU integrator_p(matrix_free, false, fom->dof_index(), fom->quad_index());
+
+      data = std::make_shared<CompiledStabilisation>();
+
+      auto & c        = *data;
+      c.mpi_comm      = fom->mpi_comm;
+      c.upwind_factor = fom->application->get_parameters().upwind_factor;
+      c.n_modes       = n_modes;
+      c.n_points      = integrator_m.n_q_points;
+
+      std::size_t const n_q = c.n_points;
+
+      c.weight.assign(selected.size(), dealii::make_vectorized_array<Number>(0.0));
+      c.measure.assign(selected.size() * n_q, dealii::make_vectorized_array<Number>(0.0));
+      c.normal.assign(selected.size() * n_q, FaceVector());
+      c.lift.assign(selected.size() * n_q, FaceVector());
+      c.trace_m.assign(selected.size() * n_modes * n_q, FaceVector());
+      c.trace_p.assign(selected.size() * n_modes * n_q, FaceVector());
+      c.test.assign(selected.size() * n_modes * n_q, FaceVector());
+
+      for(std::size_t k = 0; k < selected.size(); ++k)
+      {
+        unsigned int const face     = selected[k];
+        bool const         interior = face < n_inner;
+
+        for(unsigned int lane = 0; lane < lanes; ++lane)
+          c.weight[k][lane] = weights[face * lanes + lane];
+
+        integrator_m.reinit(face);
+        if(interior)
+          integrator_p.reinit(face);
+
+        for(unsigned int q = 0; q < n_q; ++q)
+        {
+          c.normal[k * n_q + q]  = integrator_m.normal_vector(q);
+          c.measure[k * n_q + q] = integrator_m.JxW(q);
+
+          // the state-independent part of a boundary face's exterior value: with a mirror
+          // condition u_p = -u_m + 2g, this is the 2g. Zero on an interior face and, here, zero
+          // on every boundary face too -- but read rather than assumed.
+          if(not interior)
+            c.lift[k * n_q + q] = fom->exterior_value(
+              q, integrator_m, face, FaceVector(), ExaDG::OperatorType::full);
+        }
+
+        for(unsigned int i = 0; i < n_modes; ++i)
+        {
+          integrator_m.gather_evaluate(ghosted[i], dealii::EvaluationFlags::values);
+
+          if(interior)
+            integrator_p.gather_evaluate(ghosted[i], dealii::EvaluationFlags::values);
+
+          for(unsigned int q = 0; q < n_q; ++q)
+          {
+            std::size_t const at = (k * n_modes + i) * n_q + q;
+
+            c.trace_m[at] = integrator_m.get_value(q);
+            c.trace_p[at] = interior ? integrator_p.get_value(q) :
+                                       fom->exterior_value(q,
+                                                           integrator_m,
+                                                           face,
+                                                           c.trace_m[at],
+                                                           ExaDG::OperatorType::homogeneous);
+
+            // Test and trial jumps differ, and only on the boundary. The residual of a boundary
+            // face is integrated against the interior test function alone -- there is no exterior
+            // one -- while the increment still has an exterior value, so the trial jump is the
+            // mirrored one. On an interior face the two coincide.
+            c.test[at] = interior ? (c.trace_m[at] - c.trace_p[at]) : c.trace_m[at];
+          }
+        }
+      }
+    }
+
+    VectorType const &
+    reconstruct(std::vector<double> const & coefficients)
+    {
+      fom->pde_operator->initialize_vector_velocity(full_order);
+      full_order = 0.0;
+      for(unsigned int i = 0; i < n_modes; ++i)
+        full_order.add(coefficients[i], ghosted[i]);
+
+      return full_order;
+    }
+
+    std::shared_ptr<IncNSSaddlePoint> fom;
+    unsigned int const              n_modes;
+
+    std::vector<VectorType> ghosted;
+    VectorType              full_order;
+    std::vector<double>     weights;
+
+    std::shared_ptr<CompiledStabilisation> data;
+  };
+
+  std::shared_ptr<PyMOR::SampledOperator<VectorType>>
+  sampled_momentum(std::vector<std::shared_ptr<VectorType>> const & basis) override
+  {
+    return std::make_shared<Stabilisation>(shared_self(), basis);
+  }
+
+  /**
+   * The convective term as a split: N at this application's upwind factor, and the central-flux
+   * operator that is its exactly quadratic half.
+   *
+   * The two entry points already exist and are what convective_split.py measures; this is the
+   * declared form of them, so a reductor can build a tensor without knowing the physics or the
+   * method names. Q is `apply_convective_central` -- the nonlinear operator at upwind_factor 0 --
+   * and not the linearly-implicit operator, which is also trilinear but a different bilinear map
+   * (see apply_trilinear).
+   */
+  class ConvectiveSplit : public PyMOR::SplitOperator<VectorType>
+  {
+  public:
+    explicit ConvectiveSplit(std::shared_ptr<IncNSSaddlePoint> fom) : fom(fom)
+    {
+    }
+
+    std::shared_ptr<VectorType>
+    apply(VectorType const & u) const override
+    {
+      return fom->apply_convective(u);
+    }
+
+    std::shared_ptr<VectorType>
+    apply_polynomial(VectorType const & u) const override
+    {
+      return fom->apply_convective_central(u);
+    }
+
+  private:
+    std::shared_ptr<IncNSSaddlePoint> fom;
+  };
+
+  std::shared_ptr<PyMOR::SplitOperator<VectorType>>
+  split_momentum() override
+  {
+    if(not application->get_parameters().convective_problem())
+      return nullptr;
+
+    return std::make_shared<ConvectiveSplit>(shared_self());
+  }
+
+  /**
+   * Points ExaDG's momentum operator at a linearisation velocity, and keeps it alive.
+   *
+   * ExaDG stores the pointer, so ownership has to sit somewhere that outlives every Jacobian
+   * pyMOR builds and throws away during a Newton iteration. Here is that somewhere.
+   */
+  void
+  install_linearization(std::shared_ptr<VectorType> const & velocity)
+  {
+    installed_linearization = velocity;
+
+    // Every time, not once: evaluate_nonlinear_operator() ends by zeroing the ghost values of
+    // whatever velocity the kernel points at, so an intervening apply_convective() would strip
+    // the ghosts off this vector. Re-installing is cheap and this is the only place that knows.
+    installed_linearization->update_ghost_values();
+
+    pde_operator->get_momentum_operator().set_solution_linearization(*installed_linearization);
+  }
+
+
+protected:
+  /**
+   * The given vector copied into one this model owns, with its ghosts cleared.
+   *
+   * MatrixFree::loop() exchanges ghost values itself and expects to be handed a vector that is
+   * not already ghosted; a vector arriving from Python has whatever state its last use left. The
+   * copies also outlive the call, which matters because ExaDG stores the transport velocity by
+   * pointer. ExaDG's own evaluate_nonlinear_residual_steady() path copies for the same reason.
+   */
+  /**
+   * The given vector copied into one this model owns, with its ghost values *updated*.
+   *
+   * The counterpart of owned(), and the opposite requirement, on a different vector. A vector
+   * passed as the *argument* of MatrixFree::loop must not be ghosted, because the loop exchanges
+   * ghosts itself. A velocity installed as the kernel's *transport velocity* must be, because
+   * nothing in the linear path does it: only evaluate_nonlinear_operator() calls
+   * update_ghost_values_velocity(), while apply() and vmult() read the velocity through a face
+   * integrator and assume the caller has ghosted it. ExaDG's own time integrator does exactly
+   * that before solve_linear_problem() -- see time_int_bdf_coupled_solver.cpp.
+   *
+   * Getting this backwards is invisible serially, where there are no ghosts to be wrong, and
+   * wrong by tens of percent on the faces of a partition boundary.
+   */
+  VectorType &
+  transported(VectorType const & source, VectorType & destination)
+  {
+    pde_operator->initialize_vector_velocity(destination);
+    destination.copy_locally_owned_data_from(source);
+    destination.update_ghost_values();
+
+    return destination;
+  }
+
+  VectorType &
+  owned(VectorType const & source)
+  {
+    scratch.emplace_back();
+    pde_operator->initialize_vector_velocity(scratch.back());
+    scratch.back().copy_locally_owned_data_from(source);
+    scratch.back().zero_out_ghost_values();
+
+    if(scratch.size() > 8)
+      scratch.pop_front();
+
+    return scratch.back();
+  }
+
+  // --- the face loop the two stabilisation entry points share ---------------------------------
+
+
+  void
+  run_face_loop(VectorType & dst, VectorType const & src)
+  {
+    pde_operator->get_matrix_free().loop(&IncNSSaddlePoint::stabilisation_cell_loop,
+                                         &IncNSSaddlePoint::stabilisation_face_loop,
+                                         &IncNSSaddlePoint::stabilisation_boundary_loop,
+                                         this,
+                                         dst,
+                                         src,
+                                         true /* zero dst */,
+                                         dealii::MatrixFree<dim, Number>::DataAccessOnFaces::values,
+                                         dealii::MatrixFree<dim, Number>::DataAccessOnFaces::values);
+  }
+
+  void
+  stabilisation_cell_loop(dealii::MatrixFree<dim, Number> const &,
+                          VectorType &,
+                          VectorType const &,
+                          std::pair<unsigned int, unsigned int> const &) const
+  {
+    // the stabilisation has no volume term
+  }
+
+  /**
+   * Handle one face: either submit its weighted flux, or record its projected contribution.
+   *
+   * The two entry points differ only in what they do with the flux, so it is computed once here.
+   * lambda comes from ExaDG's own kernel rather than being rewritten: it is the definition of the
+   * term being isolated, and a second copy would be a second discretisation.
+   *
+   * The projection is a quadrature sum over the face alone,
+   * V_i^T S_f = int_F flux . (V_i,m - V_i,p), so one face's contribution needs no assembly into
+   * a global vector.
+   */
+  void
+  handle_face(unsigned int const face,
+              FaceIntegratorU &  integrator_m,
+              FaceIntegratorU *  integrator_p) const
+  {
+    unsigned int const lanes = dealii::VectorizedArray<Number>::size();
+
+    std::vector<FaceVector> fluxes(integrator_m.n_q_points);
+    std::vector<dealii::VectorizedArray<Number>> lambdas(integrator_m.n_q_points);
+
+    for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+    {
+      FaceVector const u_m = integrator_m.get_value(q);
+      FaceVector const u_p =
+        (integrator_p != nullptr) ?
+          integrator_p->get_value(q) :
+          exterior_value(q, integrator_m, face, u_m, ExaDG::OperatorType::full);
+      FaceVector const normal = integrator_m.normal_vector(q);
+
+      lambdas[q] = stabilisation_kernel->calculate_lambda(u_m * normal, u_p * normal);
+      fluxes[q]  = (0.5 * lambdas[q]) * (u_m - u_p);
+    }
+
+    if(training_matrix != nullptr)
+    {
+      auto const &      basis = *training_basis;
+      std::size_t const row   = static_cast<std::size_t>(face) * lanes;
+
+      FaceIntegratorU probe_m(pde_operator->get_matrix_free(), true, dof_index(), quad_index());
+      FaceIntegratorU probe_p(pde_operator->get_matrix_free(), false, dof_index(), quad_index());
+
+      for(unsigned int i = 0; i < basis.size(); ++i)
+      {
+        probe_m.reinit(face);
+        probe_m.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+
+        if(integrator_p != nullptr)
+        {
+          probe_p.reinit(face);
+          probe_p.gather_evaluate(basis[i], dealii::EvaluationFlags::values);
+        }
+
+        auto sum = dealii::make_vectorized_array<Number>(0.0);
+        for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+        {
+          FaceVector jump = probe_m.get_value(q);
+          if(integrator_p != nullptr)
+            jump = jump - probe_p.get_value(q);
+
+          sum += (fluxes[q] * jump) * integrator_m.JxW(q);
+        }
+
+        for(unsigned int lane = 0; lane < lanes; ++lane)
+          (*training_matrix)[(row + lane) * basis.size() + i] = sum[lane];
+      }
+    }
+    else
+    {
+      for(unsigned int q = 0; q < integrator_m.n_q_points; ++q)
+      {
+        integrator_m.submit_value(fluxes[q], q);
+        if(integrator_p != nullptr)
+          integrator_p->submit_value(-fluxes[q], q);
+      }
+    }
+  }
+
+  FaceVector
+  exterior_value(unsigned int const     q,
+                 FaceIntegratorU &      integrator,
+                 unsigned int const     face,
+                 FaceVector const &     value,
+                 ExaDG::OperatorType const operator_type) const
+  {
+    auto const boundary_id = pde_operator->get_matrix_free().get_boundary_id(face);
+
+    // Spelled out rather than auto: the parameter is shared_ptr<... const>, and a conversion
+    // from shared_ptr<...> blocks template argument deduction on dim.
+    std::shared_ptr<BoundaryDescriptorU<dim> const> const descriptor =
+      application->get_boundary_descriptor()->velocity;
+
+    return calculate_exterior_value_convective(value,
+                                               q,
+                                               integrator,
+                                               operator_type,
+                                               descriptor->get_boundary_type(boundary_id),
+                                               application->get_parameters().type_dirichlet_bc_convective,
+                                               boundary_id,
+                                               descriptor,
+                                               0.0 /* time */);
+  }
+
+  void
+  stabilisation_face_loop(dealii::MatrixFree<dim, Number> const &       matrix_free,
+                          VectorType &                                  dst,
+                          VectorType const &                            src,
+                          std::pair<unsigned int, unsigned int> const & range) const
+  {
+    FaceIntegratorU integrator_m(matrix_free, true, dof_index(), quad_index());
+    FaceIntegratorU integrator_p(matrix_free, false, dof_index(), quad_index());
+
+    for(unsigned int face = range.first; face < range.second; ++face)
+    {
+      integrator_m.reinit(face);
+      integrator_p.reinit(face);
+      integrator_m.gather_evaluate(src, dealii::EvaluationFlags::values);
+      integrator_p.gather_evaluate(src, dealii::EvaluationFlags::values);
+
+      handle_face(face, integrator_m, &integrator_p);
+
+      if(training_matrix == nullptr)
+      {
+        integrator_m.integrate_scatter(dealii::EvaluationFlags::values, dst);
+        integrator_p.integrate_scatter(dealii::EvaluationFlags::values, dst);
+      }
+    }
+  }
+
+  void
+  stabilisation_boundary_loop(dealii::MatrixFree<dim, Number> const &       matrix_free,
+                              VectorType &                                  dst,
+                              VectorType const &                            src,
+                              std::pair<unsigned int, unsigned int> const & range) const
+  {
+    FaceIntegratorU integrator(matrix_free, true, dof_index(), quad_index());
+
+    for(unsigned int face = range.first; face < range.second; ++face)
+    {
+      integrator.reinit(face);
+      integrator.gather_evaluate(src, dealii::EvaluationFlags::values);
+
+      handle_face(face, integrator, nullptr);
+
+      if(training_matrix == nullptr)
+        integrator.integrate_scatter(dealii::EvaluationFlags::values, dst);
+    }
+  }
+
+  unsigned int
+  dof_index() const
+  {
+    return pde_operator->get_dof_index_velocity();
+  }
+
+  unsigned int
+  quad_index() const
+  {
+    return pde_operator->get_quad_index_velocity_overintegration();
+  }
+
+  std::shared_ptr<IncNSSaddlePoint<dim, ApplicationType>>
+  shared_self()
+  {
+    return std::static_pointer_cast<IncNSSaddlePoint<dim, ApplicationType>>(this->shared_from_this());
+  }
+
+  /**
+   * Builds the two central-flux convective operators used to split the convective term.
+   *
+   * They share the solver's MatrixFree, degree-of-freedom index and quadrature rule, and differ
+   * from the solver's own convective operator in exactly two settings: upwind_factor is zero, so
+   * the flux is central and the operator is a polynomial in the velocity; and one of them is
+   * LinearlyImplicit, which makes it the bilinear map v -> C(w, v) rather than the Jacobian.
+   *
+   * The distinction matters. With TreatmentOfConvectiveTerm::Implicit, apply() is the derivative
+   * of the nonlinear operator -- in divergence form div(w x v + v x w) -- which is *not* the
+   * trilinear form. LinearlyImplicit gives div(w x v), which is.
+   */
+  void
+  setup_central_convective_operators()
+  {
+    auto const dof_index  = pde_operator->get_dof_index_velocity();
+    auto const quad_index = pde_operator->get_quad_index_velocity_linearized();
+
+    Operators::ConvectiveKernelData kernel_data;
+    kernel_data.formulation       = application->get_parameters().formulation_convective_term;
+    kernel_data.upwind_factor     = 0.0;
+    kernel_data.use_outflow_bc    = application->get_parameters().use_outflow_bc_convective_term;
+    kernel_data.type_dirichlet_bc = application->get_parameters().type_dirichlet_bc_convective;
+    kernel_data.ale               = application->get_parameters().ale_formulation;
+
+    ConvectiveOperatorData<dim> operator_data;
+    operator_data.dof_index            = dof_index;
+    operator_data.quad_index           = quad_index;
+    operator_data.quad_index_nonlinear = pde_operator->get_quad_index_velocity_overintegration();
+    operator_data.bc                   = application->get_boundary_descriptor()->velocity;
+    operator_data.use_cell_based_loops =
+      application->get_parameters().use_cell_based_face_loops;
+
+    // A member, not a local: OperatorBase::reinit() stores a lazy_ptr to this object rather than
+    // copying it, so a stack-allocated one leaves a dangling pointer behind. It survives serially
+    // and corrupts the heap under MPI, which is the same mistake as the linearisation velocity in
+    // Jacobian above -- ExaDG hands out pointers and the caller owns the lifetime.
+    central_constraints.close();
+
+    // Own velocity storage, unlike ExaDG's own convective kernel: evaluate_nonlinear_operator()
+    // begins with kernel->update_ghost_values_velocity(), which dereferences that vector. ExaDG's
+    // kernel has had set_velocity_ptr() called on it by Newton long before anyone evaluates the
+    // nonlinear operator; these two are evaluated directly, so they have to own something valid.
+    // Serially the unset lazy_ptr survives the dereference; on more than one rank it does not.
+    kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::LinearlyImplicit;
+    trilinear_kernel               = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    trilinear_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
+    operator_data.kernel_data = kernel_data;
+    trilinear_operator.initialize(
+      pde_operator->get_matrix_free(), central_constraints, operator_data, trilinear_kernel);
+
+    // the same physics as a nonlinear operator, so that C(u, u) can be checked against N(u)
+    kernel_data.temporal_treatment = TreatmentOfConvectiveTerm::Implicit;
+    central_kernel                 = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    central_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
+    operator_data.kernel_data = kernel_data;
+    central_operator.initialize(
+      pde_operator->get_matrix_free(), central_constraints, operator_data, central_kernel);
+
+    // Only ever asked for calculate_lambda(), so that the definition of the stabilisation lives
+    // in ExaDG's kernel rather than being restated in the face loop below.
+    kernel_data.upwind_factor = application->get_parameters().upwind_factor;
+    stabilisation_kernel      = std::make_shared<Operators::ConvectiveKernel<dim, Number>>();
+    stabilisation_kernel->reinit(
+      pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
+  }
+
+  double
+  scaling_factor_continuity() const
+  {
+    // ExaDG defaults it to one and only changes it for a pressure-scaled formulation, which this
+    // application does not use. Asserting beats reading a member that may drift.
+    return 1.0;
+  }
+
+
+  std::string
+  write_fields(dealii::DoFHandler<dim> const &                  dof_handler,
+               std::string const &                              directory,
+               std::string const &                              basename,
+               std::vector<std::shared_ptr<VectorType>> const & fields,
+               std::vector<std::string> const &                 names,
+               bool const                                       vector_valued) const
+  {
+    AssertThrow(fields.size() == names.size() and not fields.empty(),
+                dealii::ExcMessage("Expected one name per field, and at least one field."));
+
+    // deal.II concatenates directory and file name verbatim, so a missing separator writes the
+    // record next to the directory instead of inside it.
+    std::string const path =
+      (directory.empty() or directory.back() == '/') ? directory : directory + "/";
+
+    create_directories(path, mpi_comm);
+
+    dealii::DataOut<dim> data_out;
+    data_out.attach_dof_handler(dof_handler);
+
+    std::vector<VectorType> ghosted(fields.size());
+    for(unsigned int i = 0; i < fields.size(); ++i)
+    {
+      if(vector_valued)
+        pde_operator->initialize_vector_velocity(ghosted[i]);
+      else
+        pde_operator->initialize_vector_pressure(ghosted[i]);
+
+      ghosted[i] = *fields[i];
+      ghosted[i].update_ghost_values();
+
+      if(vector_valued)
+        data_out.add_data_vector(
+          ghosted[i],
+          std::vector<std::string>(dim, names[i]),
+          dealii::DataOut<dim>::type_dof_data,
+          std::vector<dealii::DataComponentInterpretation::DataComponentInterpretation>(
+            dim, dealii::DataComponentInterpretation::component_is_part_of_vector));
+      else
+        data_out.add_data_vector(ghosted[i], names[i]);
+    }
+
+    data_out.build_patches(*pde_operator->get_mapping(), dof_handler.get_fe().degree);
+
+    return path + data_out.write_vtu_with_pvtu_record(path, basename, 0, mpi_comm);
+  }
+
+  MPI_Comm mpi_comm;
+
+  std::shared_ptr<ApplicationType>                  application;
+  std::unique_ptr<Driver<dim, Number>>              driver;
+  std::shared_ptr<OperatorCoupled<dim, Number>>     pde_operator;
+
+  MassOperator<dim, 1, Number> pressure_mass;
+
+  // weak, so that model -> space -> model is not a cycle; see velocity_space()
+  std::weak_ptr<VelocitySpace> velocity_space_cache;
+  std::weak_ptr<PressureSpace> pressure_space_cache;
+
+  // vectors handed to ExaDG that it may keep a pointer to; see owned()
+  std::deque<VectorType> scratch;
+
+  /**
+   * Clears the face loop's mode on the way out.
+   *
+   * The loop is told what to do through the pointers below, and every entry point sets a
+   * different two or three of them. Resetting them by hand at each exit is how one gets missed,
+   * and a stale pointer means the next call silently does the previous call's job.
+   */
+  struct ScopedMode
+  {
+    explicit ScopedMode(IncNSSaddlePoint & fom) : fom(fom)
+    {
+    }
+
+    ~ScopedMode()
+    {
+      fom.training_basis   = nullptr;
+      fom.training_matrix  = nullptr;
+    }
+
+    IncNSSaddlePoint & fom;
+  };
+
+  // what the face loop should do; set through ScopedMode, never left behind
+  std::vector<VectorType> const * training_basis  = nullptr;
+  std::vector<double> *           training_matrix = nullptr;
+
+  // the convective term with a central flux, as a trilinear form and as a nonlinear operator,
+  // and a kernel at this application's upwind factor that owns the definition of lambda
+  dealii::AffineConstraints<Number>                         central_constraints;
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> trilinear_kernel;
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> central_kernel;
+  std::shared_ptr<Operators::ConvectiveKernel<dim, Number>> stabilisation_kernel;
+
+  ConvectiveOperator<dim, Number> trilinear_operator;
+  ConvectiveOperator<dim, Number> central_operator;
+
+  // whatever ExaDG's momentum operator currently points at; see install_linearization()
+  std::shared_ptr<VectorType> installed_linearization;
+  VectorType                  trilinear_transport;
+};
+
+} // namespace IncNS
+} // namespace ExaDG
+
+#endif /* EXADG_PYMOR_INCOMPRESSIBLE_FLOW_H_ */
