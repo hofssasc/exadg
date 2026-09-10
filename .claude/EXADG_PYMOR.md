@@ -51,8 +51,16 @@ Every application module must `py::module_::import("exadg._core")`.
 | parameters | in the operator, $P$ affine components | in the right-hand side only |
 | equation | linear | Stokes or Navier–Stokes, by input file |
 
-`forced` serves both flow equations: `Equation` selects them and the convective term is the only
-difference, so one is a controlled comparison for the other. Both input files are `SolverType::Steady`.
+`forced` serves both flow equations and both regimes: `Equation` selects Stokes or Navier-Stokes,
+`Regime` selects Steady or Unsteady, and each changes exactly one term -- the convective one and the
+mass one. `input_navier_stokes_transient.json` is the unsteady file. Verified: at `mass_scaling = 0`
+the unsteady model reproduces the steady one **bit-exactly**.
+
+**It is creeping flow.** Re = 2-6 at the amplitudes the examples draw (0.5-1.5), ceiling Re ~ 54
+before the velocity-block preconditioner -- which ignores convection -- stops converging. A
+transient run relaxes monotonically to steady in t ~ 10; there is no shedding and, in 2D, no
+turbulence at any Re. To make time matter, give `ForcingModes` a time dependence (it is a
+`dealii::Function` and has `get_time()`), not a larger Reynolds number.
 
 ## The step, not the loop
 

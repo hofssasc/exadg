@@ -182,6 +182,14 @@ public:
                         "is what makes a reduced model for one a controlled comparison for the "
                         "other.",
                         dealii::Patterns::Selection("Stokes|NavierStokes"));
+      prm.add_parameter("Regime",
+                        regime,
+                        "Steady or Unsteady. Unsteady adds the mass term to the momentum "
+                        "operator, which ExaDG decides at setup from SolverType and cannot be "
+                        "switched afterwards -- so it is a property of the input file rather "
+                        "than of a call. Nothing else about the problem changes: same geometry, "
+                        "same forcing, same boundary conditions.",
+                        dealii::Patterns::Selection("Steady|Unsteady"));
       prm.add_parameter("Viscosity",
                         viscosity,
                         "Kinematic viscosity, constant in space. With a unit box and unit "
@@ -238,20 +246,29 @@ public:
     return equation;
   }
 
+  /** Whether the momentum operator carries a mass term; see the Regime parameter. */
+  bool
+  is_unsteady() const
+  {
+    return regime == "Unsteady";
+  }
+
 private:
   void
   set_parameters() final
   {
     // MATHEMATICAL MODEL
-    this->param.problem_type             = ProblemType::Steady;
+    this->param.problem_type             = is_unsteady() ? ProblemType::Unsteady :
+                                                           ProblemType::Steady;
     this->param.equation_type            = equation == "Stokes" ?
                                              EquationType::Stokes :
                                              EquationType::NavierStokes;
 
-    // A steady solver has no time level to lag the convective term behind, so ExaDG requires it
-    // implicitly. That is also what the reduced model needs: an implicit convective term makes
-    // the (1,1) block depend on the current velocity, which is precisely the Jacobian a Newton
-    // iteration -- full order or reduced -- has to be handed.
+    // Implicit in both regimes. A steady solver has no time level to lag the convective term
+    // behind, so ExaDG requires it; and it is what the reduced model needs either way, since an
+    // implicit convective term makes the (1,1) block depend on the current velocity, which is
+    // precisely the Jacobian a Newton iteration -- full order or reduced -- has to be handed.
+    // Lagging it would move the nonlinearity into the right-hand side, where nothing projects it.
     this->param.treatment_of_convective_term = TreatmentOfConvectiveTerm::Implicit;
     this->param.formulation_viscous_term = FormulationViscousTerm::LaplaceFormulation;
     this->param.right_hand_side          = true;
@@ -263,10 +280,16 @@ private:
     this->param.viscosity  = viscosity;
 
     // TEMPORAL DISCRETIZATION
-    // Steady + coupled: the only combination that is a single saddle-point operator. The
-    // splitting schemes are time-integration algorithms whose substeps do not compose into one
-    // residual, so they cannot be projected.
-    this->param.solver_type             = SolverType::Steady;
+    // Coupled, in both regimes: it is the only formulation that is a single saddle-point
+    // operator. The splitting schemes are time-integration algorithms whose substeps do not
+    // compose into one residual, so they cannot be projected at all.
+    //
+    // SolverType decides whether the momentum operator gets a mass kernel, and it decides it at
+    // setup. Unsteady here does *not* mean ExaDG will step the problem -- the pyMOR binding
+    // builds the Driver as a throughput study, so no time integrator is created and the loop
+    // belongs to the caller. It means the operator can carry gamma_0/dt * M when asked to.
+    this->param.solver_type             = is_unsteady() ? SolverType::Unsteady :
+                                                          SolverType::Steady;
     this->param.temporal_discretization = TemporalDiscretization::BDFCoupledSolution;
     this->param.calculation_of_time_step_size = TimeStepCalculation::UserSpecified;
     this->param.time_step_size                = 1.0;
@@ -312,9 +335,15 @@ private:
     // here is a piece of solver tuning in its own right, not a line to change in passing.
     this->param.multigrid_operator_type_velocity_block = MultigridOperatorType::ReactionDiffusion;
 
-    // Pointless while the preconditioner ignores convection: it does not depend on the
-    // linearisation velocity that Newton updates.
-    this->param.update_preconditioner_coupled = false;
+    // Steady: pointless while the preconditioner ignores convection, since it then does not
+    // depend on the linearisation velocity that Newton updates.
+    //
+    // Unsteady: required, and for a different reason. The velocity block is built at setup with
+    // whatever scaling factor the mass operator happens to hold, while the caller solves at
+    // gamma_0/dt -- which for a small step is large and dominates the block. A preconditioner
+    // built at the wrong scaling is not wrong, only useless, and it shows up as a GMRES count
+    // rather than as a failure.
+    this->param.update_preconditioner_coupled = is_unsteady();
     this->param.multigrid_data_velocity_block.smoother_data.smoother = MultigridSmoother::Chebyshev;
     this->param.multigrid_data_velocity_block.coarse_problem.solver =
       MultigridCoarseGridSolver::Chebyshev;
@@ -429,6 +458,9 @@ private:
 
   // "Stokes" or "NavierStokes": the convective term is the only difference between them
   std::string  equation      = "Stokes";
+
+  // "Steady" or "Unsteady": whether the momentum operator carries a mass term
+  std::string  regime        = "Steady";
 
   double       viscosity        = 1.0;
   double       solver_tolerance = 1.e-10;

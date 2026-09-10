@@ -124,7 +124,10 @@ public:
     application = std::make_shared<Application<dim, Number>>(input_file, mpi_comm);
     application->set_parameters_convergence_study(degree, refinements, 0);
 
-    driver = std::make_unique<Driver<dim, Number>>(mpi_comm, application, true, false);
+    // is_throughput_study = true: Driver then builds the spatial operator and stops, creating
+    // neither a postprocessor nor a time integrator. Both would be dead weight -- the loop belongs
+    // to the caller (see PyMOR::SaddlePointModel) and this model writes its own VTU records.
+    driver = std::make_unique<Driver<dim, Number>>(mpi_comm, application, true, true);
     driver->setup();
 
     pde_operator = std::dynamic_pointer_cast<OperatorCoupled<dim, Number>>(
@@ -597,11 +600,18 @@ public:
    * steady solve returned as though it were a step, which is the one failure mode this interface
    * exists to prevent. Refusing costs a sentence; accepting costs a plausible wrong answer.
    */
+  /// Whether the momentum operator was built with a mass kernel. Decided at setup, by the
+  /// input file's Regime; see require_mass_admissible.
+  bool
+  is_unsteady() const
+  {
+    return application->get_parameters().solver_type == SolverType::Unsteady;
+  }
+
   void
   require_mass_admissible(double const mass_scaling) const
   {
-    AssertThrow(mass_scaling == 0.0 or
-                  application->get_parameters().solver_type == SolverType::Unsteady,
+    AssertThrow(mass_scaling == 0.0 or is_unsteady(),
                 dealii::ExcMessage(
                   "mass_scaling = " + std::to_string(mass_scaling) +
                   " needs SolverType::Unsteady. This model is configured steady, and ExaDG "
@@ -610,11 +620,15 @@ public:
   }
 
   /**
-   * N(u, p) without the right-hand side.
+   * s M u + N(u, p), without the right-hand side.
    *
-   * ExaDG's steady residual already has the body force subtracted, so it is added back here.
-   * Both terms read the same forcing amplitudes, so they cancel exactly whatever those are --
-   * which is what keeps this a function of (u, p) alone.
+   * The two regimes use different ExaDG entry points, and the unsteady one is the simpler.
+   * evaluate_nonlinear_residual() subtracts a right-hand side the *caller* assembled and
+   * evaluates no forcing of its own, which is exactly this interface's contract -- so it is
+   * handed a zero vector and nothing has to be undone. evaluate_nonlinear_residual_steady()
+   * evaluates the body force internally (operator_coupled.cpp, rhs_operator.evaluate), so the
+   * steady branch adds it back; both terms read the same amplitudes and cancel exactly whatever
+   * those are, which is what keeps this a function of (u, p) alone.
    */
   bool
   apply_nonlinear(VectorType const & u,
@@ -636,14 +650,27 @@ public:
     state.block(0) = u;
     state.block(1) = p;
 
-    pde_operator->evaluate_nonlinear_residual_steady(residual, state, time);
+    if(is_unsteady())
+    {
+      VectorType no_rhs(u);
+      no_rhs = 0.0;
 
-    VectorType body_force(u);
-    body_force = 0.0;
-    pde_operator->evaluate_add_body_force_term(body_force, time);
+      pde_operator->evaluate_nonlinear_residual(residual, state, &no_rhs, time, mass_scaling);
 
-    du = residual.block(0);
-    du += body_force;
+      du = residual.block(0);
+    }
+    else
+    {
+      pde_operator->evaluate_nonlinear_residual_steady(residual, state, time);
+
+      VectorType body_force(u);
+      body_force = 0.0;
+      pde_operator->evaluate_add_body_force_term(body_force, time);
+
+      du = residual.block(0);
+      du += body_force;
+    }
+
     dp = residual.block(1);
 
     return true;
