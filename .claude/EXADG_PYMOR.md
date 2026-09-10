@@ -254,8 +254,17 @@ independent sketch rides along in the same pass and is what gets reported; it tr
 about 10% over four orders of magnitude. `local_ecsw_weights` warns when the support exceeds half
 the sketch.
 
-**Time-series output is still missing.** Both visualizers refuse a trajectory and `Space::write_vtu`
-has no time argument.
+**The basis is a hierarchical POD.** `pod`'s method of snapshots forms an N x N Gramian -- 1.76 GB
+per rank and a ~6 min eigensolve at 24 parameters x 641 levels -- and its eigensolve is serial and
+replicated, exactly like the ECSW fit. `inc_hapod` compresses trajectory by trajectory under a
+*certified* l2-mean bound; at matched accuracy it gives the same basis from a 64x smaller Gramian.
+`eps` is absolute, so scale it by the rms snapshot norm. It can also stream, at the price of a
+second pass of FOM solves -- ECSW needs the same states once the basis exists.
+
+**Time series come out as a `.pvd`.** Both visualizers take a trajectory: one record per level plus
+a ParaView collection, `times=` optional. Written in Python -- `write_vtu_with_pvtu_record` appends a
+counter of its own, and a collection makes the record names irrelevant. `float()` the timestep or
+ParaView chokes on `np.float64(...)`.
 
 Status, order and the architecture for each are in
 `~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**

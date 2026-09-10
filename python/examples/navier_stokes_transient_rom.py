@@ -18,7 +18,7 @@
 #  along with this program. If not, see <https://www.gnu.org/licenses/>.
 #  ______________________________________________________________________
 
-"""Reducing a trajectory: POD in space *and* time, then ECSW over the states it visits.
+"""Reducing a trajectory: a hierarchical POD in space *and* time, then ECSW over what it visits.
 
 The transient counterpart of ``navier_stokes_ecsw.py``, and almost all of it is inherited. The
 reduced spatial operator is the same -- an exact convective tensor, a projected viscous block, and
@@ -26,8 +26,36 @@ a stabilisation sampled on a few faces -- because the *step* is the steady probl
 term, and only the mass term is new. What changes is what the snapshots are and how many.
 
 **Snapshots are trajectories.** A parameter no longer contributes one state but ``nt + 1`` of
-them, so the POD is over space and time together and the training set grows with the time
-resolution. That is a cost, and it lands hardest on ECSW.
+them, so the basis is built over space and time together and the training set grows with the time
+resolution. That is a cost, and it lands twice: on the basis, and harder on ECSW.
+
+**The basis comes from a hierarchical POD.** ``pymor.algorithms.pod`` uses the method of
+snapshots, which forms an ``N x N`` Gramian and eigendecomposes it -- fine at 264 snapshots, and
+1.76 GB *per rank* plus a six-minute eigensolve at 24 parameters by 641 levels. ``inc_hapod``
+compresses each trajectory as it arrives and then compresses the modes, so no matrix bigger than
+one chunk is ever formed, and it does so under a **certified** bound on the l2-mean projection
+error rather than a mode count. Measured, 8 trajectories of 33 levels::
+
+    method            modes   abs l2-mean       rel     time     matrix
+    POD, modes=4          4     3.375e-03  4.263e-02    0.078    264x264
+    POD, modes=8          8     5.206e-04  6.575e-03    0.091    264x264
+    HAPOD, rel=1e-01      3     5.200e-03  6.567e-02    0.029      33x33
+    HAPOD, rel=3e-02      6     1.523e-03  1.924e-02    0.033      33x33
+    HAPOD, rel=1e-02      8     5.206e-04  6.576e-03    0.035      33x33
+
+At matched accuracy HAPOD produces the same basis as the POD -- 8 modes at 5.206e-04 either way
+-- from a Gramian sixty-four times smaller, and it is faster. Every row met its bound.
+
+``eps`` is an *absolute* l2-mean error, so it is set here as a fraction of the rms snapshot norm;
+velocity and pressure have different scales and a shared absolute tolerance would mean different
+things to each.
+
+.. note::
+   HAPOD can also **stream**: ``inc_hapod`` takes an iterable, so trajectories can be solved as it
+   asks for them and never all held at once. That is not free here and the example does not do it
+   -- ECSW needs the same states again once the basis exists, so streaming trades a second pass of
+   full-order solves (73.8 s against 0.03 s at this size) for the snapshot storage it avoids.
+   Worth it when memory is tighter than compute, which at refinement 6 in 3D it will be.
 
 **The ECSW training matrix grows in its rows, not its columns.** ``G`` is
 ``(n_states * r) x n_faces``: refining the mesh widens it, and stepping in time lengthens it.
@@ -37,22 +65,25 @@ whole before anything is solved.
 
 ``sketch_rows`` fits on a Gaussian sketch of those rows instead, applied to each state's block as
 it is assembled so the matrix is never formed. Measured, degree 2, refinement 3, 6 trajectories
-of 33 levels (1584 rows), tolerance 1e-2::
+of 33 levels on the basis above (1782 rows), tolerance 1e-2::
 
     sketch       faces      residual     ROM error       MB
-     exact      19/144      9.93e-03    3.0417e-02     1.74
-       128      20/144      9.10e-03    3.0418e-02     0.14
-        32      15/144      3.01e-02    3.0420e-02     0.04
+     exact      20/144      9.56e-03    3.9434e-02     1.96
+       128      18/144      1.40e-02    3.9434e-02     0.14
+        32      15/144      2.11e-02    3.9434e-02     0.04
 
-A sketch of 128 rows reproduces the exact fit -- 20 faces against 19, and the same residual to
-within ten per cent -- for **a twelfth of the memory**. At the production row count that ratio is
-closer to a thousand.
+A sketch of 128 rows keeps 18 faces against 20 for **a fourteenth of the memory**, at a residual
+within a factor of 1.5. At the production row count that ratio is closer to a thousand.
 
 .. warning::
    The residual reported for a sketched fit is measured on a **second, independent** sketch that
    is never fitted against. Reporting it on its own sketch is meaningless: NNLS minimises over
    that sketch, so the number is in-sample and biased low -- a six-row sketch reports 5e-16 while
    being 28% wrong. See :func:`~exadg.mor.reductors.local_ecsw_weights`.
+
+A run leaves ``navier_stokes_transient_rom_{velocity,pressure}.pvd`` behind: the full-order
+trajectory, the hyper-reduced one and their difference as three fields of one animated series.
+Open the ``.pvd``, not the individual records.
 
 **Read the ROM error column with care.** It does not move, and that is not evidence that the
 sketch is free: the reduced error here is dominated by basis truncation at 3e-02, well above what
@@ -71,7 +102,7 @@ Run from the repository root.
 """
 
 import numpy as np
-from pymor.algorithms.pod import pod
+from pymor.algorithms.hapod import inc_vectorarray_hapod
 from pymor.core.logger import set_log_levels
 from pymor.parameters.base import Mu
 from pymor.tools import mpi
@@ -85,10 +116,13 @@ from exadg.mor.reductors import (
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes_transient.json"
 DEGREE, REFINEMENTS = 2, 3
 T, NT, ORDER = 4.0, 32, 2
-N_TRAIN, N_TEST, N_MODES = 6, 2, 4
+N_TRAIN, N_TEST = 6, 2
 AMPLITUDES = (0.5, 1.5)
 SKETCHES = (None, 128, 32)
 TOLERANCE = 1.0e-2
+
+#: Relative l2-mean projection error the basis is built to, and HAPOD's balance parameter.
+BASIS_TOLERANCE, OMEGA = 3.0e-2, 0.9
 
 
 def main():
@@ -112,8 +146,8 @@ def main():
     # a full-order trajectory costs nt + 1 nonlinear solves.
     reference = [model.solve(mu) for mu in test]
 
-    basis_u, singular_u = pod(trajectories.blocks[0], product=model.u_product, modes=N_MODES)
-    basis_p, _ = pod(trajectories.blocks[1], product=model.p_product, modes=N_MODES)
+    basis_u, error_u = trajectory_basis(trajectories.blocks[0], model.u_product, N_TRAIN)
+    basis_p, error_p = trajectory_basis(trajectories.blocks[1], model.p_product, N_TRAIN)
     bases = dict(
         RB_u=basis_u, RB_p=basis_p, u_product=model.u_product, p_product=model.p_product
     )
@@ -129,13 +163,17 @@ def main():
     print(f"velocity dofs      : {velocity.dim}")
     print(f"time steps         : {NT} of BDF-{ORDER} over [0, {T}]")
     print(f"snapshots          : {N_TRAIN} trajectories x {NT + 1} levels = {len(trajectories)}")
-    print(f"velocity spectrum  : {np.array2string(singular_u[:N_MODES], precision=4)}")
+    print(f"basis, HAPOD       : {len(basis_u)} velocity modes at {error_u:.2e} relative, "
+          f"{len(basis_p)} pressure at {error_p:.2e}")
+    print(f"  largest Gramian  : {int(np.ceil(len(trajectories) / N_TRAIN))} square, against "
+          f"{len(trajectories)} square for the method of snapshots")
     print(f"reduced dimension  : {exact_rom.solution_space.dim}")
     print(f"error, exact S     : {exact_error:.4e}")
 
     print(f"\nECSW over the states the trajectories visit: G is {rows} x n_faces")
     print(f"  {'sketch':>8}  {'faces':>10}  {'residual':>10}  {'ROM error':>11}  {'MB':>7}")
 
+    last = None
     for sketch in SKETCHES:
         reductor = InstationaryECSWStokesReductor(
             model, training_states=trajectories.blocks[0], tolerance=TOLERANCE,
@@ -154,6 +192,26 @@ def main():
         )
 
         assert error < 2.0 * exact_error, "sampling the stabilisation changed the answer"
+        last = (reductor, rom)
+
+    # Something to look at: the full-order trajectory, the hyper-reduced one and their difference,
+    # at one test parameter, as three fields of one time series per block. A .pvd collection ties
+    # the per-level records together, so ParaView animates it and the record names stop mattering.
+    reductor, rom = last
+    mu = test[0]
+    U_fom = reference[0]
+    U_rom = reductor.reconstruct(rom.solve(mu))
+    times = np.linspace(0.0, T, len(U_fom))
+
+    written = model.visualize(
+        (U_fom, U_rom, U_fom - U_rom),
+        legend=("fom", "rom", "error"),
+        filename="output/pymor/navier_stokes_transient_rom",
+        times=times,
+    )
+    print(f"\nwrote {len(U_fom)} time levels:")
+    for record in written:
+        print(f"      {record}")
 
     print(
         "\nThe transient reduction is the steady one plus a mass term, which is what carrying the\n"
@@ -167,6 +225,25 @@ def main():
         "counts. The residual column is what says whether a sketch was large enough; the ROM error\n"
         "column cannot, because basis truncation dominates it."
     )
+
+
+def trajectory_basis(snapshots, product, chunks):
+    """A hierarchical POD of the snapshots, to a *relative* l2-mean projection error.
+
+    ``inc_vectorarray_hapod`` bounds the **absolute** l2-mean error, so the tolerance is scaled by
+    the rms snapshot norm here -- velocity and pressure differ by an order of magnitude in this
+    problem, and one absolute number would mean something different to each.
+
+    Returns the modes and the relative error actually achieved, which is what says the bound held.
+    """
+    scale = np.sqrt((snapshots.norm(product) ** 2).mean())
+    modes, _, _ = inc_vectorarray_hapod(
+        chunks, snapshots, BASIS_TOLERANCE * scale, omega=OMEGA, product=product
+    )
+
+    residual = snapshots - modes.lincomb(product.apply2(modes, snapshots))
+
+    return modes, np.sqrt((residual.norm(product) ** 2).mean()) / scale
 
 
 def worst_error(model, reductor, rom, test, reference):

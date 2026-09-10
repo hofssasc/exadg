@@ -499,6 +499,57 @@ class ExaDGFunctional(ListVectorArrayOperatorBase):
         )
 
 
+def write_pvd_record(path, entries):
+    """A ParaView collection tying one record per time level into a single series.
+
+    ``entries`` are ``(time, record)`` pairs; the records are made relative to the collection, so
+    the directory can be moved. Plain XML and written here rather than in C++ for one reason: it
+    is the only thing ParaView needs in order to stop caring what the individual files are called.
+    deal.II's ``write_vtu_with_pvtu_record`` appends a counter of its own, so a series written by
+    varying the basename comes out with two of them -- which a collection makes irrelevant.
+
+    Under MPI this is called on rank 0 alone. Each *record* it lists is collective and has already
+    been written by every rank; the collection is one small file naming them.
+    """
+    path = Path(path).with_suffix(".pvd")
+
+    lines = [
+        '<?xml version="1.0"?>',
+        '<VTKFile type="Collection" version="0.1" byte_order="LittleEndian">',
+        "  <Collection>",
+    ]
+    # float(), because a NumPy scalar's repr is "np.float64(0.0)" and ParaView parses the
+    # attribute as a number. It reads as a formatting nicety and is a correctness fix.
+    lines += [
+        f'    <DataSet timestep="{float(time)!r}" group="" part="0" '
+        f'file="{Path(record).name}"/>'
+        for time, record in entries
+    ]
+    lines += ["  </Collection>", "</VTKFile>", ""]
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+
+    return str(path)
+
+
+def level_times(count, times):
+    """One time per stored level: what the caller gave, or the level index.
+
+    An index is a poor time and a good ordering, which is all ParaView needs to animate. A model
+    that knows its own interval should pass ``times``; nothing here can know it, since a
+    visualizer is handed vectors and not a time axis.
+    """
+    if times is None:
+        return list(range(count))
+
+    times = list(times)
+    if len(times) != count:
+        raise ValueError(f"got {len(times)} times for {count} levels")
+
+    return times
+
+
 class ExaDGVisualizer(ImmutableObject):
     """Writes vector arrays as VTU/PVTU records, as pyMOR's ``visualizer`` hook.
 
@@ -518,40 +569,42 @@ class ExaDGVisualizer(ImmutableObject):
         self.space = space
         self.directory = directory
 
-    def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
-        """Write the given fields.
+    def visualize(self, U, title=None, legend=None, filename=None, block=None, times=None,
+                  **kwargs):
+        """Write the given fields, as one record or as a time series.
 
         Args:
-            U: A VectorArray, or a tuple of them to write as separate fields of one record.
+            U: A VectorArray, or a tuple of them to write as separate fields of one record. Arrays
+                of length one give a single record; longer ones give a series, and all of them
+                must then be the same length.
             title: Accepted and ignored; there is no window to title.
             legend: Field name per entry of ``U``. Defaults to ``field_0``, ``field_1``, ...
             filename: Path without extension. Defaults to ``<directory>/<title or 'solution'>``.
             block: Accepted and ignored; nothing blocks.
+            times: One time per level, for a series. Defaults to the level index.
 
         Returns:
-            str: Path of the written ``.pvtu``.
+            str: Path of the written ``.pvtu``, or of the ``.pvd`` collection for a series.
         """
         arrays = U if isinstance(U, tuple) else (U,)
 
-        vectors, names = [], []
+        names = []
         for position, array in enumerate(arrays):
             assert array in self.space
 
-            label = (
+            names.append(
                 legend[position]
                 if legend is not None and not isinstance(legend, str)
                 else (legend if isinstance(legend, str) else f"field_{position}")
             )
 
-            # A time series would be several records rather than several fields; until an
-            # instationary model exists, refusing beats writing only the first vector.
-            if len(array) != 1:
-                raise NotImplementedError(
-                    f"visualize() writes one vector per field, got {len(array)}."
-                )
+        levels = {len(array) for array in arrays}
+        if len(levels) != 1:
+            raise ValueError(f"all fields must have the same number of levels, got {levels}")
+        levels = levels.pop()
 
-            vectors.append(array.vectors[0].impl)
-            names.append(label if len(arrays) > 1 or legend is not None else "solution")
+        if len(arrays) == 1 and legend is None:
+            names = ["solution"]
 
         if filename is None:
             directory, basename = self.directory, (title or "solution")
@@ -559,4 +612,23 @@ class ExaDGVisualizer(ImmutableObject):
             path = Path(filename)
             directory, basename = str(path.parent), path.stem
 
-        return self.space.impl.write_vtu(directory, basename, vectors, names)
+        # One level is one record. Several are a *series*: one record per level plus a collection,
+        # rather than several fields of one record, because they are the same field at different
+        # times and ParaView animates a collection.
+        if levels == 1:
+            return self.space.impl.write_vtu(
+                directory, basename, [array.vectors[0].impl for array in arrays], names
+            )
+
+        entries = [
+            (
+                time,
+                self.space.impl.write_vtu(
+                    directory, f"{basename}_t{level:04d}",
+                    [array.vectors[level].impl for array in arrays], names,
+                ),
+            )
+            for level, time in enumerate(level_times(levels, times))
+        ]
+
+        return write_pvd_record(str(Path(directory) / basename), entries)

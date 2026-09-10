@@ -44,7 +44,7 @@ from pymor.parameters.functionals import ConstantParameterFunctional, Projection
 from pymor.solvers.interface import Solver
 from pymor.vectorarrays.interface import VectorArray
 
-from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace
+from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace, level_times, write_pvd_record
 from exadg.mor.models.stationary import parameter_names
 
 #: The step this module is on. ``interface.h`` takes ``(mass_scaling, time)`` at every method
@@ -133,20 +133,21 @@ def _solve_blocks(fom, velocity_space, pressure_space, f, g):
 def _visualize_arguments(U, title, legend, filename, directory):
     """The part of visualize() that does not depend on how the write is dispatched.
 
-    Returns ``(arrays, names, base)``: the fields to write, one name each, and the output path
-    without its suffix.
+    Returns ``(arrays, names, base, levels)``: the fields to write, one name each, the output path
+    without its suffix, and how many time levels each field has.
+
+    One level is one record; several are a *series* -- one record per level plus a ``.pvd``
+    collection -- because they are the same field at different times rather than different fields.
     """
     # Any sequence of arrays, or one array on its own. A VectorArray is itself iterable over its
     # vectors, so it has to be recognised before the sequence case rather than after it.
     arrays = (U,) if isinstance(U, VectorArray) else tuple(U)
 
-    for array in arrays:
-        # A time series would be several records rather than several fields; until an
-        # instationary model exists, refusing beats writing only the first vector.
-        if len(array) != 1:
-            raise NotImplementedError(
-                f"visualize() writes one vector per field, got {len(array)}."
-            )
+    levels = {len(array) for array in arrays}
+    if len(levels) != 1:
+        raise ValueError(
+            f"all fields must have the same number of time levels, got {sorted(levels)}."
+        )
 
     names = [
         legend[i] if legend is not None and not isinstance(legend, str) else f"field_{i}"
@@ -154,7 +155,7 @@ def _visualize_arguments(U, title, legend, filename, directory):
     ]
     base = Path(filename) if filename else Path(directory) / (title or "solution")
 
-    return arrays, names, base
+    return arrays, names, base, levels.pop()
 
 
 class ExaDGCoupledSolver(Solver):
@@ -199,21 +200,43 @@ class ExaDGSaddlePointVisualizer:
     def __init__(self, directory="output/pymor"):
         self.directory = directory
 
-    def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
-        arrays, names, base = _visualize_arguments(U, title, legend, filename, self.directory)
+    def visualize(self, U, title=None, legend=None, filename=None, block=None, times=None,
+                  **kwargs):
+        """Write the fields, as two records or as two time series.
+
+        Args:
+            times: One time per level, for a series. Defaults to the level index.
+        """
+        arrays, names, base, levels = _visualize_arguments(
+            U, title, legend, filename, self.directory
+        )
+        moments = level_times(levels, times)
 
         written = []
         for position, suffix in enumerate(("velocity", "pressure")):
             blocks = [array.blocks[position] for array in arrays]
+            space = blocks[0].space.impl
 
-            written.append(
-                blocks[0].space.impl.write_vtu(
-                    str(base.parent),
-                    f"{base.name}_{suffix}",
-                    [array.vectors[0].impl for array in blocks],
-                    names,
+            if levels == 1:
+                written.append(
+                    space.write_vtu(
+                        str(base.parent), f"{base.name}_{suffix}",
+                        [array.vectors[0].impl for array in blocks], names,
+                    )
                 )
-            )
+                continue
+
+            entries = [
+                (
+                    time,
+                    space.write_vtu(
+                        str(base.parent), f"{base.name}_{suffix}_t{level:04d}",
+                        [array.vectors[level].impl for array in blocks], names,
+                    ),
+                )
+                for level, time in enumerate(moments)
+            ]
+            written.append(write_pvd_record(str(base.parent / f"{base.name}_{suffix}"), entries))
 
         return tuple(written)
 
@@ -366,8 +389,8 @@ class MPIExaDGCoupledSolver(Solver):
         return solution, {}
 
 
-def _local_write_block(model, position, array_ids, directory, basename, names):
-    """Write one block's fields on every rank. deal.II's pvtu record is collective.
+def _local_write_block(model, position, array_ids, directory, basename, names, level=0):
+    """Write one block's fields at one time level, on every rank. The pvtu record is collective.
 
     The ids are resolved here rather than by mpi.function_call, which only maps arguments that
     are themselves ObjectIds and not lists of them.
@@ -378,7 +401,7 @@ def _local_write_block(model, position, array_ids, directory, basename, names):
     arrays = [mpi.get_object(array_id) for array_id in array_ids]
 
     return space.impl.write_vtu(
-        directory, basename, [array.vectors[0].impl for array in arrays], names
+        directory, basename, [array.vectors[level].impl for array in arrays], names
     )
 
 
@@ -395,24 +418,41 @@ class MPIExaDGSaddlePointVisualizer:
         self.models_id = models_id
         self.directory = directory
 
-    def visualize(self, U, title=None, legend=None, filename=None, block=None, **kwargs):
+    def visualize(self, U, title=None, legend=None, filename=None, block=None, times=None,
+                  **kwargs):
         from pymor.tools import mpi
 
-        arrays, names, base = _visualize_arguments(U, title, legend, filename, self.directory)
-
-        return tuple(
-            mpi.call(
-                mpi.function_call,
-                _local_write_block,
-                self.models_id,
-                position,
-                [array.blocks[position].impl.obj_id for array in arrays],
-                str(base.parent),
-                f"{base.name}_{suffix}",
-                names,
-            )
-            for position, suffix in enumerate(("velocity", "pressure"))
+        arrays, names, base, levels = _visualize_arguments(
+            U, title, legend, filename, self.directory
         )
+        moments = level_times(levels, times)
+        ids = {
+            position: [array.blocks[position].impl.obj_id for array in arrays]
+            for position in (0, 1)
+        }
+
+        def record(position, basename, level):
+            return mpi.call(
+                mpi.function_call, _local_write_block, self.models_id, position, ids[position],
+                str(base.parent), basename, names, level,
+            )
+
+        written = []
+        for position, suffix in enumerate(("velocity", "pressure")):
+            if levels == 1:
+                written.append(record(position, f"{base.name}_{suffix}", 0))
+                continue
+
+            entries = [
+                (time, record(position, f"{base.name}_{suffix}_t{level:04d}", level))
+                for level, time in enumerate(moments)
+            ]
+
+            # Each record above is collective; the collection is one small file and is written
+            # here, which under pyMOR's event loop is rank 0 alone.
+            written.append(write_pvd_record(str(base.parent / f"{base.name}_{suffix}"), entries))
+
+        return tuple(written)
 
 
 def exadg_model(model):
