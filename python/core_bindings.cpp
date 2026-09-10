@@ -300,44 +300,66 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def_property_readonly("parameter_shape", &SaddlePointModel<V>::parameter_shape)
     .def("velocity_space", &SaddlePointModel<V>::velocity_space)
     .def("pressure_space", &SaddlePointModel<V>::pressure_space)
-    .def("momentum", &SaddlePointModel<V>::momentum)
+    .def("momentum", &SaddlePointModel<V>::momentum, py::arg("mass_scaling"))
     .def("divergence", &SaddlePointModel<V>::divergence)
     .def("velocity_product", &SaddlePointModel<V>::velocity_product)
+    .def("velocity_mass", &SaddlePointModel<V>::velocity_mass)
     .def("pressure_product", &SaddlePointModel<V>::pressure_product)
     .def_property_readonly("is_nonlinear", &SaddlePointModel<V>::is_nonlinear)
     .def(
       "apply_nonlinear",
-      [](SaddlePointModel<V> & m, V const & u, V const & p) -> py::object {
+      [](SaddlePointModel<V> & m,
+         V const &             u,
+         V const &             p,
+         double const          mass_scaling,
+         double const          time) -> py::object {
         auto du = m.velocity_space()->zero_vector();
         auto dp = m.pressure_space()->zero_vector();
 
-        if(not m.apply_nonlinear(u, p, *du, *dp))
+        if(not m.apply_nonlinear(u, p, *du, *dp, mass_scaling, time))
           return py::none();
 
         return py::make_tuple(du, dp);
       },
       py::arg("u"),
       py::arg("p"),
-      "N(u, p) without the right-hand side; returns (velocity, pressure), or None if linear.")
-    .def("jacobian_momentum", &SaddlePointModel<V>::jacobian_momentum, py::arg("velocity"))
+      py::arg("mass_scaling"),
+      py::arg("time"),
+      "s M u + N(u, p) without the right-hand side; returns (velocity, pressure), or None if "
+      "linear. mass_scaling and time are the step's and are never defaulted: a silent 0.0 would "
+      "mean 'steady'.")
+    .def("jacobian_momentum",
+         &SaddlePointModel<V>::jacobian_momentum,
+         py::arg("velocity"),
+         py::arg("mass_scaling"))
     .def("sampled_momentum", &SaddlePointModel<V>::sampled_momentum, py::arg("basis"))
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)
     .def(
       "solve",
-      [](SaddlePointModel<V> & m, V const & f, V const & g) -> py::object {
+      [](SaddlePointModel<V> &     m,
+         V const &                 f,
+         V const &                 g,
+         double const              mass_scaling,
+         double const              time,
+         std::shared_ptr<V> const  initial_guess) -> py::object {
         auto u = m.velocity_space()->zero_vector();
         auto p = m.pressure_space()->zero_vector();
 
-        if(not m.solve(f, g, *u, *p))
+        if(not m.solve(f, g, *u, *p, mass_scaling, time, initial_guess.get()))
           return py::none();
 
         return py::make_tuple(u, p);
       },
       py::arg("f"),
       py::arg("g"),
-      "Full-order coupled solve for the given right-hand side; returns (velocity, pressure).");
+      py::arg("mass_scaling"),
+      py::arg("time"),
+      py::arg("initial_guess") = nullptr,
+      "One step's coupled solve for the given right-hand side; returns (velocity, pressure). "
+      "initial_guess = None is a cold start, which is what a snapshot needs and a time loop does "
+      "not.");
 }
 
 } // namespace PyMOR

@@ -47,6 +47,13 @@ from pymor.vectorarrays.interface import VectorArray
 from exadg.mor.binding import ExaDGOperator, ExaDGVectorSpace
 from exadg.mor.models.stationary import parameter_names
 
+#: The step this module is on. ``interface.h`` takes ``(mass_scaling, time)`` at every method
+#: that evaluates or solves the momentum equation, because a transient model steps in time and a
+#: steady one does not -- and it never defaults them, since a silent ``0.0`` would mean "steady".
+#: This factory builds pyMOR's *stationary* saddle point, so the answer is the same everywhere and
+#: is written down once. An instationary model is a different factory and passes the step it is on.
+STEADY = dict(mass_scaling=0.0, time=0.0)
+
 
 class ExaDGNonlinearMomentum(Operator):
     """A(u), the momentum block of a Navier-Stokes system.
@@ -78,7 +85,7 @@ class ExaDGNonlinearMomentum(Operator):
         zero_pressure = self.pressure_space.impl.zero_vector()
 
         return self.range.make_array([
-            self.range.make_vector(self.fom.apply_nonlinear(u.impl, zero_pressure)[0])
+            self.range.make_vector(self.fom.apply_nonlinear(u.impl, zero_pressure, **STEADY)[0])
             for u in U.vectors
         ])
 
@@ -96,7 +103,9 @@ class ExaDGNonlinearMomentum(Operator):
         assert len(U) == 1
 
         return ExaDGOperator(
-            self.space, self.fom.jacobian_momentum(U.vectors[0].impl), name="A'(u)"
+            self.space,
+            self.fom.jacobian_momentum(U.vectors[0].impl, STEADY["mass_scaling"]),
+            name="A'(u)",
         )
 
 
@@ -109,7 +118,7 @@ def _solve_blocks(fom, velocity_space, pressure_space, f, g):
     """
     velocities, pressures = [], []
     for i in range(len(f)):
-        result = fom.solve(f.vectors[i].impl, g.vectors[i].impl)
+        result = fom.solve(f.vectors[i].impl, g.vectors[i].impl, **STEADY)
 
         if result is None:
             raise InversionError("the application declined to solve this system")
@@ -230,7 +239,7 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
     if fom.is_nonlinear:
         A = ExaDGNonlinearMomentum(velocity, pressure, fom)
     else:
-        A = ExaDGOperator(velocity, fom.momentum(), name="A")
+        A = ExaDGOperator(velocity, fom.momentum(STEADY["mass_scaling"]), name="A")
     B = ExaDGOperator(velocity, fom.divergence(), name="B", range_space=pressure)
 
     shape = list(fom.parameter_shape)

@@ -52,7 +52,27 @@ Every application module must `py::module_::import("exadg._core")`.
 | equation | linear | Stokes or Navier–Stokes, by input file |
 
 `forced` serves both flow equations: `Equation` selects them and the convective term is the only
-difference, so one is a controlled comparison for the other.
+difference, so one is a controlled comparison for the other. Both input files are `SolverType::Steady`.
+
+## The step, not the loop
+
+`interface.h` carries one implicitly discretised step — `s M u + N(u, p) = f`, `s = gamma_0/dt` — so
+`momentum`, `apply_nonlinear`, `jacobian_momentum` and `solve` each take `(mass_scaling, time)`, and
+`solve` also takes an initial guess (`None` = cold start, which is what a snapshot needs). `s = 0` is
+the steady problem; `models/saddle_point.py` writes that down once as `STEADY`.
+
+**The time loop belongs to pyMOR, for both models.** A reduced model has no ExaDG object to step it,
+and a FOM stepped by `TimeIntBDF` against a ROM stepped by pyMOR would be two discretisations rather
+than a measurement. The history reaches ExaDG inside `f`.
+
+`velocity_mass()` is declared separately from `velocity_product()` even though `forced` returns the
+same handle: a velocity product may legitimately be the H1 product, and reading the time
+derivative's operator off the inner product would then be wrong without failing.
+
+**A nonzero `mass_scaling` on a steady model is refused.** `MomentumOperatorData::unsteady_problem`
+comes from `SolverType` at setup, so without it the mass kernel is never built and
+`set_scaling_factor_mass_operator()` accepts any value and changes nothing — a steady solve returned
+as a step. `ForcedFOM::require_mass_admissible` aborts instead.
 
 ## The Navier–Stokes reduction, in one picture
 
@@ -176,15 +196,22 @@ matrix-free pads its face batches per rank (144 → 184 at four).
 
 ## Known defects, not yet fixed
 
-**The ECSW weight fit is redundant across ranks.** `local_ecsw_weights` has every rank gather the
-whole training matrix — $(n_\text{train}\, r) \times n_\text{faces}$, on *every* rank — and solve
-the same NNLS. Scales in neither memory nor work, and its width grows with the mesh. Offline, so it
-bounds the size of problem that can be trained rather than the cost of a reduced solve.
+**The reductor reaches around the vocabulary.** `reductors.py` gets the C++ handle through
+`model.operator.solver.fom`, and calls `apply_convective` / `apply_convective_central`, which
+`forced` binds but `interface.h` does not declare. So the tensor half of the reduction is not
+portable to a second flow application, while the ECSW half is.
 
-The architecture for the fix is in
+**The ROM is not yet a deliverable.** `CompiledStabilisation` holds a communicator and allreduces on
+every `projected()` / `jacobian()`, and nothing serialises. `detach()` drops the mesh, not the
+communicator.
+
+**The ECSW weight fit gathers the whole training matrix on every rank.** Not slow — 0.02–0.22 s at
+2D refinement 6, ~0.03% of offline wall time — but the memory is the wall: 1.2 GB for a transient 2D
+training set, 5.7 GB for steady 3D. Transient grows the *rows*, 3D the *columns*, and they need
+different treatments.
+
+Status, order and the architecture for each are in
 `~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**
-Three defects listed there are now fixed: the evaluator owns its basis and weights (no tokens), it
-speaks reduced coefficients (no full-order reconstruction), and it is detached from the model.
 
 ## Vault
 

@@ -240,26 +240,28 @@ public:
   //  The three blocks
   // ===========================================================================================
 
-  /// A, the (1,1) block. Viscous only while the equation is Stokes and the problem is steady.
+  /// A = s M + viscous (+ convective, once the equation is Navier-Stokes), the (1,1) block.
   class Momentum : public PyMOR::LinearOperator<VectorType>
   {
   public:
-    explicit Momentum(std::shared_ptr<ForcedFOM<dim>> fom) : fom(fom)
+    Momentum(std::shared_ptr<ForcedFOM<dim>> fom, double const mass_scaling)
+      : fom(fom), mass_scaling(mass_scaling)
     {
     }
 
     void
     apply(VectorType & dst, VectorType const & src) const override
     {
-      // Set here rather than once at construction: ExaDG's solve_nonlinear_problem() resets the
-      // factor to 1.0 on every call, and a steady residual carries no mass term -- so an operator
-      // that trusted the constructor would silently become A + M after the first solve.
-      fom->pde_operator->get_momentum_operator().set_scaling_factor_mass_operator(0.0);
+      // Installed on every apply rather than once, because the operator is shared: ExaDG's
+      // solve_nonlinear_problem() and solve_linear_problem() both set this factor on the same
+      // object, so an operator that trusted its constructor would evaluate at whatever the last
+      // solve left behind.
+      fom->pde_operator->get_momentum_operator().set_scaling_factor_mass_operator(mass_scaling);
       fom->pde_operator->get_momentum_operator().vmult(dst, src);
     }
 
-    /// Only while there is no convective term: the viscous operator is symmetric, u . grad u is
-    /// not. The Navier-Stokes step has to override apply_transpose() rather than flip this.
+    /// Only while there is no convective term: mass and viscous are both symmetric, u . grad u
+    /// is not. The Navier-Stokes step has to override apply_transpose() rather than flip this.
     bool
     is_symmetric() const override
     {
@@ -274,6 +276,7 @@ public:
 
   private:
     std::shared_ptr<ForcedFOM<dim>> fom;
+    double const                    mass_scaling;
   };
 
   /**
@@ -367,8 +370,10 @@ public:
   class Jacobian : public PyMOR::LinearOperator<VectorType>
   {
   public:
-    Jacobian(std::shared_ptr<ForcedFOM<dim>> fom, std::shared_ptr<VectorType> velocity)
-      : fom(fom), linearization(velocity)
+    Jacobian(std::shared_ptr<ForcedFOM<dim>> fom,
+             std::shared_ptr<VectorType>     velocity,
+             double const                    mass_scaling)
+      : fom(fom), linearization(velocity), mass_scaling(mass_scaling)
     {
     }
 
@@ -378,7 +383,7 @@ public:
       fom->install_linearization(linearization);
 
       auto & momentum = fom->pde_operator->get_momentum_operator();
-      momentum.set_scaling_factor_mass_operator(0.0);
+      momentum.set_scaling_factor_mass_operator(mass_scaling);
       momentum.vmult(dst, src);
     }
 
@@ -399,6 +404,7 @@ public:
     std::shared_ptr<ForcedFOM<dim>> fom;
 
     std::shared_ptr<VectorType> const linearization;
+    double const                      mass_scaling;
   };
 
   /// The velocity mass matrix. Block diagonal for a discontinuous space, so the inverse is
@@ -501,9 +507,11 @@ public:
   }
 
   std::shared_ptr<PyMOR::LinearOperator<VectorType>>
-  momentum() override
+  momentum(double const mass_scaling) override
   {
-    return std::make_shared<Momentum>(shared_self());
+    require_mass_admissible(mass_scaling);
+
+    return std::make_shared<Momentum>(shared_self(), mass_scaling);
   }
 
   std::shared_ptr<PyMOR::LinearOperator<VectorType>>
@@ -514,6 +522,14 @@ public:
 
   std::shared_ptr<PyMOR::LinearOperator<VectorType>>
   velocity_product() override
+  {
+    return std::make_shared<VelocityMass>(shared_self());
+  }
+
+  /// The same operator this application uses as its velocity product, but said rather than
+  /// inferred: see PyMOR::SaddlePointModel::velocity_mass.
+  std::shared_ptr<PyMOR::LinearOperator<VectorType>>
+  velocity_mass() override
   {
     return std::make_shared<VelocityMass>(shared_self());
   }
@@ -572,6 +588,28 @@ public:
   }
 
   /**
+   * Refuse a mass term this model cannot carry.
+   *
+   * ExaDG decides at setup whether the momentum operator has a mass kernel at all --
+   * MomentumOperatorData::unsteady_problem is read from SolverType, and without it the volume
+   * flux is never added. set_scaling_factor_mass_operator() then accepts any value and changes
+   * nothing. So a nonzero scaling on a model configured steady is not a small error: it is a
+   * steady solve returned as though it were a step, which is the one failure mode this interface
+   * exists to prevent. Refusing costs a sentence; accepting costs a plausible wrong answer.
+   */
+  void
+  require_mass_admissible(double const mass_scaling) const
+  {
+    AssertThrow(mass_scaling == 0.0 or
+                  application->get_parameters().solver_type == SolverType::Unsteady,
+                dealii::ExcMessage(
+                  "mass_scaling = " + std::to_string(mass_scaling) +
+                  " needs SolverType::Unsteady. This model is configured steady, and ExaDG "
+                  "creates the momentum operator's mass kernel at setup from that flag -- so the "
+                  "scaling factor would be accepted and silently ignored."));
+  }
+
+  /**
    * N(u, p) without the right-hand side.
    *
    * ExaDG's steady residual already has the body force subtracted, so it is added back here.
@@ -579,11 +617,17 @@ public:
    * which is what keeps this a function of (u, p) alone.
    */
   bool
-  apply_nonlinear(VectorType const & u, VectorType const & p, VectorType & du, VectorType & dp)
-    override
+  apply_nonlinear(VectorType const & u,
+                  VectorType const & p,
+                  VectorType &       du,
+                  VectorType &       dp,
+                  double const       mass_scaling,
+                  double const       time) override
   {
     if(not is_nonlinear())
       return false;
+
+    require_mass_admissible(mass_scaling);
 
     BlockVectorType state, residual;
     pde_operator->initialize_block_vector_velocity_pressure(state);
@@ -592,11 +636,11 @@ public:
     state.block(0) = u;
     state.block(1) = p;
 
-    pde_operator->evaluate_nonlinear_residual_steady(residual, state, 0.0 /* time */);
+    pde_operator->evaluate_nonlinear_residual_steady(residual, state, time);
 
     VectorType body_force(u);
     body_force = 0.0;
-    pde_operator->evaluate_add_body_force_term(body_force, 0.0);
+    pde_operator->evaluate_add_body_force_term(body_force, time);
 
     du = residual.block(0);
     du += body_force;
@@ -606,27 +650,43 @@ public:
   }
 
   std::shared_ptr<PyMOR::LinearOperator<VectorType>>
-  jacobian_momentum(VectorType const & velocity) override
+  jacobian_momentum(VectorType const & velocity, double const mass_scaling) override
   {
     if(not is_nonlinear())
       return nullptr;
 
-    return std::make_shared<Jacobian>(shared_self(), std::make_shared<VectorType>(velocity));
+    require_mass_admissible(mass_scaling);
+
+    return std::make_shared<Jacobian>(shared_self(),
+                                      std::make_shared<VectorType>(velocity),
+                                      mass_scaling);
   }
 
   /**
-   * The full-order coupled solve for the given right-hand side.
+   * The full-order coupled solve for the given right-hand side, at one step's mass scaling.
    *
    * Mirrors DriverSteadyProblems::do_solve() rather than calling it, for one reason: that driver
    * keeps its solution between calls and would warm-start the next parameter from the previous
-   * one. A snapshot has to be a function of its parameter alone, so the guess is zeroed here.
+   * one, whatever the caller wanted. Here the guess is the caller's -- nullptr for a snapshot,
+   * which has to be a function of its parameter alone, and the previous step for a time loop.
    */
   bool
-  solve(VectorType const & f, VectorType const & g, VectorType & u, VectorType & p) override
+  solve(VectorType const & f,
+        VectorType const & g,
+        VectorType &       u,
+        VectorType &       p,
+        double const       mass_scaling,
+        double const       time,
+        VectorType const * initial_guess) override
   {
+    require_mass_admissible(mass_scaling);
+
     BlockVectorType solution;
     pde_operator->initialize_block_vector_velocity_pressure(solution);
     solution = 0.0;
+
+    if(initial_guess != nullptr)
+      solution.block(0).copy_locally_owned_data_from(*initial_guess);
 
     // A Krylov or Newton failure is an answer, not a crash. deal.II throws
     // SolverControl::NoConvergence, and letting it escape aborts the interpreter -- which is a
@@ -641,8 +701,14 @@ public:
       if(g.l2_norm() != 0.0)
         return false;
 
-      pde_operator->solve_nonlinear_problem(
-        solution, f, application->get_parameters().update_preconditioner_coupled, 0.0 /* time */);
+      // scaling_factor_mass is passed rather than left to default: solve_nonlinear_problem()
+      // installs it on the shared momentum operator, and its default is 1.0.
+      pde_operator->solve_nonlinear_problem(solution,
+                                            f,
+                                            application->get_parameters()
+                                              .update_preconditioner_coupled,
+                                            time,
+                                            mass_scaling);
     }
     else
     {
@@ -658,7 +724,7 @@ public:
                                          transport_velocity,
                                          application->get_parameters()
                                            .update_preconditioner_coupled,
-                                         0.0 /* scaling_factor_mass: steady */);
+                                         mass_scaling);
     }
 
     }
@@ -667,7 +733,7 @@ public:
       return false;
     }
 
-    pde_operator->adjust_pressure_level_if_undefined(solution.block(1), 0.0);
+    pde_operator->adjust_pressure_level_if_undefined(solution.block(1), time);
 
     u = solution.block(0);
     p = solution.block(1);

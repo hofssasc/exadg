@@ -55,6 +55,7 @@ namespace PyMOR
  *   a DoFHandler's function space      Space                            always
  *   MatrixFree + DoFHandler + Driver   FullOrderModel                   a single-field problem
  *   OperatorCoupled's block system     SaddlePointModel                 a velocity/pressure problem
+ *   one implicit time step             SaddlePointModel(mass_scaling)   the problem is transient
  *   cell matrices from FEValues        RestrictedOperator               you want empirical interpolation
  *   a residual summed over faces/cells SampledOperator                  you want ECSW
  *   -- (the arrays it compiles to)     CompiledOperator                 with SampledOperator
@@ -547,6 +548,22 @@ public:
  * parameter as well would need a setter on ExaDG's viscous kernel -- it bakes the value in at
  * setup, together with the interior penalty parameter derived from it -- so it is left out until
  * it buys something.
+ *
+ * **The step is the operator; the time loop is not.** A time integrator is an algorithm -- it
+ * chooses the sequence of problems to solve -- and an algorithm cannot be projected. What can is
+ * one implicitly discretised step,
+ *
+ *     s M u + N(u, p) = f,     s = gamma_0 / dt
+ *
+ * which is the steady problem again with a mass term and a right-hand side carrying the history.
+ * So every method that evaluates or solves the momentum equation takes (mass_scaling, time), and
+ * a caller stepping in time supplies them. s = 0 is the steady problem, and is what every steady
+ * caller passes; nothing here special-cases it.
+ *
+ * The loop itself belongs to pyMOR, for both models. A reduced model has no ExaDG object to step
+ * it, so its loop must be pyMOR's -- and a full-order model stepped by ExaDG against a reduced
+ * one stepped by pyMOR would be two discretisations rather than a measurement. The history term
+ * therefore arrives in f, already assembled by whoever owns the loop.
  */
 template<typename VectorType>
 class SaddlePointModel : public std::enable_shared_from_this<SaddlePointModel<VectorType>>
@@ -567,9 +584,9 @@ public:
     return {};
   }
 
-  /// A, the (1,1) block: velocity in, velocity out.
+  /// A, the (1,1) block at this step's mass scaling: velocity in, velocity out.
   virtual std::shared_ptr<LinearOperator<VectorType>>
-  momentum() = 0;
+  momentum(double mass_scaling) = 0;
 
   /// B, the (2,1) block: velocity in, pressure out. Its transpose is the (1,2) block.
   virtual std::shared_ptr<LinearOperator<VectorType>>
@@ -578,6 +595,22 @@ public:
   /// The velocity inner product. Needed for supremizers, so effectively required.
   virtual std::shared_ptr<LinearOperator<VectorType>>
   velocity_product()
+  {
+    return nullptr;
+  }
+
+  /**
+   * M, the velocity mass matrix -- the operator multiplying du/dt.
+   *
+   * Separate from velocity_product() even where an application returns the same handle, because
+   * they are the same object only by coincidence. A model is free to make its velocity product
+   * the H1 product, which is a reasonable choice for a proper orthogonal decomposition of
+   * velocity fields and is not the mass matrix. Reading the time derivative's operator off the
+   * inner product would then be wrong, and wrong in the way this interface exists to prevent:
+   * plausibly, without failing.
+   */
+  virtual std::shared_ptr<LinearOperator<VectorType>>
+  velocity_mass()
   {
     return nullptr;
   }
@@ -624,17 +657,20 @@ public:
   }
 
   /**
-   * N(u, p), the nonlinear operator, *without* the right-hand side.
+   * s M u + N(u, p), one step's operator, *without* the right-hand side.
    *
    * pyMOR's convention is that a model solves operator(U) = rhs, so the forcing is subtracted by
-   * the model rather than by the operator. Returns false for a model that is linear, where the
+   * the model rather than by the operator -- and so is the history, which reaches the caller's
+   * right-hand side rather than this method. Returns false for a model that is linear, where the
    * blocks say everything already.
    */
   virtual bool
   apply_nonlinear(VectorType const & /*u*/,
                   VectorType const & /*p*/,
                   VectorType & /*du*/,
-                  VectorType & /*dp*/)
+                  VectorType & /*dp*/,
+                  double const /*mass_scaling*/,
+                  double const /*time*/)
   {
     return false;
   }
@@ -643,11 +679,12 @@ public:
    * The (1,1) block of the Jacobian, linearised at the given velocity.
    *
    * Only that block depends on the state: B is linear, so the Jacobian of the whole system is
-   * [[A'(u), B*], [B, 0]] and the rest is unchanged. Returns nullptr for a linear model, whose
-   * momentum() is already its own Jacobian.
+   * [[s M + A'(u), B*], [B, 0]] and the rest is unchanged. The mass term is linear, so it enters
+   * the Jacobian at the same scaling it entered the residual -- pass the step's. Returns nullptr
+   * for a linear model, whose momentum() is already its own Jacobian.
    */
   virtual std::shared_ptr<LinearOperator<VectorType>>
-  jacobian_momentum(VectorType const & /*velocity*/)
+  jacobian_momentum(VectorType const & /*velocity*/, double const /*mass_scaling*/)
   {
     return nullptr;
   }
@@ -676,12 +713,20 @@ public:
    *
    * Returns false if this model cannot solve that system, the way FullOrderModel::assemble
    * returns nullptr.
+   *
+   * initial_guess is nullptr for a cold start, which is what a snapshot needs: it has to be a
+   * function of its parameter alone, and warm-starting from the previous one would make it a
+   * function of the order they were solved in. A time loop wants the opposite -- the previous
+   * step is the best guess there is -- so the choice belongs to the caller.
    */
   virtual bool
   solve(VectorType const & /*f*/,
         VectorType const & /*g*/,
         VectorType & /*velocity*/,
-        VectorType & /*pressure*/)
+        VectorType & /*pressure*/,
+        double const /*mass_scaling*/,
+        double const /*time*/,
+        VectorType const * /*initial_guess*/)
   {
     return false;
   }
