@@ -57,6 +57,7 @@ namespace PyMOR
  *   OperatorCoupled's block system     SaddlePointModel                 a velocity/pressure problem
  *   one implicit time step             SaddlePointModel(mass_scaling)   the problem is transient
  *   cell matrices from FEValues        RestrictedOperator               you want empirical interpolation
+ *   a nonlinear term, part polynomial  SplitOperator                    you want an exact tensor
  *   a residual summed over faces/cells SampledOperator                  you want ECSW
  *   -- (the arrays it compiles to)     CompiledOperator                 with SampledOperator
  *   a functional of the solution       Functional                       the model has outputs
@@ -320,6 +321,54 @@ public:
     AssertThrow(false, dealii::ExcMessage("This operator does not implement write_selection()."));
 
     return {};
+  }
+};
+
+/**
+ * A nonlinear term, split into the half that projects exactly and the half that does not.
+ *
+ * The counterpart of SampledOperator, and the two are meant to be read together:
+ *
+ *     N(u) = Q(u) + S(u)
+ *
+ * Q is a polynomial in the state, so its Galerkin projection is a fixed tensor -- built once
+ * offline by polarisation, contracted online at a cost independent of the mesh, and exact rather
+ * than fitted. S is whatever is left, and is what SampledOperator hyper-reduces.
+ *
+ * Both halves are needed, and for different reasons. Q determines the tensor. N determines what
+ * is *not* nonlinear: subtracting it from the momentum operator leaves the affine remainder, so r
+ * applications settle the rest of the block. An application that offers only one of them offers
+ * neither, which is why they are one object.
+ *
+ * A model returning nullptr here is not saying its operator is linear -- it is saying it has no
+ * polynomial half to exploit, so a reductor must project the whole nonlinearity generically.
+ */
+template<typename VectorType>
+class SplitOperator
+{
+public:
+  virtual ~SplitOperator() = default;
+
+  /// N(u), the whole nonlinear term, exactly as the solver evaluates it.
+  virtual std::shared_ptr<VectorType>
+  apply(VectorType const & u) const = 0;
+
+  /**
+   * Q(u), the polynomial half.
+   *
+   * Polarising this is what gives the tensor, so it must be the polynomial the *nonlinear*
+   * operator contains -- not a linearised operator that happens to be multilinear. The two can
+   * be different bilinear maps at a given mesh even when they agree in the limit, and a reduced
+   * model should reproduce the operator its own snapshots came from.
+   */
+  virtual std::shared_ptr<VectorType>
+  apply_polynomial(VectorType const & u) const = 0;
+
+  /// Degree of the polynomial half, so a reductor knows how many indices its tensor has.
+  virtual unsigned int
+  polynomial_degree() const
+  {
+    return 2;
   }
 };
 
@@ -685,6 +734,19 @@ public:
    */
   virtual std::shared_ptr<LinearOperator<VectorType>>
   jacobian_momentum(VectorType const & /*velocity*/, double const /*mass_scaling*/)
+  {
+    return nullptr;
+  }
+
+  /**
+   * The momentum operator's nonlinear term, split into its polynomial and remaining halves.
+   *
+   * Returns nullptr for a linear model, or one whose nonlinearity has no polynomial part worth
+   * separating. What the halves are used for is in SplitOperator; sampled_momentum() below
+   * hyper-reduces the second of them.
+   */
+  virtual std::shared_ptr<SplitOperator<VectorType>>
+  split_momentum()
   {
     return nullptr;
   }

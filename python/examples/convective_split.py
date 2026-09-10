@@ -63,7 +63,8 @@ from pymor.parameters.base import Mu
 from pymor.tools import mpi
 
 from exadg.mor.models.saddle_point import mpi_saddle_point_model
-from exadg.mor.reductors import _bound_model, dispatch
+from exadg.mor.models.saddle_point import exadg_model
+from exadg.mor.reductors import dispatch
 
 UPWIND = "applications/incompressible_navier_stokes/forced/input_navier_stokes.json"
 CENTRAL = "applications/incompressible_navier_stokes/forced/input_navier_stokes_central.json"
@@ -165,14 +166,14 @@ def local_info(model, snapshots):
     """
     from pymor.tools import mpi
 
-    fom = _bound_model(model)
+    fom = exadg_model(model)
     faces = mpi.comm.allreduce(fom.n_faces) if mpi.parallel else fom.n_faces
 
     return np.array([fom.upwind_factor, faces, *fom.quadrature_indices], dtype=float)
 
 
 def local_quadratic(model, snapshots, alphas):
-    fom = _bound_model(model)
+    fom = exadg_model(model)
     u = snapshots.vectors[0].impl
 
     errors = []
@@ -189,7 +190,7 @@ def local_quadratic(model, snapshots, alphas):
 
 
 def local_polarisation(model, snapshots):
-    fom = _bound_model(model)
+    fom = exadg_model(model)
     u, v = snapshots.vectors[0].impl, snapshots.vectors[1].impl
 
     linear_in_w = fom.apply_trilinear(add(u, v), u)
@@ -210,14 +211,14 @@ def local_polarisation(model, snapshots):
 
 
 def local_gap(model, snapshots):
-    fom = _bound_model(model)
+    fom = exadg_model(model)
     u = snapshots.vectors[0].impl
 
     return np.array([relative(fom.apply_trilinear(u, u), fom.apply_convective(u))])
 
 
 def local_stabilisation(model, snapshots):
-    fom = _bound_model(model)
+    fom = exadg_model(model)
 
     shares = []
     for vector in snapshots.vectors:
@@ -230,7 +231,7 @@ def local_stabilisation(model, snapshots):
 
 
 def local_face_sum(model, snapshots):
-    fom = _bound_model(model)
+    fom = exadg_model(model)
 
     errors = []
     for vector in snapshots.vectors:

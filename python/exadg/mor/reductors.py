@@ -42,6 +42,11 @@ Two reductors follow:
 The first is the reference the second is measured against: neither approximates the convective
 term, so they have to agree to solver tolerance.
 
+Both halves reach this module through the vocabulary rather than by name: the model hands out a
+``SplitOperator`` whose ``apply_polynomial`` is ``B`` and whose ``apply`` is ``N``, and a
+``SampledOperator`` for ``S``. Nothing here calls a method that only one application binds, so a
+second flow application costs a ``python_bindings.cpp`` and nothing in Python.
+
 The tensor is built by polarisation, ``B(a, b) = 0.5 (N_c(a+b) - N_c(a) - N_c(b))``, and not from
 ExaDG's linearly-implicit convective operator -- that one is also trilinear but is a *different*
 bilinear map, see ``ForcedFOM::apply_trilinear``.
@@ -52,7 +57,9 @@ dispatch below only ensures the *evaluation* happens everywhere.
 
 .. warning::
    :func:`local_ecsw_weights` fits the weights redundantly on every rank, over a training matrix
-   gathered whole. A known scaling defect rather than a design choice; see its own warning.
+   gathered whole. Not a speed problem -- the fit is a fraction of a second and a fraction of a
+   percent of offline time -- but a memory one, and it grows along two axes: the mesh widens the
+   matrix and a transient training set lengthens it. See its own warning.
 """
 
 import numpy as np
@@ -63,6 +70,8 @@ from pymor.operators.numpy import NumpyMatrixOperator
 from pymor.reductors.stokes import SupremizerGalerkinStokesReductor
 from pymor.vectorarrays.constructions import cat_arrays
 from pymor.vectorarrays.numpy import NumpyVectorSpace
+
+from exadg.mor.models.saddle_point import exadg_model, exadg_models_id
 
 
 def dispatch(model, function, basis, *args):
@@ -80,55 +89,41 @@ def dispatch(model, function, basis, *args):
         return function(model, basis, *args)
 
     return mpi.call(
-        mpi.function_call, function, model.operator.solver.models_id, basis.impl.obj_id, *args
+        mpi.function_call, function, exadg_models_id(model), basis.impl.obj_id, *args
     )
 
 
-def _bound_model(model):
-    """The ExaDG handle, reached through the solver that already holds it."""
-    return model.operator.solver.fom
-
-
-def _reconstruct(basis, coefficients):
-    """``V a`` as an ExaDG vector, from a rank-local basis."""
-    u = basis.space.impl.zero_vector()
-    for weight, mode in zip(coefficients, basis.vectors):
-        u.axpy(float(weight), mode.impl)
-
-    return u
-
-
-def convective_tensor(fom, basis):
-    """``C[i,j,k] = <phi_i, B(phi_j, phi_k)>`` for the trilinear part of the convective operator.
+def convective_tensor(split, basis):
+    """``C[i,j,k] = <phi_i, Q(phi_j, phi_k)>`` for the polynomial half of a nonlinear term.
 
     Args:
-        fom: A bound model offering ``apply_convective_central``, i.e. the convective operator
-            with a central flux. That operator is exactly quadratic, which is what makes the
-            tensor exact rather than a fit.
+        split: The model's ``SplitOperator``. ``apply_polynomial`` is exactly quadratic, which is
+            what makes the tensor exact rather than a fit -- and it is the operator's own
+            polynomial half rather than a linearisation that happens to be multilinear.
         basis: The velocity basis, **after** supremizer enrichment -- it has to be the basis the
             rest of the model is projected onto.
 
     Returns:
         ``numpy.ndarray`` of shape ``(r, r, r)``, symmetric in its last two indices.
 
-    Costs ``r + r(r-1)/2`` applications of the convective operator, plus the projections.
+    Costs ``r + r(r-1)/2`` applications of the polynomial half, plus the projections.
     """
     phi = [v.impl for v in basis.vectors]
     r = len(phi)
 
-    diagonal = [fom.apply_convective_central(p) for p in phi]
+    diagonal = [split.apply_polynomial(p) for p in phi]
 
     tensor = np.zeros((r, r, r))
     for j in range(r):
         for k in range(j, r):
             if j == k:
-                # B(a, a) = N_c(a) exactly, so the diagonal costs no extra evaluation
+                # Q(a, a) = Q(a) exactly, so the diagonal costs no extra evaluation
                 image = diagonal[j]
             else:
                 sum_jk = phi[j].copy()
                 sum_jk.axpy(1.0, phi[k])
 
-                image = fom.apply_convective_central(sum_jk)
+                image = split.apply_polynomial(sum_jk)
                 image.axpy(-1.0, diagonal[j])
                 image.axpy(-1.0, diagonal[k])
                 image.scal(0.5)
@@ -143,20 +138,27 @@ def local_momentum_blocks(model, basis):
     """The three parameter-independent pieces of the momentum block, on one rank.
 
     Returns ``(tensor, viscous, constant)``: the convective tensor, the projected viscous block,
-    and the right-hand side's constant part. The viscous block is isolated from the momentum
-    operator by removing the convective term, which is legitimate because what remains is affine
-    in the velocity -- so ``r`` applications determine it.
+    and the operator's value at zero. The viscous block is isolated by removing the whole
+    nonlinear term from the momentum operator, which is legitimate because what remains is affine
+    in the velocity -- so ``r`` applications determine it. Both halves of that subtraction come
+    from the model's declared ``SplitOperator``; nothing here names a convective operator.
     """
-    fom = _bound_model(model)
+    split = exadg_model(model).split_momentum()
     momentum = model.operator.blocks[0, 0]
 
-    convective = basis.space.make_array(
-        [basis.space.make_vector(fom.apply_convective(v.impl)) for v in basis.vectors]
+    if split is None:
+        raise ValueError(
+            "this model declares no split_momentum(), so its nonlinear term has no polynomial "
+            "half to build a tensor from"
+        )
+
+    nonlinear = basis.space.make_array(
+        [basis.space.make_vector(split.apply(v.impl)) for v in basis.vectors]
     )
     constant = basis.inner(momentum.apply(basis.space.zeros(1))).ravel()
-    viscous = basis.inner(momentum.apply(basis) - convective) - constant[:, None]
+    viscous = basis.inner(momentum.apply(basis) - nonlinear) - constant[:, None]
 
-    return convective_tensor(fom, basis), viscous, constant
+    return convective_tensor(split, basis), viscous, constant
 
 
 def local_sampled(model, basis, weights):
@@ -165,7 +167,7 @@ def local_sampled(model, basis, weights):
     Returned as an :class:`~pymor.tools.mpi.ObjectId` under MPI, so that later calls address every
     rank's evaluator rather than rank 0's alone.
     """
-    evaluator = _bound_model(model).sampled_momentum([mode.impl for mode in basis.vectors])
+    evaluator = exadg_model(model).sampled_momentum([mode.impl for mode in basis.vectors])
 
     if weights is not None:
         evaluator.set_weights(weights)
@@ -206,7 +208,7 @@ def _make_builder(model, basis, weights):
 
     return mpi.call(
         mpi.function_call_manage, local_sampled,
-        model.operator.solver.models_id, basis.impl.obj_id, weights,
+        exadg_models_id(model), basis.impl.obj_id, weights,
     )
 
 

@@ -1351,6 +1351,48 @@ public:
   }
 
   /**
+   * The convective term as a split: N at this application's upwind factor, and the central-flux
+   * operator that is its exactly quadratic half.
+   *
+   * The two entry points already exist and are what convective_split.py measures; this is the
+   * declared form of them, so a reductor can build a tensor without knowing the physics or the
+   * method names. Q is `apply_convective_central` -- the nonlinear operator at upwind_factor 0 --
+   * and not the linearly-implicit operator, which is also trilinear but a different bilinear map
+   * (see apply_trilinear).
+   */
+  class ConvectiveSplit : public PyMOR::SplitOperator<VectorType>
+  {
+  public:
+    explicit ConvectiveSplit(std::shared_ptr<ForcedFOM<dim>> fom) : fom(fom)
+    {
+    }
+
+    std::shared_ptr<VectorType>
+    apply(VectorType const & u) const override
+    {
+      return fom->apply_convective(u);
+    }
+
+    std::shared_ptr<VectorType>
+    apply_polynomial(VectorType const & u) const override
+    {
+      return fom->apply_convective_central(u);
+    }
+
+  private:
+    std::shared_ptr<ForcedFOM<dim>> fom;
+  };
+
+  std::shared_ptr<PyMOR::SplitOperator<VectorType>>
+  split_momentum() override
+  {
+    if(not application->get_parameters().convective_problem())
+      return nullptr;
+
+    return std::make_shared<ConvectiveSplit>(shared_self());
+  }
+
+  /**
    * Points ExaDG's momentum operator at a linearisation velocity, and keeps it alive.
    *
    * ExaDG stores the pointer, so ownership has to sit somewhere that outlives every Jacobian

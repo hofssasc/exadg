@@ -415,6 +415,44 @@ class MPIExaDGSaddlePointVisualizer:
         )
 
 
+def exadg_model(model):
+    """The bound ExaDG model behind a *rank-local* pyMOR model built by this module.
+
+    A pyMOR model is meant to hide what discretised it, so there is no general route back. This
+    module's block operator carries a solver holding the application -- it has to, because a
+    coupled solve is a method on the model rather than an operator's inverse -- and that is the
+    route. Declaring it here means a reductor does not have to know the shape, and a model built
+    some other way fails with a sentence rather than an ``AttributeError`` three frames down.
+
+    Under MPI this is the *local* model on whichever rank is asking; see :func:`exadg_models_id`
+    for the handle that addresses all of them.
+    """
+    return _handle(model, "fom", "the local ExaDG model")
+
+
+def exadg_models_id(model):
+    """The ``ObjectId`` addressing every rank's ExaDG model, from the MPI-wrapped one.
+
+    A different object from :func:`exadg_model`, not a parallel spelling of it: that one answers
+    "which model is on this rank", this one answers "how do I reach all of them at once". Only
+    the MPI solver carries it, because only it needs to dispatch.
+    """
+    return _handle(model, "models_id", "an MPI handle to the ExaDG models")
+
+
+def _handle(model, attribute, what):
+    solver = getattr(model.operator, "solver", None)
+    handle = getattr(solver, attribute, None)
+
+    if handle is None:
+        raise TypeError(
+            f"{model.name} carries no {what}: its operator's solver is "
+            f"{type(solver).__name__}, so it was not built by exadg.mor.models.saddle_point."
+        )
+
+    return handle
+
+
 def _build_saddle_point_model(module_name, class_name, args, kwargs, model_kwargs):
     """Construct the per-rank model. Module level so that it survives pickling to the ranks."""
     import importlib

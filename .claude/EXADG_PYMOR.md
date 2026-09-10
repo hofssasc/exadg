@@ -86,6 +86,13 @@ mechanism that stabilises under-resolved flow, so it cannot be dropped.
 `B` is projected exactly; `S` is sampled on a weighted subset of faces. The same weights serve the
 Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 
+Both halves reach `reductors.py` through **declared** vocabulary and nothing else:
+`split_momentum()` returns a `SplitOperator` with `apply` (= N) and `apply_polynomial` (= B), and
+`sampled_momentum(basis)` returns the `SampledOperator` for S. The C++ handle behind a pyMOR model
+comes from `exadg_model()` / `exadg_models_id()` in `models/saddle_point.py` — the first is the
+rank-local model, the second the ObjectId addressing all of them, and they are different objects
+rather than two spellings. Nothing in Python calls a method only one application binds.
+
 `S` is sampled through **two objects split by phase**, and the split is load-bearing:
 
 | | `SampledOperator<VectorType>` (builder) | `CompiledOperator` |
@@ -195,11 +202,6 @@ raises on one rank and returns ~1e17 on four; face **counts** grow with the rank
 matrix-free pads its face batches per rank (144 → 184 at four).
 
 ## Known defects, not yet fixed
-
-**The reductor reaches around the vocabulary.** `reductors.py` gets the C++ handle through
-`model.operator.solver.fom`, and calls `apply_convective` / `apply_convective_central`, which
-`forced` binds but `interface.h` does not declare. So the tensor half of the reduction is not
-portable to a second flow application, while the ECSW half is.
 
 **The ROM is not yet a deliverable.** `CompiledStabilisation` holds a communicator and allreduces on
 every `projected()` / `jacobian()`, and nothing serialises. `detach()` drops the mesh, not the

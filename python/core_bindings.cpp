@@ -254,6 +254,15 @@ register_vector_type(py::module_ & module, std::string const & prefix)
          py::arg("directory"),
          py::arg("basename"));
 
+  py::class_<SplitOperator<V>, std::shared_ptr<SplitOperator<V>>>(
+    module, (prefix + "SplitOperator").c_str())
+    .def_property_readonly("polynomial_degree", &SplitOperator<V>::polynomial_degree)
+    .def("apply", &SplitOperator<V>::apply, py::arg("u"), "N(u), the whole nonlinear term.")
+    .def("apply_polynomial",
+         &SplitOperator<V>::apply_polynomial,
+         py::arg("u"),
+         "Q(u), the polynomial half -- polarise this to get the tensor.");
+
   py::class_<Functional<V>, std::shared_ptr<Functional<V>>>(module,
                                                             (prefix + "Functional").c_str())
     .def_property_readonly("n_outputs", &Functional<V>::n_outputs)
@@ -332,6 +341,7 @@ register_vector_type(py::module_ & module, std::string const & prefix)
          &SaddlePointModel<V>::jacobian_momentum,
          py::arg("velocity"),
          py::arg("mass_scaling"))
+    .def("split_momentum", &SaddlePointModel<V>::split_momentum)
     .def("sampled_momentum", &SaddlePointModel<V>::sampled_momentum, py::arg("basis"))
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
