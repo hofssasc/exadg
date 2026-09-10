@@ -42,25 +42,42 @@ rank 0. Plain `mpirun` runs the script once per rank and deadlocks on the first 
 binding `distributed::Vector` aborts with `generic_type: type "Vector" is already registered!`.
 Every application module must `py::module_::import("exadg._core")`.
 
-## The two applications
+## The three applications
 
-| | `poisson/thermal_block` | `incompressible_navier_stokes/forced` |
-|---|---|---|
-| interface | `FullOrderModel` | `SaddlePointModel` |
-| discretisation | CG, Dirichlet rows eliminated | DG (L2), nothing constrained |
-| parameters | in the operator, $P$ affine components | in the right-hand side only |
-| equation | linear | Stokes or Navier–Stokes, by input file |
+| | `poisson/thermal_block` | `incompressible_navier_stokes/forced` | `.../flow_past_cylinder` |
+|---|---|---|---|
+| interface | `FullOrderModel` | `SaddlePointModel` | `SaddlePointModel` |
+| discretisation | CG, Dirichlet rows eliminated | DG (L2), nothing constrained | same |
+| parameters | in the operator, $P$ affine components | in the right-hand side only | in the operator (viscosity) |
+| drive | body force | body force | inhomogeneous Dirichlet inflow |
+| equation | linear | Stokes or Navier–Stokes, by input file | Navier–Stokes |
+| dynamics | — | relaxes to steady | von Kármán shedding |
+
+The two flow applications share `include/exadg/pymor/incompressible_flow.h`
+(`IncNSSaddlePoint<dim, ApplicationType>`), which holds everything that is about ExaDG rather than
+about the case: spaces, blocks, the split, the face loops, the CFL step. A binding supplies only
+its parameter shape and its right-hand side — the cylinder returns `{}` / `nullptr` for all of
+them, because it has no body force at all.
 
 `forced` serves both flow equations and both regimes: `Equation` selects Stokes or Navier-Stokes,
 `Regime` selects Steady or Unsteady, and each changes exactly one term -- the convective one and the
 mass one. `input_navier_stokes_transient.json` is the unsteady file. Verified: at `mass_scaling = 0`
 the unsteady model reproduces the steady one **bit-exactly**.
 
-**It is creeping flow.** Re = 2-6 at the amplitudes the examples draw (0.5-1.5), ceiling Re ~ 54
-before the velocity-block preconditioner -- which ignores convection -- stops converging. A
+**`forced` is creeping flow.** Re = 2-6 at the amplitudes the examples draw (0.5-1.5), ceiling
+Re ~ 54 before the velocity-block preconditioner -- which ignores convection -- stops converging. A
 transient run relaxes monotonically to steady in t ~ 10; there is no shedding and, in 2D, no
-turbulence at any Re. To make time matter, give `ForcingModes` a time dependence (it is a
+turbulence at any Re. To make time matter there, give `ForcingModes` a time dependence (it is a
 `dealii::Function` and has `get_time()`), not a larger Reynolds number.
+
+**`flow_past_cylinder` is where time matters.** `Formulation = Coupled` swaps the shipped splitting
+scheme for `BDFCoupledSolution` with an implicit convective term and no penalty terms -- a splitting
+scheme's substeps do not compose into one residual, and a penalty term makes the momentum block
+depend on the state outside the convective term. `TestCase 1` has a *time-independent* inflow;
+`MaxInflow` and `Viscosity` are overridable, so test case 1's steady inflow can be run at test case
+2's Reynolds number. Verified against Schäfer–Turek 2D-2: at refinement 1, degree 2, Re = 100 the
+wake sheds at **St = 0.300** (published 0.295-0.305); refinement 0 reaches 0.266 on 900 velocity
+dofs. No symmetry-breaking perturbation is used or needed -- the cylinder is off-centre.
 
 ## The step, not the loop
 
@@ -109,20 +126,97 @@ comes from `SolverType` at setup, so without it the mass kernel is never built a
 `set_scaling_factor_mass_operator()` accepts any value and changes nothing — a steady solve returned
 as a step. `ForcedFOM::require_mass_admissible` aborts instead.
 
+## Both right-hand sides are easy to under-read
+
+`f` carries the **body force alone**. For a nonlinear model `A` is the application's own residual,
+so the momentum equation's inhomogeneous boundary contribution is already inside it — which is why
+`_velocity_rhs` takes `constant = None if fom.is_nonlinear`.
+
+`g` is **not zero in general**: it is the divergence operator's boundary term, and it is zero
+exactly when the Dirichlet data is homogeneous. `IncNSSaddlePoint::pressure_rhs()` assembles it the
+way `OperatorCoupled::rhs_linear_problem` does, sign and scaling included.
+
+The asymmetry is not an inconsistency — one row's inhomogeneity is inside the operator because that
+operator is a residual, the other's is beside it because that operator is a plain linear block.
+
+## Two kinds of parameter
+
+A parameter in the **right-hand side** never reaches ExaDG. The model holds its affine components
+(`velocity_rhs_components()`) and combines them in Python, so the application is only ever handed
+an assembled vector and never told which parameter it is solving at. That is the `forced` case.
+
+A parameter of the **operator** has to go the other way: the residual, the Jacobian and the solve
+all belong to the application, and its Newton iteration reads the coefficient out of objects Python
+does not own. `SaddlePointModel` therefore declares
+
+```cpp
+coefficients()                  // names; empty by default
+get_coefficient(name)
+set_coefficient(name, value)
+```
+
+and `install_coefficients(fom, mu)` in `models/saddle_point.py` pushes them before every evaluate
+and every solve — before each, not on change, because two models can share one discretisation and
+the last one to solve is the one whose value is installed. Under MPI the names are resolved once
+and a plain dict of numbers crosses to the ranks.
+
+**The operator must be affine in each declared coefficient**, which is what lets the reduced model
+project once per coefficient instead of once per parameter value. For the viscosity it holds
+exactly: the interior penalty parameter is geometric and every viscous flux carries the viscosity
+as a factor. Measured on the cylinder, the momentum residual is affine in it to **1.9e-14**.
+
+**Setting it reaches three copies**, and all three matter:
+
+| copy | read when | reached by |
+|---|---|---|
+| `Parameters::viscosity` | at apply time, by the Schur preconditioners | `IncNS::ApplicationBase::set_viscosity` |
+| `ViscousKernel::data` | every operator evaluation | `SpatialOperatorBase::set_viscosity` |
+| one per multigrid level | inside the preconditioner | `MultigridPreconditioner::update()`, which now syncs it and re-initialises the smoothers |
+
+Not reached: the divergence and continuity penalty kernels cache it at setup, so setting the
+viscosity with those active asserts rather than quietly using the old value.
+
+Whether the viscosity *is* a parameter is the application's choice, not the binding's —
+`viscosity_is_parameter()` defaults to false, and only the cylinder overrides it. Declaring it
+would otherwise make every flow model demand a value for a parameter it never varies.
+
 ## The Navier–Stokes reduction, in one picture
 
-$$N(u) = \underbrace{B(u,u)}_{\text{trilinear} \to \text{tensor } C_{ijk}} + \underbrace{S(u)}_{\text{Lax–Friedrichs} \to \text{ECSW}}$$
+$$N(u) = \underbrace{B(u,u)}_{\text{trilinear} \to \text{tensor } C_{ijk}} + \underbrace{L u + c}_{\text{inflow} \to \text{affine block}} + \underbrace{S(u)}_{\text{Lax–Friedrichs} \to \text{ECSW}}$$
+
+**The polynomial half is quadratic *plus affine*, not quadratic.** An inhomogeneous Dirichlet
+inflow carries the prescribed value into the convective flux, so $Q(u) = B(u,u) + Lu + c$ with
+$c = Q(0)$. Two consequences, both of which are identities for homogeneous data and wrong the
+moment there is an inflow:
+
+- the polarisation needs $Q(0)$: $B(a,b) = \tfrac12[Q(a{+}b) - Q(a) - Q(b) + Q(0)]$;
+- the diagonal is no longer free — $B(a,a) \ne Q(a)$, so it costs $Q(2a)$.
+
+`convective_tensor` returns $(C, L, c)$ projected, and `local_momentum_blocks` folds $L$ and $c$
+into the affine block, which is where they belong. What that block then represents is
+$M(v) = A(v) - N(v) + Q(v) - B(v,v)$, affine in $v$ (measured: $A - N$ is affine to 1.7e-15), so
+$r+1$ evaluations determine it and the reduced residual $B(a,a) + M(a) + S(a)$ is *exactly* the
+projected full-order one. Verified on the cylinder at **4e-16**, at viscosities the probes never
+used.
 
 Everything hard is in `S`. Its $\lambda = \texttt{uf}\cdot 2\max(|u_M\!\cdot\!n|,|u_P\!\cdot\!n|)$ is
 a maximum of absolute values, so it is **(a)** not a polynomial — no tensor, **(b)** not
 differentiable — ExaDG freezes it, so the Jacobian is only first-order accurate, and **(c)** the
 mechanism that stabilises under-resolved flow, so it cannot be dropped.
 
-`B` is projected exactly; `S` is sampled on a weighted subset of faces. The same weights serve the
+`B` is projected exactly, and its tensor is coefficient-free — so are the divergence block and
+the stabilisation, whose $\lambda$ is built from the velocity alone. The whole viscosity
+dependence of the reduced system is therefore the affine block: two small dense matrices, `base +
+value * slope`, assembled online at a cost independent of the mesh. The decomposition is recovered
+by **probing at two values and differencing**, not by naming terms — which needs no knowledge of
+which term is which or what the boundary condition contributes to each, and is exact for anything
+genuinely affine.
+
+`S` is sampled on a weighted subset of faces. The same weights serve the
 Jacobian, because a frozen λ makes `S'` a *linear* face operator.
 
 Both halves reach `reductors.py` through **declared** vocabulary and nothing else:
-`split_momentum()` returns a `SplitOperator` with `apply` (= N) and `apply_polynomial` (= B), and
+`split_momentum()` returns a `SplitOperator` with `apply` (= N) and `apply_polynomial` (= Q), and
 `sampled_momentum(basis)` returns the `SampledOperator` for S. The C++ handle behind a pyMOR model
 comes from `exadg_model()` / `exadg_models_id()` in `models/saddle_point.py` — the first is the
 rank-local model, the second the ObjectId addressing all of them, and they are different objects
@@ -168,7 +262,9 @@ are never gathered. The compiled half is **not templated on a vector type** and 
 1. **Nothing is assumed.** Symmetry, invertibility, a restricted evaluation — each defaults to
    "no" and its transposed form aborts rather than improvising.
 2. **Structure is declared in C++, naming is not.** `parameter_shape()` says how many parameters;
-   what they are called and how the operator depends on them live in Python.
+   what they are called and how the operator depends on them live in Python. The exception proves
+   it: a coefficient the *operator* depends on is named in C++, because the application's own
+   solver has to look it up — see "Two kinds of parameter".
 3. **Composite objects need explicit MPI counterparts.** `mpi_wrap_model` wraps *leaf* operators.
    Anything pyMOR composes from them — a `BlockOperator`, its solver, a block visualizer — gets
    nothing. Hence `MPIExaDGCoupledSolver`, `MPIExaDGSaddlePointVisualizer`, `reductors.dispatch`.
@@ -202,6 +298,32 @@ are never gathered. The compiled half is **not templated on a vector type** and 
   interior test function alone; the increment still has an exterior value, so the trial jump is
   the mirrored one. Conflating them makes the boundary term twice too large — which then hides as
   a plausible-looking $O(h^5)$ residue.
+- **The norm of a velocity is not a shedding diagnostic.** A limit cycle's fluctuation is a
+  quadrature pair, so $\|u(t)\|$ is nearly constant while the flow oscillates fully: on a cylinder
+  wake whose fluctuation is 16% of the mean it read a peak-to-peak of 3.5e-03 and looked steady.
+  Take the deviation from the *time mean*, and get the frequency off a scalar probe of it — the
+  norm of that deviation is nearly constant too, for the same reason, so counting its mean
+  crossings measures nothing.
+- **A block-Jacobi multigrid smoother is serial-only.** It builds its block diagonal from separate
+  cell and face loops, and ExaDG aborts in parallel asking for `use_cell_based_face_loops` instead
+  — which is *not* a free switch here, because the hyper-reduction samples face batches directly
+  and changing how faces are traversed changes what it counts. `PreconditionerSmoother::PointJacobi`
+  needs no block diagonal, costs iterations rather than correctness, and leaves the face machinery
+  alone. Chebyshev is not the alternative it is for `forced`: a velocity block that keeps its
+  convective term is not symmetric, so Chebyshev's eigenvalue estimate has nothing to work with.
+- **A missing `g` does not look like a missing constant.** When the continuity right-hand side was
+  left out (see above), the reduced velocity collapsed to 2.6 % of the full-order one, the reduced
+  pressure sat at a constant 17x too large, **doubling the basis changed nothing**, and
+  root-finding on the reduced step from the projected full-order state converged — to a state 140
+  away from a trajectory of norm 1.08. What identified it was the *shape* of the residual, not its
+  size: split by row, the continuity row was 1.437 at every level, identical to four digits, while
+  the momentum row varied. A closure error moves with the state; a constant does not.
+- **The convective operator vanishes at zero velocity only for homogeneous data.** With an inflow,
+  $N(0) \ne 0$ and $Q(0) \ne 0$; anything that treats the polynomial half as a pure quadratic form,
+  or takes the affine block's constant from $A(0)$ rather than $A(0) - N(0)$, leaves a term
+  weighted by $\sum_j a_j$ instead of by 1. It then cancels at exactly one point of the reduced
+  space, so a ROM checked only at its training point looks right. Cost: 1.5e-02 relative, hidden
+  behind `forced`'s homogeneous boundary.
 - **ExaDG's linearly-implicit operator is not the polarisation of its nonlinear one.** Both are
   trilinear; they differ at discretisation level (~$h^5$). Build tensors from the nonlinear one.
 - **A snapshot velocity is discretely divergence-free**, so an adjoint check probed at a snapshot
@@ -229,6 +351,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `navier_stokes_transient.py` | BDF coefficients and rates, s=0 vs steady, relaxation, step cost |
 | `navier_stokes_transient_rom.py` | streamed offline phase, timings, FOM error; `--vtu` / `--chunks` / `--sketches` |
+| `cylinder_transient_rom.py` | a parameter of the *operator*, an inhomogeneous inflow, a shedding wake; `--vtu` (~20 min) — identical at 1 and 4 ranks |
 | `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
@@ -236,9 +359,39 @@ Legitimately rank-dependent: Stokes' last row and the NS residual sit at their s
 floor; `navier_stokes_tensor`'s `tensor vs Galerkin` is a cancellation and sits at roundoff (4e-16
 on one rank, 7e-13 on four); `thermal_block_ei`'s first row is a singular reduced operator that
 raises on one rank and returns ~1e17 on four; face **counts** grow with the rank count because
-matrix-free pads its face batches per rank (144 → 184 at four).
+matrix-free pads its face batches per rank (144 → 184 at four). A **sketched** fit is
+rank-dependent beyond that: the Gaussian rows are drawn over a differently padded candidate set,
+so the selection itself moves (13 faces at one rank, 11 at four) and with it the fit residual. The
+reduced error still agrees to four digits — which is the right expectation for two different fits,
+not the nine that holds where the computation is the same one reduced differently.
 
 ## Known defects, not yet fixed
+
+**A plain Galerkin ROM of the cylinder wake is closure-limited.** At refinement 0, Reynolds 80-170
+and 66+18 modes it reaches worst-level errors of a few tens of percent at untrained Reynolds
+numbers (0.28 and 0.23), against a projection floor of 1.4e-02 and 7.3e-03 — the error is **20-30x
+what the basis can do**, so more modes will not close it. That is the expected behaviour of
+POD-Galerkin on convection-dominated flow and is a *basis-and-closure* problem (problem 4 in the
+vault's road map), not a defect in the projection: every operator is exact to machine precision and
+the residual reproduces the full-order one at 4e-16. The online speed-up is correspondingly modest
+— 7.6x, because a 102-dimensional reduced space makes the tensor contraction $O(r^3)$ the dominant
+online cost, where the forced problem's 35 dimensions gave 76x.
+
+Read those errors as an order of magnitude, not a pinned number. Switching the multigrid smoother
+— which cannot change the converged full-order solution, only the iterations to reach it — moved
+the ECSW selection by one face (29 → 30, fit residual 1.4e-01 → 1.1e-01) and with it the worst
+level from 0.15 to 0.28. A trajectory perturbed at the solver tolerance flips a discrete face
+selection near a threshold, and a closure-limited reduced model is sensitive to that. The
+projection floor, which is the basis alone, moved by 12 %.
+
+**The sampled Jacobian is 3.5e-04 from ExaDG's with an inhomogeneous inflow**, against 9.8e-16
+with homogeneous data. Localised by elimination: the tensor half and the affine half were each
+checked against a central difference of their own operator — exact, one being quadratic and the
+other affine — and the residual `S` matches `N - Q` at 2.2e-16, so the gap is `CompiledStabilisation
+::jacobian` alone. It does not move a solution: the reduced solution is defined by its residual,
+which is exact, and ExaDG's own Jacobian is already not the derivative of its own residual — both
+sit 22.7% from a finite difference of it, because λ is frozen. The cost is Newton iterations,
+already linear rather than quadratic for that reason.
 
 **The ROM is not yet a deliverable.** `CompiledStabilisation` holds a communicator and allreduces on
 every `projected()` / `jacobian()`, and nothing serialises. `detach()` drops the mesh, not the
