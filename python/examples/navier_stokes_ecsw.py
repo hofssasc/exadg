@@ -20,65 +20,44 @@
 
 """Hyper-reducing the Lax-Friedrichs stabilisation with ECSW.
 
-``navier_stokes_tensor.py`` reduces the convective term exactly: its trilinear part becomes a
-third-order tensor, contracted online at a cost independent of the mesh. What that leaves is the
-Lax-Friedrichs stabilisation
+``navier_stokes_tensor.py`` reduces the convective term exactly, as a third-order tensor. What
+that leaves is the stabilisation ``S(u) = N(u) - B(u, u)``, a face term whose
+``lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|)`` is a maximum of absolute values and so no
+polynomial at all. It is also what keeps under-resolved flow stable, which is why it is sampled
+rather than dropped or modelled.
 
-    S(u) = N(u) - B(u, u),    a face term, 0.5 * lambda * jump(u)
-
-whose ``lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|)`` is a maximum of absolute values and so
-no polynomial at all. It is also the term that stabilises under-resolved flow, which is why it is
-sampled rather than dropped or modelled.
-
-**ECSW, not DEIM.** Nothing here is interpolated. The reduced stabilisation is fitted as a
+**ECSW, not DEIM.** Nothing is interpolated. The reduced stabilisation is fitted as a
 *non-negative* combination of a few faces' exact contributions,
 
     V^T S(u) ~ sum_{f in F} xi_f V^T S_f(u),    xi >= 0
 
 with the weights chosen by a non-negative least squares that stops as soon as the fit is good
-enough -- every extra face kept is one more the reduced model has to evaluate. Asking a smooth
-interpolant to reproduce a kink is exactly what DEIM would do and exactly what this avoids.
+enough -- every extra face kept is one more the reduced model evaluates. Asking a smooth
+interpolant to reproduce a kink is what DEIM would do and what this avoids. Non-negativity is not
+decoration either: it is what makes the sampled operator inherit the sign structure of the one it
+replaces.
 
-The Jacobian is sampled with the same weights. ExaDG freezes lambda when it linearises -- it is
-not differentiable -- so the linearised stabilisation is a *linear* face operator built from the
-same quantity, and the weights carry over unchanged. With the tensor supplying the convective
-part's derivative exactly, the reduced Jacobian is then the exact derivative of the reduced
-residual, and neither depends on the mesh any more.
+The Jacobian is sampled with the same weights. ExaDG freezes ``lambda`` when it linearises -- it is
+not differentiable -- so the linearised stabilisation is a *linear* face operator over the same
+faces. With the tensor supplying the convective part's derivative exactly, the reduced Jacobian is
+then the exact derivative of the reduced residual and neither depends on the mesh.
 
-Both are read off a ``SampledOperator`` the model hands out, which speaks *reduced coefficients*
-rather than velocity vectors. That is what makes the online cost independent of the mesh: given a
-vector it would have to reconstruct ``V a`` everywhere before looking at a dozen faces; given
-coefficients it combines basis traces gathered on the sampled faces when the weights were fitted.
-Those traces, the weights and the face geometry are all the evaluation needs, so they are split
-off into a ``CompiledOperator`` that holds no reference to the discretisation. Nothing mesh-sized
-is touched and no deal.II integrator is called::
-
-    refinement   dofs   faces   kept    full     sampled   speed-up
-             3   1152     144     21   0.040 ms   0.018 ms     2.2x
-             4   4608     544     27   0.132 ms   0.026 ms     5.1x
-             5  18432    2112     27   0.501 ms   0.030 ms    16.6x
-             6  73728    8320     27   2.644 ms   0.029 ms    90.7x
-
-The sampled column is flat across a sixty-fourfold growth in degrees of freedom, because the fit
-settles at 27 faces and stays there. That, rather than the speed-up, is the claim: the cost is set
-by the faces kept, and the faces kept are set by the rank of the term, not by the mesh.
+Both are read off a ``SampledOperator`` that speaks *reduced coefficients* rather than velocity
+vectors. That is what makes the online cost independent of the mesh: given a vector it would have
+to reconstruct ``V a`` everywhere before looking at a dozen faces. Those coefficients, the weights
+and the face geometry are all the evaluation needs, so they are split into a ``CompiledOperator``
+holding no reference to the discretisation.
 
 Two records come out of a run. ``navier_stokes_ecsw_{velocity,pressure}`` holds the POD modes, the
-full-order field at one parameter, and each tolerance's reduced field and error -- all at the *same*
-parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` is the selection itself:
-a surface mesh of the faces the fit kept, one cell per face, carrying ``ecsw_weight``. Open it
-alongside the velocity record to see where in the domain the quadrature went.
+full-order field at one parameter, and each tolerance's reduced field and error -- all at the same
+parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` is the selection
+itself: a surface mesh of the faces the fit kept, one cell per face, carrying ``ecsw_weight``.
 
 .. note::
    Colour the modes by a **component**, not by magnitude. POD modes are orthogonal as vector
-   fields -- pairwise cosine here is under 0.01 -- but their magnitudes are 76-83% correlated and
-   their norms agree to three digits, so magnitude, which is ParaView's default for a vector array,
-   makes all four look like the same picture. The difference is in the direction.
-
-**One thing still scales with the mesh**: the weight fit is solved redundantly on every rank over a
-training matrix gathered whole. See the warning on ``local_ecsw_weights``, and the architecture in
-``ExaDG ROM Next Steps.md``. It is offline, so it bounds the size of problem that can be trained
-rather than the cost of a reduced solve.
+   fields, but their magnitudes are strongly correlated and their norms nearly equal, so magnitude
+   -- ParaView's default for a vector array -- makes them all look like the same picture. The
+   difference is in the direction.
 
 Runs unchanged on any number of ranks::
 
@@ -187,8 +166,9 @@ def main():
         "the rank count because matrix-free pads its face batches per rank -- the padding slots\n"
         "contribute nothing and are never selected, so the fit is unchanged.\n"
         "\n"
-        "Residual and Jacobian are both sampled, and neither touches the mesh: see the table in\n"
-        "the module docstring. What still does is the weight fit, which is offline."
+        "Residual and Jacobian are both sampled and neither touches the mesh -- the cost is set\n"
+        "by the faces kept, and the faces kept are set by the rank of the term rather than by\n"
+        "the mesh. What still touches it is the weight fit, which is offline."
     )
 
 

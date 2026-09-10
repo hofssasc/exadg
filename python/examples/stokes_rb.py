@@ -20,11 +20,11 @@
 
 """Saddle-point reduced basis for the ExaDG forced box, driven entirely by pyMOR.
 
-This is a **verification, not a benchmark**. The Stokes solution is linear in the forcing
-amplitudes, so the manifold is exactly P-dimensional and a basis of P modes has to reproduce the
+A **verification, not a benchmark**. The Stokes solution is linear in the forcing amplitudes, so
+the manifold is exactly ``P``-dimensional and a basis of ``P`` modes has to reproduce the
 full-order model. There is nothing to approximate, which is the point: any error that survives is
-a defect in the saddle-point projection rather than an approximation, with no truncation error to
-hide behind. The reduction benchmark is the Navier-Stokes case; this is what has to work first.
+a defect in the saddle-point projection, with no truncation error to hide behind. The reduction
+benchmark is the Navier-Stokes case; this is what has to work first.
 
 Four things are checked, in the order in which they would break:
 
@@ -32,6 +32,9 @@ Four things are checked, in the order in which they would break:
     2. the assembled block system agrees with ExaDG's own coupled solve
     3. a truncated basis is visibly wrong, so the check below has power
     4. the reduced model reproduces the full one once the basis spans the manifold
+
+The last has a floor, and it is the solver's: GMRES converges a residual, so the error in the
+solution is that times the condition number of the saddle point.
 
 Runs unchanged on any number of ranks::
 
@@ -154,7 +157,7 @@ def check_adjoint(model, p):
     lhs = B.apply(u).inner(p)[0, 0]
     rhs = u.inner(B.apply_adjoint(p))[0, 0]
 
-    print(f"\n<B u, p> vs <u, B^T p> : {abs(lhs - rhs) / abs(lhs):.3e}")
+    print(f"\nadjoint identity   : {abs(lhs - rhs) / abs(lhs):.3e}  (<B u, p> vs <u, B^T p>)")
     assert abs(lhs - rhs) / abs(lhs) < 1.0e-12, "B^T is not the adjoint of B"
 
 
@@ -166,7 +169,7 @@ def check_block_system(model, n_parameters):
     rhs = model.rhs.as_range_array(mu)
     residual = (model.operator.apply(U, mu=mu) - rhs).norm()[0] / rhs.norm()[0]
 
-    print(f"block residual / |rhs| : {residual:.3e}")
+    print(f"block residual     : {residual:.3e}  (relative to |rhs|)")
     assert residual < 1.0e-9, "the block system is not the one ExaDG solves"
 
 

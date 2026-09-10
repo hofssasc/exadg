@@ -62,6 +62,7 @@ from exadg.mor.models.saddle_point import (
     ExaDGSaddlePointVisualizer,
     MPIExaDGSaddlePointVisualizer,
     exadg_model,
+    exadg_models_id,
 )
 from exadg.mor.models.stationary import parameter_names
 
@@ -252,6 +253,41 @@ class ExaDGStepSolver(Solver):
         return operator.source.make_array([
             velocity_space.make_array(velocities), pressure_space.make_array(pressures)
         ]), {}
+
+
+def _local_time_step_for_cfl(model, cfl):
+    """Ask one rank's model. The criterion reduces over the communicator, so all must ask."""
+    return exadg_model(model).time_step_for_cfl(cfl)
+
+
+def time_step_for_cfl(model, cfl):
+    """The time step this discretisation admits at that CFL number.
+
+    ExaDG's own criterion, read off the mesh -- see ``ForcedFOM::time_step_for_cfl``. Collective,
+    because the minimum is taken over every element and therefore over every rank, so it is
+    dispatched rather than asked of rank 0 alone.
+
+    A step count is what a time stepper wants, and deriving it from this rather than fixing it is
+    what keeps a refinement study honest: a count that does not follow the mesh silently changes
+    the CFL number when the mesh changes, and then two things are varying at once.
+    """
+    from pymor.tools import mpi
+
+    if not mpi.parallel:
+        return _local_time_step_for_cfl(model, cfl)
+
+    return mpi.call(mpi.function_call, _local_time_step_for_cfl, exadg_models_id(model), cfl)
+
+
+def steps_for_cfl(model, cfl, T):
+    """Steps over ``[0, T]`` at that CFL number, rounded up so the last one lands on ``T``.
+
+    The rounding is ``adjust_time_step_to_hit_end_time`` from ExaDG's time integrator, which is
+    what it does with the same number.
+    """
+    from math import ceil
+
+    return max(1, ceil(T / time_step_for_cfl(model, cfl)))
 
 
 def _local_step_solve(model, f, g, mass_scaling, time, guess):

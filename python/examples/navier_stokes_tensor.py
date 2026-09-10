@@ -21,16 +21,14 @@
 """The Navier-Stokes convective term reduced exactly, as a third-order tensor.
 
 The convective operator splits into a trilinear part and the Lax-Friedrichs stabilisation. The
-trilinear part has an exact Galerkin projection -- a fixed tensor, contracted online at a cost
-independent of the mesh -- so a reduced model need not evaluate it at full order at all. That is
-what ITHACA-FV and ITHACA-DG do for the whole convective term, and what Yu & Hesthaven (JCP 2022)
-do for its central part before hyper-reducing the rest.
+trilinear part has an exact Galerkin projection -- a fixed third-order tensor, contracted online
+at a cost independent of the mesh -- so a reduced model need not evaluate it at full order at all.
 
-**This is a verification, not a speed-up.** Neither this reduced model nor the plain Galerkin one
-approximates the convective term, so the two have to agree to solver tolerance; that is what the
-script checks, and it is what makes this the reference against which a hyper-reduced stabilisation
-is later measured. The stabilisation and the momentum Jacobian are still evaluated at full order
-here, which is exactly what ECSW is meant to remove.
+**A verification, not a speed-up.** Neither this reduced model nor a plain Galerkin one
+approximates the convective term, so the two have to agree to solver tolerance. That agreement is
+what the script checks, and it is what makes this the reference a hyper-reduced stabilisation is
+later measured against. The stabilisation and the momentum Jacobian are still evaluated at full
+order here, which is exactly what ECSW removes.
 
 Runs unchanged on any number of ranks::
 

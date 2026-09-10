@@ -897,6 +897,30 @@ public:
     return dst;
   }
 
+  /**
+   * The time step this mesh admits at the given CFL number.
+   *
+   * ExaDG's own calculation, not a reimplementation of it: calculate_time_step_cfl_global() reads
+   * the element sizes out of the MatrixFree, together with the velocity degree and the parameters'
+   * max_velocity and cfl_exponent_fe_degree_velocity, and returns the step at CFL = 1. The caller
+   * scales it and rounds it into a step count, which is what adjust_time_step_to_hit_end_time()
+   * does inside ExaDG's own time integrator.
+   *
+   * Exposed because a step count fixed independently of the mesh is a trap: refine and the same
+   * count silently becomes a different CFL, so a convergence study measures two things at once.
+   */
+  double
+  time_step_for_cfl(double const cfl) const
+  {
+    return cfl * pde_operator->calculate_time_step_cfl_global();
+  }
+
+  double
+  get_max_velocity() const
+  {
+    return application->get_max_velocity();
+  }
+
   double
   get_upwind_factor() const
   {
@@ -1921,6 +1945,11 @@ register_model(py::module_ & module, std::string const & name)
          py::arg("verbose")     = false)
     .def_property_readonly("n_modes", &ForcedFOM<dim>::n_modes)
     .def_property_readonly("upwind_factor", &ForcedFOM<dim>::get_upwind_factor)
+    .def_property_readonly("max_velocity", &ForcedFOM<dim>::get_max_velocity)
+    .def("time_step_for_cfl",
+         &ForcedFOM<dim>::time_step_for_cfl,
+         py::arg("cfl"),
+         "The time step this mesh admits at that CFL number, from ExaDG's own criterion.")
     .def_property_readonly("quadrature_indices", &ForcedFOM<dim>::quadrature_indices)
     .def("apply_convective",
          &ForcedFOM<dim>::apply_convective,

@@ -25,72 +25,44 @@ discretised step can::
 
     s M u + N(u, p) = f,    s = gamma_0 / dt
 
-which is the steady problem again with a mass term and a right-hand side carrying the history.
-So ``interface.h`` carries the step and this script carries the loop -- and the loop is pyMOR's
-for the full-order model *and* for any reduced model built on it, because a reduced model has no
-ExaDG object to step it and comparing two different time discretisations measures nothing.
+which is the steady problem again with a mass term and a right-hand side carrying the history. So
+``interface.h`` carries the step and this script carries the loop -- and the loop is pyMOR's for
+the full-order model *and* for any reduced model built on it, because a reduced model has no ExaDG
+object to step it and comparing two time discretisations measures nothing.
 
 Four things are checked, in the order in which they would break.
 
-**One: the coefficients are the textbook ones.** Derived from ``sum_j (1/j) nabla^j`` rather than
+**The coefficients are the textbook ones.** Derived from ``sum_j (1/j) nabla^j`` rather than
 tabulated, so they are worth checking against the values everyone knows.
 
-**Two: s = 0 is the steady problem, through the pyMOR layer.** The same block operator and the
-same solver, asked for ``mass_scaling = 0``, reproduce the steady model over the same
-discretisation. That is also what makes the third check meaningful: both models' vectors live in
-the same space, which they do only because ``velocity_space()`` hands out one space rather than a
-fresh one per call.
+**s = 0 is the steady problem, through the pyMOR layer.** The same block operator and the same
+solver, asked for zero mass scaling, reproduce the steady model over the same discretisation. That
+also makes the third check meaningful: both models' vectors live in one space, which they do only
+because ``velocity_space()`` hands out one space rather than a fresh one per call.
 
-**Three: the flow relaxes to that steady state.** The forcing is time-independent, so the
-trajectory has nowhere else to go. Measured, degree 2, refinement 3, t in [0, 4]::
+**The flow relaxes to that steady state.** The forcing is time-independent, so the trajectory has
+nowhere else to go. This test case has no dynamics of its own -- it runs at a Reynolds number
+where a confined 2D flow cannot oscillate -- so what is verified is the machinery, not a flow.
 
-    t      |U(t) - U_steady| / |U_steady|
-    0.00   1.0000e+00
-    0.12   1.2129e-01
-    0.50   7.5808e-02
-    2.00   1.9772e-02
-    4.00   4.0254e-03
+**Each order converges at its own rate**, against a fine reference. BDF-2 approaches its rate from
+above because its first step is BDF-1: the scheme needs two levels and at ``t = 0`` there is one,
+which perturbs the trajectory by ``O(dt^2)`` globally and washes out.
 
-which is a decay time of about 1.3 -- faster than the slowest Stokes mode, because the forcing
-blobs are of width 0.15 and excite the fast ones. **This test case has no dynamics of its own**:
-at nu = 0.02 it runs at Re = 2-6, and a confined 2D flow needs Re ~ 1e3-1e4 before it oscillates
-on its own. See the module docstring of ``navier_stokes_ecsw.py`` and the vault note for what to
-change if the transient is meant to be interesting rather than merely correct.
-
-**Four: each order converges at its own rate.** Against a fine BDF-2 reference::
-
-    order   nt      dt        error     rate
-        1    8  0.5000  2.6139e-03
-        1   16  0.2500  1.2729e-03     1.04
-        1   32  0.1250  6.2678e-04     1.02
-        1   64  0.0625  3.1085e-04     1.01
-        2    8  0.5000  4.0842e-04
-        2   16  0.2500  7.8217e-05     2.38
-        2   32  0.1250  1.7721e-05     2.14
-        2   64  0.0625  4.2048e-06     2.08
-
-BDF-2 approaches 2 from above because its first step is BDF-1 -- the scheme needs two levels and
-at t = 0 there is one -- which perturbs the trajectory by O(dt^2) globally and washes out.
+**The step count is the variable here, and only here.** This is a study *of* the time
+discretisation, so ``nt`` is swept at a fixed mesh on purpose. Everywhere else it is derived from
+a fixed Courant number through ExaDG's own criterion -- a count held fixed across meshes silently
+changes the CFL number when the mesh changes. The table reports the Courant number each count
+corresponds to, so the sweep can be placed against the limit.
 
 **Why order 2 and not order 1.** For a degree-k discontinuous Galerkin velocity the spatial error
-is O(h^(k+1)), so keeping the time error subordinate needs ``dt <~ h^((k+1)/p)``. At k = 2 and
-h = 1/16 that is dt <~ 2e-4 for BDF-1 against 2e-2 for BDF-2: forty thousand steps against six
-hundred. BDF-1 is a startup and a debugging scheme, not one to generate snapshots with.
+is ``O(h^(k+1))``, so keeping the time error subordinate needs ``dt <~ h^((k+1)/p)``. At degree 2
+that is the difference between tens of thousands of steps and hundreds. BDF-1 is a startup and
+debugging scheme, not one to generate snapshots with.
 
-**A step is cheaper than a steady solve, and the preconditioner is why.** Measured seconds per
-step against one cold steady solve on the same mesh::
-
-                          refinement 3          refinement 4
-    dt        s      InvMass    Cahouet    InvMass    Cahouet
-    0.5       2        0.91x      0.69x      0.91x      0.68x
-    0.125     8        1.35x      0.45x      1.53x      0.51x
-    0.03125  32        3.32x      0.38x      3.99x      0.38x
-
-With ``SchurComplementPreconditioner::InverseMassMatrix`` the cost *grows* with s, which is
-backwards -- a smaller step is more mass-dominated and should be easier. The Schur complement of
-``[[s M + A, B^T], [B, 0]]`` tends to ``-(1/s) B M^-1 B^T``, a pressure Laplacian scaled by 1/s,
-so a pressure mass matrix becomes a worse approximation the finer the step. Cahouet-Chabard is the
-sum of the two limits and restores the expected behaviour: the finer the step, the cheaper it is.
+**A step is cheaper than a steady solve, and the preconditioner is why.** The Schur complement of
+``[[s M + A, B^T], [B, 0]]`` tends to a pressure Laplacian scaled by ``1/s``, not to a mass
+matrix, so the steady choice degrades as the step shrinks while Cahouet-Chabard does not. The cost
+table below is what says which.
 
 Runs unchanged on any number of ranks::
 
@@ -100,6 +72,7 @@ Runs unchanged on any number of ranks::
 Run from the repository root.
 """
 
+import math
 import time
 
 import numpy as np
@@ -111,6 +84,7 @@ from exadg.mor.models.instationary_saddle_point import (
     BDFTimeStepper,
     bdf_coefficients,
     mpi_instationary_saddle_point_model,
+    time_step_for_cfl,
 )
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes_transient.json"
@@ -132,10 +106,13 @@ def main():
     mu = Mu(mu=list(MU))
     product = model.products["mixed"]
 
+    limit = time_step_for_cfl(model, 1.0)
+
     print(f"ranks              : {mpi.size}")
     print(f"velocity dofs      : {velocity.dim}")
     print(f"pressure dofs      : {pressure.dim}")
     print(f"interval           : [0, {T}]")
+    print(f"CFL = 1 step       : {limit:.4e}, i.e. {math.ceil(T / limit)} steps over the interval")
 
     print("\nBDF coefficients, against the values everyone knows")
     print(f"  {'order':>5}  {'gamma':>9}  {'alpha':>22}  expected")
@@ -154,7 +131,7 @@ def main():
         model.rhs.as_range_array(mu), mu=mu, solver=steady_solver
     )
     norm_steady = U_steady.norm(product)[0]
-    print(f"\nsteady state at s = 0 : |U| = {norm_steady:.9e}")
+    print(f"\nsteady at s = 0    : |U| = {norm_steady:.9e}")
 
     print(f"\nrelaxation to it, nt = {STEP_COUNTS[-1]}, BDF-2")
     trajectory = stepped(model, mu, STEP_COUNTS[-1], 2)
@@ -165,13 +142,14 @@ def main():
 
     reference = stepped(model, mu, REFERENCE_STEPS, 2)[-1]
     print(f"\norder of convergence at t = {T}, against nt = {REFERENCE_STEPS} BDF-2")
-    print(f"  {'order':>5}  {'nt':>5}  {'dt':>9}  {'error':>12}  {'rate':>6}")
+    print(f"  {'order':>5}  {'nt':>5}  {'dt':>9}  {'CFL':>7}  {'error':>12}  {'rate':>6}")
     for order in (1, 2):
         previous = None
         for nt in STEP_COUNTS:
             error = (stepped(model, mu, nt, order)[-1] - reference).norm(product)[0] / norm_steady
             rate = "" if previous is None else f"{np.log2(previous / error):>6.2f}"
-            print(f"  {order:>5}  {nt:>5}  {T / nt:>9.4f}  {error:>12.4e}  {rate}")
+            print(f"  {order:>5}  {nt:>5}  {T / nt:>9.4f}  {T / nt / limit:>7.2f}  "
+                  f"{error:>12.4e}  {rate}")
             previous = error
 
     print(f"\nseconds per step, against one cold steady solve ({cost(model, mu, 0):.3f} s)")

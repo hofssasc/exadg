@@ -20,25 +20,28 @@
 
 """Empirical interpolation of the thermal block operator, measured against the exact reference.
 
-Two things are checked here, and the second is the interesting one.
+Two things are checked, and the second is the interesting one.
 
 **The restriction contract.** ``Operator.restricted`` is the hook the whole of hyper-reduction
 rests on, and its contract is an identity rather than an approximation::
 
     op.apply(U, mu).dofs(dofs) == restricted.apply(U.dofs(source_dofs), mu)
 
-A violation does not raise; empirical interpolation just converges to a slightly different
-operator than the one being reduced. The C++ counterpart of this check is
-``tests/pymor/restricted_operator.cc``; here it is exercised through pyMOR's own call path.
+A violation does not raise -- interpolation simply converges to a slightly different operator than
+the one being reduced -- so it is checked rather than assumed. ``tests/pymor/restricted_operator.cc``
+is the C++ counterpart; here it is exercised through pyMOR's own call path.
 
-**Whether interpolation is worth it.** It is not, for this problem, and the point of the sweep
-is to show that against a reference rather than assert it. The reduced model is compared with
-the exact affine projection on the same basis, so the only difference between the two numbers
-is the interpolation.
+**Whether interpolation is worth it.** Not for this problem, and the sweep shows that against a
+reference rather than asserting it: the interpolated model is compared with the exact affine
+projection *on the same basis*, so the only difference between the two numbers is the
+interpolation. The coefficient field here is the parameter, so there is no low-dimensional
+structure for a greedy to find.
 
-Runs unchanged on any number of ranks. The stencil is replicated rather than distributed --
-each rank assembles the cells it owns and then receives the rest -- because pyMOR builds the
-restricted operator on every rank but keeps and evaluates only rank 0's::
+The stencil is replicated rather than distributed -- each rank assembles the cells it owns and
+receives the rest -- because pyMOR builds the restricted operator on every rank and evaluates only
+rank 0's.
+
+Runs unchanged on any number of ranks::
 
     python python/examples/thermal_block_ei.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/thermal_block_ei.py
@@ -87,7 +90,10 @@ def main():
     )
     n_parameters = field.operator.parameters["mu"]
 
-    print(f"ranks: {mpi.size}")
+    print(f"ranks              : {mpi.size}")
+    print(f"degrees of freedom : {space.dim}")
+    print(f"parameters         : {n_parameters}")
+    print(f"modes              : {N_MODES}")
 
     rng = np.random.default_rng(0)
     train = [Mu(mu=m) for m in rng.uniform(-1.0, 1.0, (N_TRAIN, n_parameters))]
@@ -133,7 +139,7 @@ def check_restriction_contract(field, space, basis, train):
         ).to_numpy()
         worst = max(worst, np.abs(exact - via_stencil).max())
 
-    print("restriction contract")
+    print("\nrestriction contract")
     print(f"  output dofs / stencil dofs      : {len(dofs)} / {len(source_dofs)}")
     print(f"  max |apply.dofs - restricted|   : {worst:.3e}")
     assert worst < 1.0e-10, "the restriction does not reproduce the operator"

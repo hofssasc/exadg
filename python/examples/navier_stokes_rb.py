@@ -20,29 +20,30 @@
 
 """Saddle-point reduced basis for the forced box at Navier-Stokes, driven entirely by pyMOR.
 
-The same geometry, forcing and boundary conditions as ``stokes_rb.py``; the only difference is
-the convective term. That is deliberate: everything that could go wrong in the block plumbing is
-shared with the Stokes case, which verifies exactly, so what is measured here is the
+The same geometry, forcing and boundary conditions as ``stokes_rb.py``; the only difference is the
+convective term. That is deliberate -- everything that could go wrong in the block plumbing is
+shared with the Stokes case, which verifies exactly -- so what is measured here is the
 nonlinearity and nothing else.
 
-Unlike the Stokes case this is a real reduction benchmark rather than a verification. The
-solution is no longer linear in the forcing amplitudes, so the manifold is not P-dimensional and
-the reduced model approximates instead of reproducing.
+Unlike Stokes this is a real reduction rather than a verification. The solution is no longer
+linear in the forcing amplitudes, so a finite basis approximates instead of spanning, and the
+error falls with the basis rather than dropping to the solver floor.
 
-The viscosity is 0.02, chosen by measuring rather than by taste. Against the Stokes solution at
-the same forcing, the convective term moves the velocity by 14% there, while the coupled solver
-still converges for every parameter drawn; at 0.1 the nonlinearity is worth 0.4% and the problem
-is Stokes in disguise, and at 0.01 it is worth 30% but only half the parameters converge.
+The viscosity was chosen by measuring how much the convective term moves the solution against the
+Stokes one at the same forcing, subject to the coupled solver still converging at every parameter
+drawn; see the vault for the sweep.
 
-**The reduced model is correct, not fast.** Every reduced Newton step evaluates the residual at
-full order -- pyMOR projects the nonlinear operator, it cannot collapse it -- so the online cost
-still scales with the mesh. Hyper-reduction is what removes that, and it is the next step rather
+**The reduced model here is correct, not fast.** Every reduced Newton step evaluates the residual
+at full order -- pyMOR projects a nonlinear operator, it cannot collapse it -- so the online cost
+still scales with the mesh. Removing that is hyper-reduction, and it is the next script rather
 than this one.
 
-Run from the repository root::
+Runs unchanged on any number of ranks::
 
     python python/examples/navier_stokes_rb.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/navier_stokes_rb.py
+
+Run from the repository root.
 """
 
 import numpy as np

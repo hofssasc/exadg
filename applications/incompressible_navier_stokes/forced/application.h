@@ -205,6 +205,12 @@ public:
                         "residual, so the error in the solution is this times the condition "
                         "number of the saddle point -- which is what sets the floor for any "
                         "check that a reduced model reproduces the full one exactly.");
+      prm.add_parameter("MaxVelocity",
+                        max_velocity,
+                        "Velocity scale the CFL condition is read against. Not a bound and not "
+                        "measured from a solution -- a time step has to be chosen before there is "
+                        "one -- so it is the a-priori estimate ExaDG's own applications supply, "
+                        "and it has to be revisited if the forcing amplitudes change.");
       prm.add_parameter("ForcingWidth",
                         forcing_width,
                         "Standard deviation of each forcing mode.");
@@ -253,6 +259,12 @@ public:
     return regime == "Unsteady";
   }
 
+  double
+  get_max_velocity() const
+  {
+    return max_velocity;
+  }
+
 private:
   void
   set_parameters() final
@@ -291,8 +303,17 @@ private:
     this->param.solver_type             = is_unsteady() ? SolverType::Unsteady :
                                                           SolverType::Steady;
     this->param.temporal_discretization = TemporalDiscretization::BDFCoupledSolution;
+    // The step size is the caller's, and it is derived from a CFL number rather than set: see
+    // ForcedFOM::time_step_for_cfl, which is ExaDG's own calculate_time_step_cfl_global() scaled
+    // by the number. UserSpecified here only because nothing in this application steps anything --
+    // the loop belongs to whoever drives the binding.
     this->param.calculation_of_time_step_size = TimeStepCalculation::UserSpecified;
     this->param.time_step_size                = 1.0;
+    this->param.max_velocity                  = max_velocity;
+
+    // ExaDG's convention for a degree-p velocity: the CFL limit tightens faster than 1/p. 1.5 is
+    // what its own flow applications use.
+    this->param.cfl_exponent_fe_degree_velocity = 1.5;
     this->param.order_time_integrator   = 1;
 
     this->param.convergence_criterion_steady_problem =
@@ -467,6 +488,9 @@ private:
 
   // "Steady" or "Unsteady": whether the momentum operator carries a mass term
   std::string  regime        = "Steady";
+
+  // velocity scale the CFL condition is read against; see the MaxVelocity parameter
+  double       max_velocity  = 0.15;
 
   double       viscosity        = 1.0;
   double       solver_tolerance = 1.e-10;

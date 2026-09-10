@@ -20,8 +20,8 @@
 
 """Where the convective term is a polynomial, and where it is not.
 
-A reduced model can represent a polynomial operator **exactly** as a small tensor, with an online
-cost independent of the mesh and no interpolation anywhere. This script establishes which part of
+A reduced model can represent a polynomial operator **exactly** as a small tensor, at an online
+cost independent of the mesh and with no interpolation anywhere. This establishes which part of
 ExaDG's convective operator qualifies, by measurement rather than by reading the flux formulas.
 
 In divergence form the volume integral and the central part of the numerical flux are trilinear.
@@ -29,32 +29,34 @@ What is not is the Lax-Friedrichs stabilisation, whose
 
     lambda = upwind_factor * 2 * max(|uM.n|, |uP.n|)
 
-is a maximum of absolute values. Writing S(u) = N(u) - B(u, u) for whatever that leaves over,
+is a maximum of absolute values. Writing ``S(u) = N(u) - B(u, u)`` for whatever that leaves,
 
     N(u) = B(u, u) + S(u)          B trilinear, S the stabilisation
 
 is the split a reduced model has to respect: B becomes a third-order tensor, S is what
-hyper-reduction has to handle. Reducing the two together, or dropping S, means projecting an
-operator the full-order model never solved.
+hyper-reduction handles. Reducing the two together, or dropping S, projects an operator the
+full-order model never solved.
 
-Four things are checked, and the third is the one that changes how the tensor must be built.
+Four things are checked, and the third changes how the tensor must be built -- ExaDG's
+linearly-implicit convective operator is trilinear too, and is a *different* bilinear map, so the
+tensor is built by polarising the nonlinear one.
 
-Every check runs on all ranks, because that is where the bugs are. The identities themselves are
-local to a face or a cell, so a partition cannot change them -- which is exactly what makes them
-worth checking in parallel: a face on a partition boundary is the one place a flux can be
-evaluated against the wrong exterior state, and nothing else in the suite would say so. Running
-this at four ranks is what found the transport velocity's missing ghost exchange, which made
-``C(w, w)`` fifty per cent wrong while every nonlinear path agreed to eight digits.
+Every check runs on all ranks, because that is where the bugs are. The identities are local to a
+face or a cell, so a partition cannot change them -- which is exactly what makes them worth
+checking in parallel: a face on a partition boundary is the one place a flux can be evaluated
+against the wrong exterior state, and nothing else in the suite would say so.
 
-The raw operators speak ExaDG vectors, not pyMOR VectorArrays, so each check is dispatched whole
-rather than assembled from remote vector operations: ``reductors.dispatch`` runs it on every rank
-and only floats come back. Norms are ``l2_norm``, which is collective, so each rank computes the
-same global number and pyMOR keeps rank 0's.
+The raw operators speak ExaDG vectors rather than pyMOR VectorArrays, so each check is dispatched
+whole rather than assembled from remote vector operations: ``reductors.dispatch`` runs it on every
+rank and only floats come back. Norms are ``l2_norm``, which is collective, so each rank computes
+the same global number.
 
-Run from the repository root::
+Runs unchanged on any number of ranks::
 
     python python/examples/convective_split.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/convective_split.py
+
+Run from the repository root.
 """
 
 import numpy as np

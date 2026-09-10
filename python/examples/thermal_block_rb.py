@@ -20,22 +20,28 @@
 
 """Reduced basis approximation of the ExaDG thermal block, driven entirely by pyMOR.
 
+The whole certified pipeline over an affine operator: proper orthogonal decomposition of
+full-order solves, Galerkin projection onto the reduced space, and a residual-based error
+estimator that bounds the reduced error rather than reporting it. The estimator is what makes the
+script worth running -- a reduced model that is merely close is a claim, and one that is close and
+says how close is a result.
+
+Every printed quantity is global, so the output is identical for every rank count. That is the
+second thing this pins: it is the parallel regression check as much as it is a demo. Agreement to
+nine significant digits is what is genuinely rank-independent -- a different partitioning sums its
+reductions in a different order and the iterative solve carries that to about the twelfth digit --
+and any real defect moves things far more than that.
+
+Sized to finish in the time you will actually give it. Assembling the certificate costs
+``O((P r)^2)`` full-order applies, so the mesh and the basis are kept small; raise ``refinements``
+and ``N_MODES`` for a real study.
+
 Runs unchanged on any number of ranks::
 
     python python/examples/thermal_block_rb.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/thermal_block_rb.py
 
-Every quantity it prints is a global one, so the output is identical for every rank count. That
-is the point of the script: it is the parallel regression check as much as it is a demo. Nine
-significant digits, because that is what is genuinely rank-independent -- a different partitioning
-sums floating-point reductions in a different order, and the iterative solve carries that through
-to about the twelfth digit. Any real defect moves things far more than that.
-Paths are relative to the repository root, so run it from there.
-
-Sized to finish in the time you will actually give it. The certified estimator costs
-O((P*r)^2) full-order applies to assemble -- with P = 64 parameters and r = 8 modes that is half
-an hour -- so the mesh and the basis are kept small here. Raise ``refinements`` and ``N_MODES``
-for a real study; the certificate is what makes this example worth running, not the size.
+Run from the repository root.
 """
 
 import numpy as np

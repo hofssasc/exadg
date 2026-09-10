@@ -228,7 +228,7 @@ Every printed quantity is global, so **1 and 4 ranks must agree to nine signific
 | `navier_stokes_tensor.py` | the tensor reproduces a plain Galerkin ROM |
 | `navier_stokes_ecsw.py` | sampling does not move the error |
 | `navier_stokes_transient.py` | BDF coefficients and rates, s=0 vs steady, relaxation, step cost |
-| `navier_stokes_transient_rom.py` | the streamed offline phase, timings, error to the FOM; `--chunks` / `--sketches` compare |
+| `navier_stokes_transient_rom.py` | streamed offline phase, timings, FOM error; `--vtu` / `--chunks` / `--sketches` |
 | `navier_stokes_scaling.py` | the cost model: offline ~n, online ~0 (sweep, minutes) |
 | `ctest -R pymor` | DoF-numbering stability at 1/2/4 ranks; the restricted operator |
 
@@ -287,6 +287,14 @@ basis tolerance of 3e-4, going 1e-2 -> 3e-4 takes the fit from 38 faces to 89 an
 error by 0.02%. What *does* become visible below ~1e-3 is the **basis**: two compression routes
 meeting the same certified bound land on different subspaces, and the stored/streamed gap goes from
 0.3% to 8.8% -- with the streamed one ahead, so it is a difference and not a penalty.
+
+**Derive the step count from a CFL number, never fix it.** `ForcedFOM::time_step_for_cfl` calls
+ExaDG's own `calculate_time_step_cfl_global()` -- element sizes from the MatrixFree, plus
+`max_velocity` and `cfl_exponent_fe_degree_velocity` -- and `steps_for_cfl` rounds it into a count.
+Collective, so it is dispatched. A count held fixed across meshes silently changes the Courant
+number when the mesh changes, and then a refinement study varies two things at once.
+`max_velocity` is an a-priori scale (an input parameter), not a measurement: a step has to be
+chosen before there is a solution.
 
 **Time series come out as a `.pvd`.** Both visualizers take a trajectory: one record per level plus
 a ParaView collection, `times=` optional. Written in Python -- `write_vtu_with_pvtu_record` appends a

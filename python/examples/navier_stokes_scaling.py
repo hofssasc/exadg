@@ -18,27 +18,26 @@
 #  along with this program. If not, see <https://www.gnu.org/licenses/>.
 #  ______________________________________________________________________
 
-"""Does each part of the hyper-reduced path cost what it should?
+"""Does each part of the hyper-reduced path cost what its algorithm says?
 
 ``navier_stokes_ecsw.py`` establishes that sampling the stabilisation does not move the error.
 This asks the other question -- whether the cost behaves -- by refining the mesh and timing every
 stage separately. Three claims, in increasing order of importance.
 
-**One: the full-order model scales.** Nothing downstream can be trusted otherwise, and a reduced
-model measured against a full-order one that is itself misbehaving proves nothing.
+**The full-order model scales.** Nothing downstream can be trusted otherwise: a reduced model
+measured against a full-order one that is itself misbehaving proves nothing.
 
-**Two: the offline stages scale as their algorithms say they should.** Each is linear in the mesh
-for a reason that can be stated in advance, and a stage that departs from its own prediction is a
-bug, not a surprise.
+**The offline stages scale as their algorithms say they should.** Each is a fixed number of passes
+over the mesh, so each is linear in it for a reason that can be stated in advance -- and a stage
+departing from its own prediction is a bug rather than a surprise.
 
-**Three: the reduced model does not scale with the mesh at all.** This is the point of the whole
-construction. A reduced solve contracts a tensor and evaluates a few faces; neither knows how many
-degrees of freedom exist, so the time must be *flat* as the mesh grows by orders of magnitude. A
-speed-up figure only says the ROM is faster today; a flat column says it will still be faster on a
+**The reduced model does not scale with the mesh at all.** This is the point of the construction.
+A reduced solve contracts a tensor and evaluates a few faces; neither knows how many degrees of
+freedom exist, so the time must be *flat* as the mesh grows by orders of magnitude. A speed-up
+figure says the reduced model is faster today; a flat column says it will still be faster on a
 mesh nobody has run yet.
 
-What is timed, and what each is expected to do -- writing the prediction down first is what makes
-the measurement a test rather than a description::
+Writing the prediction down before measuring is what makes this a test rather than a description::
 
     stage                    expected     because
     ----------------------------------------------------------------------------------
@@ -53,48 +52,43 @@ the measurement a test rather than a description::
     sampled stabilisation     **~0**      those batches, from compiled arrays
     sampled Jacobian          **~0**      the same batches, the same arrays
 
-The exponents reported are ``d log t / d log n`` fitted over the sweep. Read them against that
-table: ~1 for the mesh-bound stages, ~0 for the reduced ones.
+The exponents reported are ``d log t / d log n`` fitted over the sweep; read them against that
+table.
 
 .. warning::
    **Read the online claim off the counts, not off the clock.** The reduced stages take tens of
-   microseconds, and at that scale wall time measures the machine as much as the algorithm. The
-   mesh-independent quantities are exact and are printed next to the times: *batches visited*,
-   which bounds the work, and *Newton steps*. Batches are the honest unit -- matrix-free evaluates
-   four to eight faces at once, so a batch costs the same whether one face in it was selected or
-   all of them -- and they saturate at the face count once the mesh is fine enough to stop
-   selected faces sharing one.
+   microseconds, where wall time measures the machine as much as the algorithm. The
+   mesh-independent quantities are exact and printed beside the times: *batches visited*, which
+   bounds the work, and *Newton steps*. A batch is the honest unit -- matrix-free evaluates four
+   to eight faces at once, so a batch costs the same whether one face in it was selected or all of
+   them -- and batches saturate at the face count once the mesh is fine enough that selected faces
+   stop sharing one.
 
-   The clock also had a systematic bias that the counts did not, and it is worth knowing because
-   it looks exactly like the thing being tested. Timed with the full-order model still resident,
-   the reduced stages slowed down at the finest refinement while doing *identical* work -- same
-   batches, same modes, same quadrature -- because that model's working set evicts the compiled
-   arrays between calls. Dropping it made the same work 38% faster at refinement 6 and made no
-   difference at refinement 5, which is what a cache effect looks like and not what mesh
-   dependence looks like.
+   The clock also carries a bias the counts do not, and it looks exactly like the thing being
+   tested: with the full-order model still resident its working set evicts the compiled arrays
+   between calls, so the reduced stages slow down at the finest mesh while doing *identical* work.
+   ``measure()`` therefore calls ``momentum.detach()`` and releases everything full-order before
+   timing, which is both fairer and the situation being claimed -- a deployed reduced model does
+   not carry a mesh around -- and is only possible because the compiled operator holds no
+   reference to one.
 
    Under MPI the microsecond columns also carry one broadcast per evaluation, since every reduced
-   call is dispatched to all ranks; that is a constant per call and does not touch the counts.
+   call is dispatched to all ranks. That is a constant per call and does not touch the counts.
 
-   So ``measure()`` calls ``momentum.detach()`` and releases everything full-order *before* timing
-   the online stages. That is both fairer and the situation actually being claimed -- a deployed
-   reduced model does not carry a mesh around -- and it is only possible because the compiled
-   operator holds no reference to one. It moved the measured exponents from 0.13, 0.17, 0.17 to
-   0.04, 0.07, 0.12.
+The weight fit is the one entry expected to misbehave, and it is listed that way on purpose: every
+rank gathers the whole training matrix and solves the same non-negative least squares, so its
+width grows with the mesh. Offline, so it bounds the size of problem that can be *trained* rather
+than the cost of a reduced solve.
 
-The weight fit is the one entry expected to misbehave, and it is listed that way on purpose --
-every rank gathers the entire training matrix and solves the same non-negative least squares, so
-its width grows with the mesh. It is offline, so it bounds the size of problem that can be
-*trained* rather than the cost of a reduced solve. See ``local_ecsw_weights`` and the architecture
-in ``ExaDG ROM Next Steps.md``.
+``REFINEMENTS`` is the knob: each step multiplies the degrees of freedom by four and the
+full-order cost with them, so a longer sweep is an overnight job.
 
 Runs unchanged on any number of ranks::
 
     python python/examples/navier_stokes_scaling.py
     mpirun -n 4 python -m pymor.tools.mpi python/examples/navier_stokes_scaling.py
 
-Run from the repository root. ``REFINEMENTS`` is the knob: each step multiplies the degrees of
-freedom by four and the full-order cost with them, so a longer sweep is an overnight job.
+Run from the repository root.
 """
 
 import gc

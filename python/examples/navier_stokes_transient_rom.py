@@ -36,14 +36,20 @@ Three tolerances, controlling different things:
     TOLERANCE         how well the sampled faces reproduce the projected stabilisation
     SKETCH            rows kept of the ECSW training matrix, which grows with the level count
 
-A default run streams, and reports what each stage cost, how far the reduced trajectories are from
-the full-order ones, and a ParaView series. Two comparisons are optional and off by default: each
-needs the stored path as its reference, which is the expense streaming exists to avoid, so neither
-belongs in a run on a case that is hard to solve::
+**The step count follows the mesh.** ``CFL`` is fixed and the count is derived from it through
+ExaDG's own criterion, read off the element sizes. Fixing the count instead would mean that
+refining silently changes the Courant number, and then a refinement study varies two things at
+once.
+
+A default run streams and reports what each stage cost and how far the reduced trajectories are
+from the full-order ones. Three additions are optional and off by default; the two comparisons
+each need the stored path as their reference, which is the expense streaming exists to avoid, so
+neither belongs in a run on a case that is hard to solve::
 
     python python/examples/navier_stokes_transient_rom.py
-    python python/examples/navier_stokes_transient_rom.py --chunks
-    python python/examples/navier_stokes_transient_rom.py --sketches
+    python python/examples/navier_stokes_transient_rom.py --vtu       # modes, faces, trajectories
+    python python/examples/navier_stokes_transient_rom.py --chunks    # compression granularity
+    python python/examples/navier_stokes_transient_rom.py --sketches  # sketch size
 
 Runs unchanged on any number of ranks::
 
@@ -62,12 +68,21 @@ from pymor.parameters.base import Mu
 from pymor.tools import mpi
 
 from exadg.mor.basis import chunk_count, streaming_basis, trajectory_chunks
-from exadg.mor.models.instationary_saddle_point import mpi_instationary_saddle_point_model
+from exadg.mor.models.instationary_saddle_point import (
+    BDFTimeStepper,
+    mpi_instationary_saddle_point_model,
+    steps_for_cfl,
+    time_step_for_cfl,
+)
 from exadg.mor.reductors import InstationaryECSWStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes_transient.json"
 DEGREE, REFINEMENTS = 2, 3
-T, NT, ORDER = 4.0, 32, 2
+T, ORDER = 4.0, 2
+
+#: Courant number the step count is derived from, on whatever mesh is used.
+CFL = 0.5
+
 N_TRAIN, N_TEST = 6, 2
 AMPLITUDES = (0.5, 1.5)
 
@@ -83,12 +98,18 @@ CHUNK = 1
 OUTPUT = "output/pymor/navier_stokes_transient_rom"
 
 
-def main(compare_chunks=False, compare_sketches=False):
+def main(compare_chunks=False, compare_sketches=False, write_vtu=False):
     set_log_levels({"pymor": "ERROR", "exadg": "ERROR"})
 
+    # Built at one step so it can be asked what step it admits, then restepped. The criterion is a
+    # property of the discretisation, so the model has to exist before it can be read off.
     model, (velocity, pressure) = mpi_instationary_saddle_point_model(
         "forced", "ForcedFOM2D", INPUT_FILE,
-        degree=DEGREE, refinements=REFINEMENTS, T=T, nt=NT, order=ORDER,
+        degree=DEGREE, refinements=REFINEMENTS, T=T, nt=1, order=ORDER,
+    )
+    nt = steps_for_cfl(model, CFL, T)
+    model = model.with_(
+        time_stepper=BDFTimeStepper(nt, order=ORDER, solver=model.time_stepper.solver)
     )
     rng = np.random.default_rng(0)
     train = [Mu(mu=m) for m in rng.uniform(*AMPLITUDES, (N_TRAIN, model.parameters["mu"]))]
@@ -96,8 +117,9 @@ def main(compare_chunks=False, compare_sketches=False):
 
     print(f"ranks              : {mpi.size}")
     print(f"dofs               : {velocity.dim} velocity, {pressure.dim} pressure")
-    print(f"trajectory         : {NT} steps of BDF-{ORDER} over [0, {T}]")
-    print(f"training           : {N_TRAIN} trajectories = {N_TRAIN * (NT + 1)} levels")
+    print(f"trajectory         : {nt} steps of BDF-{ORDER} over [0, {T}], "
+          f"dt = {T / nt:.4e} at CFL {CFL} (limit {time_step_for_cfl(model, 1.0):.4e})")
+    print(f"training           : {N_TRAIN} trajectories = {N_TRAIN * (nt + 1)} levels")
     print(f"tolerances         : basis {BASIS_TOLERANCE:.0e}, ECSW {TOLERANCE:.0e}, "
           f"sketch {SKETCH}, chunk {CHUNK}")
 
@@ -121,7 +143,7 @@ def main(compare_chunks=False, compare_sketches=False):
     print(f"\nbasis              : {len(basis_u)} velocity + {len(basis_p)} pressure modes, "
           f"reduced dimension {rom.solution_space.dim}")
     print(f"held               : {held} full-order vectors, against "
-          f"{2 * N_TRAIN * (NT + 1)} for keeping every level")
+          f"{2 * N_TRAIN * (nt + 1)} for keeping every level")
     print(f"faces              : {momentum.n_faces} of {momentum.n_candidates}, "
           f"fit residual {momentum.training_residual:.3e}")
 
@@ -144,13 +166,8 @@ def main(compare_chunks=False, compare_sketches=False):
         print(f"  {index:>6}  {error.max():>12.4e}  {error[-1]:>12.4e}")
     print(f"  {'worst':>6}  {worst:>12.4e}")
 
-    approximation = reductor.reconstruct(reduced[0])
-    written = model.visualize(
-        (reference[0], approximation, reference[0] - approximation),
-        legend=("fom", "rom", "error"), filename=OUTPUT,
-        times=np.linspace(0.0, T, len(reference[0])),
-    )
-    print("\nwrote " + "\n      ".join(written))
+    if write_vtu:
+        visualise(model, reductor, momentum, basis_u, basis_p, reference[0], reduced[0])
 
     if compare_chunks:
         chunk_comparison(model, train, test, reference)
@@ -165,16 +182,59 @@ def main(compare_chunks=False, compare_sketches=False):
     )
 
 
+def visualise(model, reductor, momentum, basis_u, basis_p, reference, reduced):
+    """Everything worth opening in ParaView, for the streamed model only.
+
+    Three records, and they answer different questions. The **modes** are what the basis spans;
+    the **faces** are where ECSW put its quadrature, drawn as the faces themselves rather than the
+    cells beside them; and the **trajectories** are the full-order one, the reduced one and their
+    difference as one animated series per block.
+
+    Off by default because a run on a case that is hard to solve wants numbers, not files.
+    """
+    written = []
+
+    # One field per mode. The two bases need not be the same length -- the pressure usually needs
+    # fewer -- so the shorter is padded rather than the extra modes dropped.
+    modes = max(len(basis_u), len(basis_p))
+    velocity, pressure = model.solution_space.subspaces
+    fields = [
+        model.solution_space.make_array([
+            basis_u[k] if k < len(basis_u) else velocity.zeros(1),
+            basis_p[k] if k < len(basis_p) else pressure.zeros(1),
+        ])
+        for k in range(modes)
+    ]
+    written += list(model.visualize(
+        fields, legend=[f"mode_{k}" for k in range(modes)], filename=f"{OUTPUT}_modes"
+    ))
+
+    # Colour a velocity mode by a *component*. Modes are orthogonal as vector fields, but their
+    # magnitudes are correlated and their norms nearly equal, so ParaView's default for a vector
+    # array makes them all look like the same picture.
+    written.append(momentum.write_selection(f"{OUTPUT}_faces"))
+
+    approximation = reductor.reconstruct(reduced)
+    written += list(model.visualize(
+        (reference, approximation, reference - approximation),
+        legend=("fom", "rom", "error"), filename=OUTPUT,
+        times=np.linspace(0.0, T, len(reference)),
+    ))
+
+    print("\nwrote " + "\n      ".join(written))
+
+
 def stream(model, parameters, chunk):
     """The offline phase: solve once, compress as it goes, keep no snapshot.
 
     Returns one ``(basis, compressed)`` pair per field.
     """
+    levels = model.time_stepper.nt + 1
     scales = trajectory_scales(model, parameters[0], chunk)
 
     def trajectories():
         for mu in parameters:
-            yield trajectory_chunks(model, mu, chunk), chunk_count(NT + 1, chunk)
+            yield trajectory_chunks(model, mu, chunk), chunk_count(levels, chunk)
 
     return streaming_basis(
         trajectories(), len(parameters),
@@ -262,7 +322,7 @@ def chunk_comparison(model, train, test, reference):
           f"{momentum.training_residual:>10.3e}  "
           f"{worst_error(model, reductor, rom, test, reference):>11.4e}")
 
-    for chunk in (NT + 1, 8, 1):
+    for chunk in (model.time_stepper.nt + 1, 8, 1):
         fields = stream(model, train, chunk)
         (basis_u, snapshots_u), (basis_p, snapshots_p) = fields
 
@@ -312,4 +372,8 @@ def report(timings):
 
 
 if __name__ == "__main__":
-    main(compare_chunks="--chunks" in sys.argv, compare_sketches="--sketches" in sys.argv)
+    main(
+        compare_chunks="--chunks" in sys.argv,
+        compare_sketches="--sketches" in sys.argv,
+        write_vtu="--vtu" in sys.argv,
+    )
