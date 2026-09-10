@@ -683,10 +683,18 @@ public:
     {
     if(application->get_parameters().nonlinear_problem_has_to_be_solved())
     {
-      // ExaDG's nonlinear solve takes the body force alone; the pressure equation of a steady
-      // incompressible problem has no right-hand side to give it.
-      if(g.l2_norm() != 0.0)
-        return false;
+      // ExaDG's nonlinear solve takes the body force alone and assembles the continuity
+      // equation's right-hand side itself, so g cannot be honoured -- only checked. It is not
+      // required to be zero, because with a weakly imposed inflow it is not: it is required to be
+      // the vector this model would have assembled, which is what pressure_rhs() hands out and
+      // therefore what a caller stepping this model passes back.
+      {
+        VectorType difference(g);
+        difference -= continuity_rhs();
+
+        if(difference.l2_norm() > 1.0e-10 * std::max(1.0, continuity_rhs().l2_norm()))
+          return false;
+      }
 
       // scaling_factor_mass is passed rather than left to default: solve_nonlinear_problem()
       // installs it on the shared momentum operator, and its default is 1.0.
@@ -838,6 +846,29 @@ public:
   get_max_velocity() const
   {
     return application->get_max_velocity();
+  }
+
+  /*
+   * g, the right-hand side of the continuity equation.
+   *
+   * Zero only when the Dirichlet data is homogeneous. A weakly imposed inflow contributes a
+   * boundary term to the divergence operator, so the discrete constraint is B u = g and not
+   * B u = 0. ExaDG's own solve assembles that term internally, which is why a full-order model
+   * never had to know about it -- and why a projection-based reduced model does: its pressure row
+   * is the projection of this equation, and nothing else supplies the constant. Leaving it out
+   * makes the reduced continuity equation wrong by a fixed vector at every step, which is not a
+   * closure error and does not shrink when the basis grows.
+   *
+   * Assembled the way OperatorCoupled::rhs_linear_problem does it, sign and scaling included, so
+   * that this is the same vector ExaDG would use rather than a second derivation of it.
+   *
+   * Evaluated at t = 0: a time-dependent Dirichlet condition would make this a function of time,
+   * which the interface does not yet carry.
+   */
+  std::shared_ptr<VectorType>
+  pressure_rhs() override
+  {
+    return std::make_shared<VectorType>(continuity_rhs());
   }
 
   /*
@@ -1800,6 +1831,28 @@ protected:
     stabilisation_kernel->reinit(
       pde_operator->get_matrix_free(), kernel_data, dof_index, quad_index, true /* own storage */);
   }
+
+  /*
+   * The continuity equation's right-hand side, assembled once and kept.
+   *
+   * It depends on the Dirichlet data alone, which is fixed here, and the solve path compares
+   * against it on every step -- so reassembling it would be a mesh loop per step for a vector
+   * that never changes.
+   */
+  VectorType const &
+  continuity_rhs() const
+  {
+    if(continuity_rhs_vector.size() == 0)
+    {
+      pde_operator->initialize_vector_pressure(continuity_rhs_vector);
+      pde_operator->get_divergence_operator().rhs(continuity_rhs_vector, 0.0);
+      continuity_rhs_vector *= -scaling_factor_continuity();
+    }
+
+    return continuity_rhs_vector;
+  }
+
+  mutable VectorType continuity_rhs_vector;
 
   double
   scaling_factor_continuity() const

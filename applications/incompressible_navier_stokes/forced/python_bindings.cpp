@@ -100,12 +100,6 @@ public:
       return components;
     }
 
-    std::shared_ptr<VectorType>
-    pressure_rhs() override
-    {
-      return assemble_rhs(std::vector<double>(n_modes(), 0.0)).second;
-    }
-
     /**
      * Writes the body force of a parameter as its own VTU record.
      *

@@ -321,7 +321,7 @@ def saddle_point_model(fom, parameters=None, coefficients=None, directory="outpu
             A,
             B,
             _velocity_rhs(velocity, fom, components, coefficients),
-            g=_pressure_rhs(pressure, fom),
+            g=pressure_rhs_operator(pressure, fom),
             visualizer=ExaDGSaddlePointVisualizer(directory=directory),
             solver=ExaDGCoupledSolver(fom),
             **products,
@@ -369,8 +369,14 @@ def _velocity_rhs(space, fom, components, coefficients):
     return LincombOperator(operators, functionals)
 
 
-def _pressure_rhs(space, fom):
-    """g, or None when it is zero -- pyMOR then builds the zero vector itself."""
+def pressure_rhs_operator(space, fom):
+    """g, the continuity equation's right-hand side, or None when it is zero.
+
+    Zero exactly when the Dirichlet data is homogeneous. A weakly imposed inflow contributes a
+    boundary term to the divergence operator, so the discrete constraint is ``B u = g`` rather
+    than ``B u = 0``; the application's own solver assembles that term internally, which is why a
+    full-order model never had to be told and a projected one does.
+    """
     pressure_rhs = fom.pressure_rhs()
 
     if pressure_rhs is None or pressure_rhs.norm() == 0.0:

@@ -105,12 +105,6 @@ public:
     return {};
   }
 
-  std::shared_ptr<VectorType>
-  pressure_rhs() override
-  {
-    return nullptr;
-  }
-
   /*
    * Reynolds number, on the cylinder diameter and the mean inflow, as the benchmark defines it.
    *

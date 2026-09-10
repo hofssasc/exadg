@@ -65,6 +65,7 @@ from exadg.mor.models.saddle_point import (
     exadg_models_id,
     install_coefficients,
     local_coefficient_names,
+    pressure_rhs_operator,
 )
 from exadg.mor.models.stationary import parameter_names
 
@@ -506,7 +507,10 @@ def instationary_saddle_point_model(
             B=B,
             velocity_mass=mass,
             f=f,
-            g=None,
+            # Not None: a weakly imposed inflow puts a boundary term in the divergence operator,
+            # so the discrete constraint is B u = g. ExaDG's own solve assembles that internally,
+            # which is why only a projected model needs it written down.
+            g=pressure_rhs_operator(pressure, fom),
             initial_velocity=velocity.zeros(1) if initial_velocity is None else initial_velocity,
             T=T,
             time_stepper=BDFTimeStepper(
