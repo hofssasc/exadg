@@ -330,6 +330,13 @@ def _velocity_rhs(space, fom, components, coefficients):
         operators.insert(0, _as_operator(space, constant))
         functionals.insert(0, ConstantParameterFunctional(1.0))
 
+    # A model can legitimately have no right-hand side at all: a flow driven entirely through an
+    # inhomogeneous Dirichlet boundary has no body force, and on a discontinuous space the
+    # boundary data is already inside the residual rather than beside it. An empty LincombOperator
+    # is not a zero operator, so say zero explicitly.
+    if not operators:
+        return _as_operator(space, fom.velocity_space().zero_vector())
+
     return LincombOperator(operators, functionals)
 
 

@@ -469,12 +469,18 @@ def instationary_saddle_point_model(
             for c in components
         ]
 
-    f = LincombOperator(
-        [VectorOperator(velocity.make_array([velocity.make_vector(c.vector)]))
-         for c in components],
-        coefficients,
-        name="f",
-    )
+    # A model may have no body force at all -- a flow driven through an inhomogeneous Dirichlet
+    # boundary has none, and on a discontinuous space that boundary data is already inside the
+    # residual rather than beside it. An empty LincombOperator is not a zero operator.
+    if components:
+        f = LincombOperator(
+            [VectorOperator(velocity.make_array([velocity.make_vector(c.vector)]))
+             for c in components],
+            coefficients,
+            name="f",
+        )
+    else:
+        f = VectorOperator(velocity.zeros(1), name="f")
 
     return (
         InstationarySaddlePointModel(

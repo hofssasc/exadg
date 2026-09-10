@@ -149,8 +149,34 @@ public:
       prm.add_parameter("CylinderType", cylinder_type, "Type of cylinder.");
       prm.add_parameter(
         "CFL", cfl_number, "CFL number.", dealii::Patterns::Double(0.0, 1.0e6), true);
+      prm.add_parameter("Formulation",
+                        formulation,
+                        "Splitting reproduces the benchmark as published. Coupled solves the "
+                        "saddle point monolithically with an implicit convective term and no "
+                        "penalty terms, which is what a projection-based reduced model needs: a "
+                        "splitting scheme's substeps do not compose into one residual, and a "
+                        "penalty term evaluated on the current velocity makes the momentum block "
+                        "depend on the state outside the convective term. A different "
+                        "discretisation, not a different solver for the same one.",
+                        dealii::Patterns::Selection("Splitting|Coupled"));
+      prm.add_parameter("MaxInflow",
+                        Um,
+                        "Peak of the parabolic inflow. Defaults to the benchmark value for the "
+                        "test case; set it to run the steady inflow of test case 1 at the "
+                        "Reynolds number of test case 2, which sheds without the inflow itself "
+                        "depending on time.");
+      prm.add_parameter("Viscosity", viscosity, "Kinematic viscosity; with Um and the cylinder "
+                                                "diameter this is what sets the Reynolds number.");
     }
     prm.leave_subsection();
+  }
+
+
+  /** Peak of the parabolic inflow; the mean is 2/3 of it in 2D, 4/9 in 3D. */
+  double
+  get_max_inflow() const
+  {
+    return Um;
   }
 
 private:
@@ -326,6 +352,35 @@ private:
     this->param.preconditioner_pressure_block =
       SchurComplementPreconditioner::PressureConvectionDiffusion;
     this->param.multigrid_data_pressure_block.type = MultigridType::cphMG;
+
+    // Last, so that it overrides the temporal settings above rather than being overridden by
+    // them. Everything the coupled solver itself needs is already configured just above -- the
+    // application carries that configuration whether or not it selects it.
+    if(is_coupled())
+    {
+      // A splitting scheme is a time-integration algorithm whose substeps do not compose into one
+      // residual; only the coupled formulation is a single saddle-point operator.
+      this->param.temporal_discretization = TemporalDiscretization::BDFCoupledSolution;
+
+      // An explicit convective term lags the nonlinearity into the right-hand side, where nothing
+      // projects it. Implicit makes the (1,1) block depend on the current velocity, which is the
+      // Jacobian a reduced Newton iteration has to be handed.
+      this->param.treatment_of_convective_term = TreatmentOfConvectiveTerm::Implicit;
+
+      // Both would make the momentum block depend on the velocity outside the convective term --
+      // a second state-dependent term, and one the reduced model has no way to hyper-reduce
+      // alongside the first. Dropping them changes the discretisation and costs robustness in
+      // convection-dominated flow; it is the price of projectability as the interface stands.
+      this->param.use_divergence_penalty = false;
+      this->param.use_continuity_penalty = false;
+    }
+  }
+
+  /** Whether the saddle point is solved monolithically; see the Formulation parameter. */
+  bool
+  is_coupled() const
+  {
+    return formulation == "Coupled";
   }
 
 
@@ -530,10 +585,16 @@ private:
   // select test case according to Schaefer and Turek benchmark definition: 2D-1/2/3, 3D-1/2/3
   unsigned int test_case = 3; // 1, 2 or 3
 
-  ProblemType  problem_type = ProblemType::Unsteady;
-  double const Um = (dim == 2 ? (test_case == 1 ? 0.3 : 1.5) : (test_case == 1 ? 0.45 : 2.25));
+  ProblemType problem_type = ProblemType::Unsteady;
 
-  double const viscosity = 1.e-3;
+  // "Splitting" or "Coupled": whether the saddle point is solved monolithically
+  std::string formulation = "Splitting";
+
+  // Overridable, because the Reynolds number is the interesting parameter and these two are what
+  // set it. The defaults are the benchmark's.
+  double Um = (dim == 2 ? (test_case == 1 ? 0.3 : 1.5) : (test_case == 1 ? 0.45 : 2.25));
+
+  double viscosity = 1.e-3;
 
   double cfl_number = 1.0;
 

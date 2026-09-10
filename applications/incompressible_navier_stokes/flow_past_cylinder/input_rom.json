@@ -1,0 +1,21 @@
+{
+    "General": { "Precision": "double", "Dim": "2", "IsTest": "false" },
+    "SpatialResolution": {
+        "DegreeMin": "2", "DegreeMax": "2",
+        "RefineSpaceMin": "0", "RefineSpaceMax": "0"
+    },
+    "TemporalResolution": { "RefineTimeMin": "0", "RefineTimeMax": "0" },
+    "Application": {
+        "TestCase": "1",
+        "CylinderType": "Circular",
+        "Formulation": "Coupled",
+        "MaxInflow": "1.5",
+        "Viscosity": "1.e-3",
+        "CFL": "0.35"
+    },
+    "Output": {
+        "OutputDirectory": "output/flow_past_cylinder_rom/",
+        "OutputName": "cylinder_rom",
+        "WriteOutput": "false"
+    }
+}
