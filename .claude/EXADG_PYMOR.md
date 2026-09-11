@@ -173,8 +173,16 @@ as a factor. Measured on the cylinder, the momentum residual is affine in it to 
 | `ViscousKernel::data` | every operator evaluation | `SpatialOperatorBase::set_viscosity` |
 | one per multigrid level | inside the preconditioner | `MultigridPreconditioner::update()`, which now syncs it and re-initialises the smoothers |
 
-Not reached: the divergence and continuity penalty kernels cache it at setup, so setting the
-viscosity with those active asserts rather than quietly using the old value.
+**Two copies are not reached.** The divergence and continuity penalty kernels cache it at setup,
+so setting the viscosity with those active now asserts rather than quietly using the old value. The
+*pressure-block* preconditioner also caches it: `PressureConvectionDiffusion` copies
+`param.viscosity` into its diffusive kernel at setup, and `update_block_preconditioner()` refreshes
+the pressure block only under `ale_formulation` or `viscosity_is_variable()` — neither of which a
+constant-viscosity sweep sets. So the cylinder's Schur preconditioner stays built at the viscosity
+the model was constructed with. Preconditioner only, so a sweep converges to the right answer, but
+it degrades as the parameter moves away from that value and is part of why the sweep is less
+robust at large steps. Fixing it means either refreshing that block on a viscosity change or
+choosing a Schur preconditioner that reads the parameter at apply time, as Cahouet-Chabard does.
 
 Whether the viscosity *is* a parameter is the application's choice, not the binding's —
 `viscosity_is_parameter()` defaults to false, and only the cylinder overrides it. Declaring it
