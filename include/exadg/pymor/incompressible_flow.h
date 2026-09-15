@@ -689,16 +689,22 @@ public:
       // the vector this model would have assembled, which is what pressure_rhs() hands out and
       // therefore what a caller stepping this model passes back.
       {
+        // Compared at *this step's* time, because the Dirichlet data may have a schedule and the
+        // right vector at one time is the wrong one at another.
+        //
         // Compared on the locally owned data alone. A vector arriving from Python may carry ghost
         // entries and this one does not, and deal.II's arithmetic requires the two partitionings
         // to agree -- serially there are no ghosts and the distinction does not arise, which is
         // exactly how it hides.
+        auto const & expected = continuity_rhs(time);
+        double const scale    = std::max(1.0, expected.l2_norm());
+
         VectorType difference;
         pde_operator->initialize_vector_pressure(difference);
         difference.copy_locally_owned_data_from(g);
-        difference.add(-1.0, continuity_rhs());
+        difference.add(-1.0, expected);
 
-        if(difference.l2_norm() > 1.0e-10 * std::max(1.0, continuity_rhs().l2_norm()))
+        if(difference.l2_norm() > 1.0e-10 * scale)
           return false;
       }
 
@@ -874,7 +880,7 @@ public:
   std::shared_ptr<VectorType>
   pressure_rhs() override
   {
-    return std::make_shared<VectorType>(continuity_rhs());
+    return std::make_shared<VectorType>(continuity_rhs(application->get_parameters().start_time));
   }
 
   /*
@@ -1839,21 +1845,24 @@ protected:
   }
 
   /*
-   * The continuity equation's right-hand side, assembled once and kept.
+   * The continuity equation's right-hand side at one time, in the scratch vector it reuses.
    *
-   * It depends on the Dirichlet data alone, which is fixed here, and the solve path compares
-   * against it on every step -- so reassembling it would be a mesh loop per step for a vector
-   * that never changes.
+   * It depends on the Dirichlet data, which need not be fixed: an inflow with a schedule, or an
+   * amplitude installed as a coefficient, makes this a different vector from step to step. So it
+   * is reassembled rather than cached -- one loop over boundary faces, against a Newton solve --
+   * and only the allocation is kept.
+   *
+   * DivergenceOperator::rhs takes the evaluation time itself, so nothing here has to know what
+   * the schedule is; the application's boundary function is asked at the time it is given.
    */
   VectorType const &
-  continuity_rhs() const
+  continuity_rhs(double const time) const
   {
     if(continuity_rhs_vector.size() == 0)
-    {
       pde_operator->initialize_vector_pressure(continuity_rhs_vector);
-      pde_operator->get_divergence_operator().rhs(continuity_rhs_vector, 0.0);
-      continuity_rhs_vector *= -scaling_factor_continuity();
-    }
+
+    pde_operator->get_divergence_operator().rhs(continuity_rhs_vector, time);
+    continuity_rhs_vector *= -scaling_factor_continuity();
 
     return continuity_rhs_vector;
   }

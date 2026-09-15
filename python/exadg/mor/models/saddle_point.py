@@ -69,9 +69,21 @@ def install_coefficients(fom, mu):
     single place a change would pass through -- two models over one discretisation share the
     application, and the last one to solve is the one whose value is installed.
     """
+    if mu is None:
+        return
+
     for name in fom.coefficients():
-        if mu is not None and name in mu:
+        if name in mu:
             fom.set_coefficient(name, float(mu[name][0]))
+        elif name in mu.time_dependent_values:
+            # pyMOR hides time-dependent values from the mapping protocol until at_time() has
+            # been called, so `name in mu` is False for one and skipping it would quietly solve
+            # at whatever was installed last. The stepper passes mu.at_time(t); anything that
+            # does not has to be told.
+            raise ValueError(
+                f"the value of '{name}' is still a function of time; evaluate it with "
+                f"Mu.at_time(t) before solving, or the application is handed a stale coefficient"
+            )
 
 
 class ExaDGNonlinearMomentum(Operator):
@@ -376,13 +388,32 @@ def pressure_rhs_operator(space, fom):
     boundary term to the divergence operator, so the discrete constraint is ``B u = g`` rather
     than ``B u = 0``; the application's own solver assembles that term internally, which is why a
     full-order model never had to be told and a projected one does.
-    """
-    pressure_rhs = fom.pressure_rhs()
 
-    if pressure_rhs is None or pressure_rhs.norm() == 0.0:
+    Where the inflow carries a coefficient -- an amplitude with a schedule -- g is *exactly*
+    linear in it, so it comes back as components with that coefficient in front rather than as one
+    assembled vector. The momentum equation's constant is not linear in the same scalar, because
+    the convective flux carries it quadratically; that is why only this one can be written down
+    this way.
+    """
+    components = fom.pressure_rhs_components()
+    constant = fom.pressure_rhs()
+
+    operators, functionals = [], []
+    if constant is not None and constant.norm() != 0.0:
+        operators.append(_as_operator(space, constant))
+        functionals.append(ConstantParameterFunctional(1.0))
+
+    for component in components:
+        operators.append(_as_operator(space, component.vector))
+        functionals.append(ProjectionParameterFunctional(component.coefficient))
+
+    if not operators:
         return None
 
-    return _as_operator(space, pressure_rhs)
+    if len(operators) == 1 and isinstance(functionals[0], ConstantParameterFunctional):
+        return operators[0]
+
+    return LincombOperator(operators, functionals, name="g")
 
 
 def _local_coupled_solve(model, f, g, coefficients):

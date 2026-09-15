@@ -23,6 +23,9 @@
 #define APPLICATIONS_INCOMPRESSIBLE_NAVIER_STOKES_TEST_CASES_FLOW_PAST_CYLINDER_H_
 
 // ExaDG
+#include <cmath>
+#include <limits>
+
 #include <exadg/functions_and_boundary_conditions/linear_interpolation.h>
 
 // flow past cylinder application
@@ -45,7 +48,8 @@ public:
            bool const                                          use_random_perturbations,
            std::vector<double> const &                         y,
            std::vector<double> const &                         z,
-           std::vector<dealii::Tensor<1, dim, double>> const & u)
+           std::vector<dealii::Tensor<1, dim, double>> const & u,
+           double const &                                      amplitude)
     : dealii::Function<dim>(dim, 0.0),
       Um(Um),
       H(H),
@@ -54,8 +58,36 @@ public:
       use_random_perturbations(use_random_perturbations),
       y_vector(y),
       z_vector(z),
-      u_vector(u)
+      u_vector(u),
+      amplitude(amplitude)
   {
+  }
+
+  /*
+   * How much of the inflow profile is applied, in [0, 1].
+   *
+   * Normally the test case's own function of time, which is what ExaDG's time integrator drives
+   * through set_time(). A caller that owns the time loop itself can override it instead -- see
+   * Application::set_inflow_amplitude -- and then the schedule lives outside this class. Both go
+   * through here, so the momentum equation, the viscous lift and the divergence operator all see
+   * the same value.
+   */
+  double
+  scheduled_amplitude(double const t) const
+  {
+    double const pi = dealii::numbers::PI;
+    double const T  = 1.0;
+
+    if(test_case == 1)
+      return 1.0;
+    else if(test_case == 2)
+      return (t / T) < 1.0 ? std::sin(pi / 2. * t / T) : 1.0;
+    else if(test_case == 3)
+      return std::sin(pi * t / end_time);
+
+    AssertThrow(false, dealii::ExcMessage("Not implemented."));
+
+    return 0.0;
   }
 
   double
@@ -66,20 +98,15 @@ public:
 
     if(component == 0)
     {
-      double const pi          = dealii::numbers::PI;
-      double const T           = 1.0;
-      double       coefficient = dealii::Utilities::fixed_power<dim - 1>(4.) * Um /
+      double coefficient = dealii::Utilities::fixed_power<dim - 1>(4.) * Um /
                            dealii::Utilities::fixed_power<2 * dim - 2>(H);
 
-      if(test_case == 1)
-        result = coefficient * x[1] * (H - x[1]);
-      else if(test_case == 2)
-        result =
-          coefficient * x[1] * (H - x[1]) * ((t / T) < 1.0 ? std::sin(pi / 2. * t / T) : 1.0);
-      else if(test_case == 3)
-        result = coefficient * x[1] * (H - x[1]) * std::sin(pi * t / end_time);
-      else
-        AssertThrow(false, dealii::ExcMessage("Not implemented."));
+      // The spatial profile is fixed and the whole time dependence is one scalar in front of it.
+      // That separability is what lets a reduced model carry the schedule as a coefficient
+      // instead of reprojecting whenever the inflow changes.
+      double const scale = std::isnan(amplitude) ? scheduled_amplitude(t) : amplitude;
+
+      result = coefficient * x[1] * (H - x[1]) * scale;
 
       if(dim == 3)
         result *= x[2] * (H - x[2]);
@@ -113,6 +140,9 @@ public:
 private:
   double const       Um, H, end_time;
   unsigned int const test_case;
+
+  /// NaN means "use scheduled_amplitude(t)"; anything else overrides it.
+  double const & amplitude;
 
   // perturbations
   bool const                                  use_random_perturbations;
@@ -167,6 +197,14 @@ public:
                         "depending on time.");
       prm.add_parameter("Viscosity", viscosity, "Kinematic viscosity; with Um and the cylinder "
                                                 "diameter this is what sets the Reynolds number.");
+      prm.add_parameter("InflowIsParameter",
+                        inflow_is_a_parameter,
+                        "Whether the fraction of the inflow profile that is applied is a "
+                        "parameter of the study rather than this test case's own function of "
+                        "time. A caller owning the time loop needs it to be, because it has to "
+                        "evaluate the operator at an amplitude of its choosing and not at "
+                        "whatever the clock says. Leave it false and the schedule is the "
+                        "benchmark's, which is what ExaDG's own time integrator drives.");
     }
     prm.leave_subsection();
   }
@@ -177,6 +215,44 @@ public:
   get_max_inflow() const
   {
     return Um;
+  }
+
+  /*
+   * Override the fraction of the inflow profile that is applied, or NaN to hand the schedule back
+   * to the test case's own function of time.
+   *
+   * For a caller that owns the time loop -- a reduced-order model's, say -- the schedule is a
+   * parameter rather than a property of the application, and it has to be able to evaluate the
+   * operator at an amplitude of its choosing rather than at whatever the clock says. ExaDG's own
+   * time integrator never touches this and keeps the benchmark's schedule.
+   */
+  void
+  set_inflow_amplitude(double const amplitude)
+  {
+    inflow_amplitude = amplitude;
+  }
+
+  /** The override as it stands, NaN when the test case's own schedule is in charge. */
+  double
+  get_inflow_amplitude() const
+  {
+    return inflow_amplitude;
+  }
+
+  /** Whether the inflow amplitude is a parameter of this study rather than a fixed schedule. */
+  bool
+  inflow_is_parameter() const
+  {
+    return inflow_is_a_parameter;
+  }
+
+  /** The schedule this test case would follow on its own, for a caller reproducing it. */
+  double
+  scheduled_inflow_amplitude(double const t) const
+  {
+    return InflowBC<dim>(Um, H, end_time, test_case, false, y_values, z_values, velocity_values,
+                         inflow_amplitude)
+      .scheduled_amplitude(t);
   }
 
 private:
@@ -447,7 +523,15 @@ private:
     this->boundary_descriptor->velocity->dirichlet_bc.insert(
       pair(0,
            new InflowBC<dim>(
-             Um, H, end_time, test_case, use_perturbation, y_values, z_values, velocity_values)));
+             Um,
+             H,
+             end_time,
+             test_case,
+             use_perturbation,
+             y_values,
+             z_values,
+             velocity_values,
+             inflow_amplitude)));
     this->boundary_descriptor->velocity->dirichlet_bc.insert(
       pair(2, new dealii::Functions::ZeroFunction<dim>(dim)));
     this->boundary_descriptor->velocity->neumann_bc.insert(
@@ -608,6 +692,11 @@ private:
   double Um = (dim == 2 ? (test_case == 1 ? 0.3 : 1.5) : (test_case == 1 ? 0.45 : 2.25));
 
   double viscosity = 1.e-3;
+
+  /// NaN: the inflow follows the test case's schedule. See set_inflow_amplitude().
+  double inflow_amplitude = std::numeric_limits<double>::quiet_NaN();
+
+  bool inflow_is_a_parameter = false;
 
   double cfl_number = 1.0;
 

@@ -477,6 +477,17 @@ struct AffineVector
 
   unsigned int slot  = 0;
   unsigned int index = 0;
+
+  /**
+   * Name of the operator coefficient this component scales with, or empty when it belongs to a
+   * parameter group instead and slot/index name one of its entries.
+   *
+   * A right-hand side is usually parameterised by amplitudes of its own. An inhomogeneous
+   * boundary condition is different: it puts the *same* scalar into the operator and into the
+   * right-hand side, and the two then have to move together. Naming the coefficient here is what
+   * keeps one value in front of both, rather than a parameter that happens to be set twice.
+   */
+  std::string coefficient;
 };
 
 /**
@@ -719,11 +730,26 @@ public:
     return {};
   }
 
-  /// The pressure right-hand side g, or nullptr for zero.
+  /// The parameter-independent part of the pressure right-hand side g, or nullptr for zero.
   virtual std::shared_ptr<VectorType>
   pressure_rhs()
   {
     return nullptr;
+  }
+
+  /**
+   * Affine components of g.
+   *
+   * The counterpart of velocity_rhs_components(), and needed for the same reason once the
+   * Dirichlet data is not fixed: the continuity equation's right-hand side is the boundary term
+   * of the divergence operator, so it carries whatever scales that data. It is *exactly* linear
+   * in such a scalar, which the momentum equation's constant is not -- there the same data also
+   * enters the convective flux quadratically.
+   */
+  virtual std::vector<AffineVector<VectorType>>
+  pressure_rhs_components()
+  {
+    return {};
   }
 
   /**

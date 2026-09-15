@@ -35,9 +35,17 @@
  * freedom is constrained; the inflow enters the residual as a boundary flux whose
  * state-independent part is exactly the constant term the reduced operator already carries.
  *
- * That holds only while the inflow does not depend on time. Test cases 2 and 3 ramp and oscillate
- * it, which would make that constant a function of t; test case 1's inflow is steady, and at the
- * Reynolds number of test case 2 it still sheds.
+ * Test cases 2 and 3 ramp and oscillate the inflow, which makes that constant a function of time.
+ * What keeps it tractable is that the schedule is *separable*: one scalar in front of a fixed
+ * spatial profile. Set InflowIsParameter and the scalar becomes a coefficient like the viscosity,
+ * so the schedule lives in the caller's parameter rather than in this application's clock -- which
+ * is what a reduced model needs, since it has to evaluate the operator at an amplitude of its
+ * choosing and not at whatever the clock says.
+ *
+ * The two right-hand sides then behave differently, and the difference is not cosmetic. The
+ * continuity equation's is *exactly* linear in that scalar, so it is declared as an affine
+ * component. The momentum equation's is not: the same boundary data enters the convective flux
+ * quadratically, so its constant carries the amplitude squared.
  *
  * **The flow has dynamics of its own.** Above a Reynolds number of about 47 a cylinder wake is
  * unsteady whatever the inflow does, so this is the first case here whose reduced model has to
@@ -69,7 +77,19 @@ class CylinderFOM : public IncNSSaddlePoint<dim, Application<dim, Number>>
 {
 public:
   using Base = IncNSSaddlePoint<dim, Application<dim, Number>>;
-  using Base::Base;
+
+  CylinderFOM(std::string const & input_file,
+              unsigned int const  degree,
+              unsigned int const  refinements,
+              bool const          verbose)
+    : Base(input_file, degree, refinements, verbose)
+  {
+    // An amplitude that is a parameter starts at the top of the profile rather than at whatever
+    // the schedule says, so that a caller which never sets it gets the steady inflow and not a
+    // NaN. The schedule is still reachable through scheduled_inflow_amplitude().
+    if(this->application->inflow_is_parameter())
+      this->application->set_inflow_amplitude(1.0);
+  }
 
   /**
    * No parameters yet.
@@ -120,6 +140,90 @@ public:
     return true;
   }
 
+  /*
+   * The inflow amplitude joins the viscosity as a coefficient, when the application says it is a
+   * parameter rather than a schedule.
+   *
+   * It is one scalar in front of a fixed spatial profile, and that separability is what makes it
+   * usable: the operator is a polynomial in it -- degree one in the viscous lift and the linear
+   * part of the convective flux, degree two in that flux's constant -- and the continuity
+   * equation's right-hand side is exactly linear in it.
+   */
+  std::vector<std::string>
+  coefficients() const override
+  {
+    auto names = Base::coefficients();
+
+    if(this->application->inflow_is_parameter())
+      names.push_back("inflow");
+
+    return names;
+  }
+
+  double
+  get_coefficient(std::string const & name) const override
+  {
+    if(name == "inflow")
+      return this->application->get_inflow_amplitude();
+
+    return Base::get_coefficient(name);
+  }
+
+  void
+  set_coefficient(std::string const & name, double const value) override
+  {
+    if(name == "inflow")
+    {
+      this->application->set_inflow_amplitude(value);
+      return;
+    }
+
+    Base::set_coefficient(name, value);
+  }
+
+  /*
+   * g, split so that the amplitude sits in front of it rather than inside it.
+   *
+   * With a fixed inflow the whole of g is a constant and the base class hands it over as one.
+   * With the amplitude as a parameter none of it is: g is exactly linear in that scalar, so the
+   * component is g at an amplitude of one and the coefficient carries the rest. Returning both
+   * would count the inflow twice.
+   */
+  std::shared_ptr<VectorType>
+  pressure_rhs() override
+  {
+    if(this->application->inflow_is_parameter())
+      return nullptr;
+
+    return Base::pressure_rhs();
+  }
+
+  std::vector<PyMOR::AffineVector<VectorType>>
+  pressure_rhs_components() override
+  {
+    if(not this->application->inflow_is_parameter())
+      return {};
+
+    double const restore = this->application->get_inflow_amplitude();
+    this->application->set_inflow_amplitude(1.0);
+
+    PyMOR::AffineVector<VectorType> component;
+    component.vector = std::make_shared<VectorType>(
+      this->continuity_rhs(this->application->get_parameters().start_time));
+    component.coefficient = "inflow";
+
+    this->application->set_inflow_amplitude(restore);
+
+    return {component};
+  }
+
+  /** The schedule this test case would follow on its own, for a caller reproducing it. */
+  double
+  scheduled_inflow_amplitude(double const time) const
+  {
+    return this->application->scheduled_inflow_amplitude(time);
+  }
+
   double
   reynolds_number() const
   {
@@ -162,6 +266,11 @@ register_model(py::module_ & module, std::string const & name)
                   &CylinderFOM<dim>::reynolds_number,
                   &CylinderFOM<dim>::set_reynolds_number)
     .def_property("viscosity", &CylinderFOM<dim>::get_viscosity, &CylinderFOM<dim>::set_viscosity)
+    .def("scheduled_inflow_amplitude",
+         &CylinderFOM<dim>::scheduled_inflow_amplitude,
+         py::arg("time"),
+         "The fraction of the inflow profile this test case applies at that time, for a caller "
+         "reproducing its schedule as a parameter.")
     .def_property_readonly("upwind_factor", &CylinderFOM<dim>::get_upwind_factor)
     .def_property_readonly("n_faces", &CylinderFOM<dim>::n_faces)
     .def("time_step_for_cfl",

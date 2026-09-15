@@ -277,7 +277,11 @@ register_vector_type(py::module_ & module, std::string const & prefix)
   py::class_<AffineVector<V>>(module, (prefix + "AffineVector").c_str())
     .def_readonly("vector", &AffineVector<V>::vector)
     .def_readonly("slot", &AffineVector<V>::slot)
-    .def_readonly("index", &AffineVector<V>::index);
+    .def_readonly("index", &AffineVector<V>::index)
+    .def_readonly("coefficient",
+                  &AffineVector<V>::coefficient,
+                  "Operator coefficient this component scales with, or empty when slot and index "
+                  "name a parameter group entry instead.");
 
   py::class_<Space<V>, std::shared_ptr<Space<V>>>(module, (prefix + "Space").c_str())
     .def_property_readonly("n_dofs", &Space<V>::n_dofs)
@@ -354,6 +358,7 @@ register_vector_type(py::module_ & module, std::string const & prefix)
          py::arg("value"),
          "Install a coefficient before evaluating or solving. The application's own solver reads "
          "it from objects the Python layer does not own, so it has to be set rather than passed.")
+    .def("pressure_rhs_components", &SaddlePointModel<V>::pressure_rhs_components)
     .def("velocity_rhs", &SaddlePointModel<V>::velocity_rhs)
     .def("velocity_rhs_components", &SaddlePointModel<V>::velocity_rhs_components)
     .def("pressure_rhs", &SaddlePointModel<V>::pressure_rhs)
