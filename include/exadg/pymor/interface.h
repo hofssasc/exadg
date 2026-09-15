@@ -253,6 +253,22 @@ public:
   /// V^T (sum_e w_e R'_e(V a)) V, row-major (r, r).
   virtual std::vector<double>
   jacobian(std::vector<double> const & coefficients) const = 0;
+
+  /**
+   * Scale the inhomogeneous boundary data this operator holds, relative to how it was compiled.
+   *
+   * A sampled term that touches a Dirichlet boundary carries the prescribed data with it -- in a
+   * Lax-Friedrichs flux it is inside the lambda, which is a maximum of absolute values and so not
+   * a polynomial in anything. There is nothing to decompose, and the only way a detached operator
+   * can follow a schedule is to be told where on it the caller is. Compiled at an amplitude of
+   * one, so this is the amplitude itself and not a ratio.
+   *
+   * Defaults to doing nothing, which is right for fixed or homogeneous data.
+   */
+  virtual void
+  set_boundary_amplitude(double const /*amplitude*/)
+  {
+  }
 };
 
 /**
@@ -307,6 +323,21 @@ public:
    */
   virtual std::vector<double>
   contributions(std::vector<double> const & coefficients) = 0;
+
+  /**
+   * Where on the boundary data's schedule the next contributions() is taken.
+   *
+   * The counterpart of CompiledOperator::set_boundary_amplitude, and needed for the same reason:
+   * a term reaching a Dirichlet boundary carries the prescribed data, and the weights are fitted
+   * to reproduce *that* term. Training every state at one amplitude while the states came from a
+   * schedule fits the wrong operator -- quietly, because the fit still converges.
+   *
+   * Defaults to doing nothing, which is right for fixed or homogeneous data.
+   */
+  virtual void
+  set_boundary_amplitude(double const /*amplitude*/)
+  {
+  }
 
   /**
    * Draw the entities the installed weights select, as a VTU/PVTU record, and return its path.
@@ -677,6 +708,40 @@ public:
   set_coefficient(std::string const & name, double const /*value*/)
   {
     AssertThrow(false, dealii::ExcMessage("There is no coefficient named '" + name + "'."));
+  }
+
+  /**
+   * The degree of the polynomial the operator is in this coefficient.
+   *
+   * One is the usual answer and the default: a coefficient that multiplies one term of the
+   * operator once, as a viscosity multiplies every viscous flux. Two is what a Dirichlet
+   * amplitude needs, and for a reason worth stating rather than discovering -- the convective
+   * flux is quadratic in the velocity, and prescribed boundary data *is* part of that velocity,
+   * so the same scalar appears in the flux's linear part and again, squared, in its constant.
+   *
+   * A reduced model probes at ``degree + 1`` values of each coefficient and interpolates. Declare
+   * too low and the fit is silently wrong away from the nodes; too high costs probes and is
+   * harmless, since the surplus monomials come out zero.
+   */
+  virtual unsigned int
+  coefficient_degree(std::string const & /*name*/) const
+  {
+    return 1;
+  }
+
+  /**
+   * The coefficient the inhomogeneous Dirichlet data scales with, or empty when it is fixed.
+   *
+   * Everything else a coefficient touches can be decomposed and projected once. This one cannot
+   * be, entirely: a Lax-Friedrichs lambda is a maximum of absolute values of a velocity that
+   * includes the boundary data, so a sampled operator holding that term has to be handed the
+   * number itself. Naming it here is how a reduced model knows which of its coefficients to pass
+   * on -- see CompiledOperator::set_boundary_amplitude.
+   */
+  virtual std::string
+  boundary_amplitude_coefficient() const
+  {
+    return {};
   }
 
   /// A, the (1,1) block at this step's mass scaling: velocity in, velocity out.

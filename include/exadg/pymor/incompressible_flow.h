@@ -911,6 +911,26 @@ public:
   }
 
   /*
+   * The scalar the inhomogeneous Dirichlet data scales with, and a way to set it.
+   *
+   * Defaults to a fixed one, which is right for homogeneous data or a schedule the application
+   * keeps to itself. An application whose boundary data is one amplitude in front of a fixed
+   * profile overrides both, and then anything that has to *normalise* the data -- compiling a
+   * sampled operator at a known amplitude, say -- can do so without knowing which parameter it
+   * is or what the profile looks like.
+   */
+  virtual double
+  boundary_amplitude() const
+  {
+    return 1.0;
+  }
+
+  virtual void
+  set_boundary_amplitude(double const /*amplitude*/)
+  {
+  }
+
+  /*
    * Whether the viscosity is a parameter of this study or a constant of it.
    *
    * The operator is affine in the viscosity either way -- that is a property of the
@@ -1154,6 +1174,12 @@ public:
   class CompiledStabilisation : public PyMOR::CompiledOperator
   {
   public:
+    void
+    set_boundary_amplitude(double const value) override
+    {
+      amplitude = value;
+    }
+
     std::size_t
     n_selected() const override
     {
@@ -1230,7 +1256,7 @@ public:
               std::vector<double> const & coefficients) const
     {
       auto const u_m = state(coefficients, trace_m, k, q);
-      auto const u_p = state(coefficients, trace_p, k, q) + lift[k * n_points + q];
+      auto const u_p = state(coefficients, trace_p, k, q) + amplitude * lift[k * n_points + q];
       auto const n   = normal[k * n_points + q];
 
       return Operators::ConvectiveKernel<dim, Number>::lambda_of(upwind_factor, u_m * n, u_p * n);
@@ -1241,7 +1267,7 @@ public:
             std::vector<double> const & coefficients) const
     {
       auto const u_m = state(coefficients, trace_m, k, q);
-      auto const u_p = state(coefficients, trace_p, k, q) + lift[k * n_points + q];
+      auto const u_p = state(coefficients, trace_p, k, q) + amplitude * lift[k * n_points + q];
 
       return (0.5 * lambda_at(k, q, coefficients)) * (u_m - u_p);
     }
@@ -1269,6 +1295,7 @@ public:
 
     MPI_Comm     mpi_comm       = MPI_COMM_SELF;
     double       upwind_factor  = 0.0;
+    double       amplitude      = 1.0;
     unsigned int n_modes        = 0;
     unsigned int n_points       = 0;
 
@@ -1338,6 +1365,12 @@ public:
       data.reset();
     }
 
+    void
+    set_boundary_amplitude(double const amplitude) override
+    {
+      fom->set_boundary_amplitude(amplitude);
+    }
+
     /// The training data, over every face. Offline: it reconstructs V a and touches the mesh.
     std::vector<double>
     contributions(std::vector<double> const & coefficients) override
@@ -1390,6 +1423,13 @@ public:
       c.trace_m.assign(selected.size() * n_modes * n_q, FaceVector());
       c.trace_p.assign(selected.size() * n_modes * n_q, FaceVector());
       c.test.assign(selected.size() * n_modes * n_q, FaceVector());
+
+      // Assembled at an amplitude of one, so that the stored lift is the profile and the
+      // schedule stays outside: a detached operator is then told where on the schedule it is
+      // rather than carrying one moment of it. Restored afterwards, because the caller's value
+      // is none of this function's business.
+      double const restore_amplitude = fom->boundary_amplitude();
+      fom->set_boundary_amplitude(1.0);
 
       for(std::size_t k = 0; k < selected.size(); ++k)
       {
@@ -1444,6 +1484,9 @@ public:
           }
         }
       }
+
+      fom->set_boundary_amplitude(restore_amplitude);
+      c.amplitude = restore_amplitude;
     }
 
     VectorType const &

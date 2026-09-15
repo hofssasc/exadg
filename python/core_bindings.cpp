@@ -248,6 +248,10 @@ register_vector_type(py::module_ & module, std::string const & prefix)
     .def_property_readonly("n_entities", &SampledOperator<V>::n_entities)
     .def("set_weights", &SampledOperator<V>::set_weights, py::arg("weights"))
     .def("contributions", &SampledOperator<V>::contributions, py::arg("coefficients"))
+    .def("set_boundary_amplitude",
+         &SampledOperator<V>::set_boundary_amplitude,
+         py::arg("amplitude"),
+         "Where on the boundary data's schedule the next contributions() is taken.")
     .def("compiled", &SampledOperator<V>::compiled)
     .def("write_selection",
          &SampledOperator<V>::write_selection,
@@ -352,6 +356,14 @@ register_vector_type(py::module_ & module, std::string const & prefix)
          "Names of the operator coefficients this model lets a caller set. The operator is "
          "affine in each of them.")
     .def("get_coefficient", &SaddlePointModel<V>::get_coefficient, py::arg("name"))
+    .def("coefficient_degree",
+         &SaddlePointModel<V>::coefficient_degree,
+         py::arg("name"),
+         "Degree of the polynomial the operator is in that coefficient. A reduced model probes "
+         "at degree + 1 values and interpolates.")
+    .def("boundary_amplitude_coefficient",
+         &SaddlePointModel<V>::boundary_amplitude_coefficient,
+         "Coefficient the inhomogeneous Dirichlet data scales with, or empty when it is fixed.")
     .def("set_coefficient",
          &SaddlePointModel<V>::set_coefficient,
          py::arg("name"),
@@ -421,7 +433,12 @@ PYBIND11_MODULE(_core, module)
   py::class_<CompiledOperator, std::shared_ptr<CompiledOperator>>(module, "CompiledOperator")
     .def_property_readonly("n_selected", &CompiledOperator::n_selected)
     .def("projected", &CompiledOperator::projected, py::arg("coefficients"))
-    .def("jacobian", &CompiledOperator::jacobian, py::arg("coefficients"));
+    .def("jacobian", &CompiledOperator::jacobian, py::arg("coefficients"))
+    .def("set_boundary_amplitude",
+         &CompiledOperator::set_boundary_amplitude,
+         py::arg("amplitude"),
+         "Where on the boundary data's schedule this operator is being evaluated. Compiled at "
+         "one, so this is the amplitude and not a ratio.");
 
   register_vector_type<VectorType>(module, "");
 }

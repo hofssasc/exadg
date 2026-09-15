@@ -160,6 +160,52 @@ public:
     return names;
   }
 
+  /*
+   * The inflow amplitude is what the Dirichlet data scales with, so the sampled stabilisation can
+   * be compiled at a known one and told the rest later. Its lambda is a maximum of absolute
+   * values, so there is nothing to decompose there and the schedule has to arrive as a number.
+   */
+  /*
+   * The inflow amplitude enters twice over, so a reduced model has to fit a parabola in it.
+   *
+   * Once through the convective flux's linear part -- the prescribed value multiplies the
+   * interior velocity there -- and once through its constant, where it multiplies itself. The
+   * viscosity keeps the default degree of one.
+   */
+  unsigned int
+  coefficient_degree(std::string const & name) const override
+  {
+    if(name == "inflow")
+      return 2;
+
+    return Base::coefficient_degree(name);
+  }
+
+  std::string
+  boundary_amplitude_coefficient() const override
+  {
+    if(not this->application->inflow_is_parameter())
+      return {};
+
+    return "inflow";
+  }
+
+  double
+  boundary_amplitude() const override
+  {
+    if(not this->application->inflow_is_parameter())
+      return 1.0;
+
+    return this->application->get_inflow_amplitude();
+  }
+
+  void
+  set_boundary_amplitude(double const amplitude) override
+  {
+    if(this->application->inflow_is_parameter())
+      this->application->set_inflow_amplitude(amplitude);
+  }
+
   double
   get_coefficient(std::string const & name) const override
   {
