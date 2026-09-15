@@ -453,16 +453,23 @@ class MPIExaDGCoupledSolver(Solver):
         return solution, {}
 
 
-def _local_write_block(model, position, array_ids, directory, basename, names, level=0):
+def _local_write_block(model, position, array_ids, indices, directory, basename, names, level=0):
     """Write one block's fields at one time level, on every rank. The pvtu record is collective.
 
     The ids are resolved here rather than by mpi.function_call, which only maps arguments that
     are themselves ObjectIds and not lists of them.
+
+    ``indices`` are the arrays' view indices, and without them a view is written wrongly: a view
+    such as ``basis[k]`` shares its ``obj_id`` with the whole of ``basis``, so the id alone names
+    every mode and ``level`` then picks the first -- each mode came out as mode 0.
     """
     from pymor.tools import mpi
 
     space = model.operator.source.subspaces[position]
-    arrays = [mpi.get_object(array_id) for array_id in array_ids]
+    arrays = [
+        mpi.get_object(array_id) if index is None else mpi.get_object(array_id)[index]
+        for array_id, index in zip(array_ids, indices)
+    ]
 
     return space.impl.write_vtu(
         directory, basename, [array.vectors[level].impl for array in arrays], names
@@ -490,15 +497,14 @@ class MPIExaDGSaddlePointVisualizer:
             U, title, legend, filename, self.directory
         )
         moments = level_times(levels, times)
-        ids = {
-            position: [array.blocks[position].impl.obj_id for array in arrays]
-            for position in (0, 1)
-        }
+        blocks = {position: [array.blocks[position] for array in arrays] for position in (0, 1)}
+        ids = {position: [block.impl.obj_id for block in blocks[position]] for position in (0, 1)}
+        indices = {position: [block.ind for block in blocks[position]] for position in (0, 1)}
 
         def record(position, basename, level):
             return mpi.call(
                 mpi.function_call, _local_write_block, self.models_id, position, ids[position],
-                str(base.parent), basename, names, level,
+                indices[position], str(base.parent), basename, names, level,
             )
 
         written = []

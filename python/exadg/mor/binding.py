@@ -550,6 +550,42 @@ def level_times(count, times):
     return times
 
 
+def output_levels(times, interval=None):
+    """The levels to write: one per ``interval`` of time rather than one per step.
+
+    A level is written when it is the first to reach the next output time -- ExaDG's own rule for
+    ``TimeControlData::trigger_interval``, epsilon included -- so the records land on the levels a
+    full-order run's postprocessor would pick, and their spacing does not follow the step, which
+    the CFL criterion changes with the mesh. One departure: the next output time is taken past the
+    level just written, so a step longer than the interval writes every level instead of falling
+    behind the clock.
+
+    Select before reconstructing. ``U[levels]`` is a view and costs nothing; a reconstructed
+    trajectory is as large as a full-order one.
+
+    Args:
+        times: One time per stored level, increasing.
+        interval: Time between records. ``None`` keeps every level.
+
+    Returns:
+        list[int]: Indices into ``times``, starting with the first level.
+    """
+    times = list(times)
+    if interval is None:
+        return list(range(len(times)))
+    if interval <= 0.0:
+        raise ValueError(f"the output interval must be positive, got {interval}")
+
+    start, epsilon = times[0], 1.0e-10
+    levels, next_output = [], start
+    for level, time in enumerate(times):
+        if time > next_output - epsilon:
+            levels.append(level)
+            next_output = start + ((time - start + epsilon) // interval + 1) * interval
+
+    return levels
+
+
 class ExaDGVisualizer(ImmutableObject):
     """Writes vector arrays as VTU/PVTU records, as pyMOR's ``visualizer`` hook.
 

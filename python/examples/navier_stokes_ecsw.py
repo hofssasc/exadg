@@ -53,12 +53,6 @@ full-order field at one parameter, and each tolerance's reduced field and error 
 parameter, so the errors are comparable. ``navier_stokes_ecsw_faces_<tol>`` is the selection
 itself: a surface mesh of the faces the fit kept, one cell per face, carrying ``ecsw_weight``.
 
-.. note::
-   Colour the modes by a **component**, not by magnitude. POD modes are orthogonal as vector
-   fields, but their magnitudes are strongly correlated and their norms nearly equal, so magnitude
-   -- ParaView's default for a vector array -- makes them all look like the same picture. The
-   difference is in the direction.
-
 Runs unchanged on any number of ranks::
 
     python python/examples/navier_stokes_ecsw.py
@@ -80,7 +74,7 @@ from exadg.mor.reductors import ECSWStokesReductor, TensorGalerkinStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes.json"
 DEGREE, REFINEMENTS = 2, 4
-N_TRAIN, N_TEST, N_MODES = 24, 4, 4
+N_TRAIN, N_TEST, N_MODES = 12, 4, 4
 AMPLITUDES = (0.5, 1.5)
 TOLERANCES = (1.0e-1, 1.0e-2, 1.0e-3)
 

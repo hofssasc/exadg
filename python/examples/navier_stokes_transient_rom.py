@@ -68,6 +68,7 @@ from pymor.parameters.base import Mu
 from pymor.tools import mpi
 
 from exadg.mor.basis import chunk_count, streaming_basis, trajectory_chunks
+from exadg.mor.binding import output_levels
 from exadg.mor.models.instationary_saddle_point import (
     BDFTimeStepper,
     mpi_instationary_saddle_point_model,
@@ -77,7 +78,7 @@ from exadg.mor.models.instationary_saddle_point import (
 from exadg.mor.reductors import InstationaryECSWStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/forced/input_navier_stokes_transient.json"
-DEGREE, REFINEMENTS = 2, 3
+DEGREE, REFINEMENTS = 2, 6
 T, ORDER = 4.0, 2
 
 #: Courant number the step count is derived from, on whatever mesh is used.
@@ -87,13 +88,17 @@ N_TRAIN, N_TEST = 6, 2
 AMPLITUDES = (0.5, 1.5)
 
 #: Relative l2-mean projection error the basis is built to, and HAPOD's balance parameter.
-BASIS_TOLERANCE, OMEGA = 3.0e-2, 0.9
+BASIS_TOLERANCE, OMEGA = 1.0e-3, 0.9
 
 #: Relative residual at which the ECSW fit stops, and the rows kept of its training matrix.
-TOLERANCE, SKETCH = 1.0e-2, 128
+TOLERANCE, SKETCH = 1.0e-1, 128
 
 #: Levels compressed at a time. One keeps the peak at the running basis plus a single vector.
 CHUNK = 1
+
+#: Time between the records --vtu writes, independent of the step the CFL number sets: a fine mesh
+#: takes thousands of steps and cannot afford a record for each. None writes every level.
+VTU_INTERVAL = 0.05
 
 OUTPUT = "output/pymor/navier_stokes_transient_rom"
 
@@ -209,16 +214,17 @@ def visualise(model, reductor, momentum, basis_u, basis_p, reference, reduced):
         fields, legend=[f"mode_{k}" for k in range(modes)], filename=f"{OUTPUT}_modes"
     ))
 
-    # Colour a velocity mode by a *component*. Modes are orthogonal as vector fields, but their
-    # magnitudes are correlated and their norms nearly equal, so ParaView's default for a vector
-    # array makes them all look like the same picture.
     written.append(momentum.write_selection(f"{OUTPUT}_faces"))
 
-    approximation = reductor.reconstruct(reduced)
+    # One record per VTU_INTERVAL, not per step. The levels are selected before reconstructing: a
+    # view of the reference costs nothing, a reconstructed trajectory is as large as the reference.
+    times = np.linspace(0.0, T, len(reference))
+    levels = output_levels(times, VTU_INTERVAL)
+    reference = reference[levels]
+    approximation = reductor.reconstruct(reduced[levels])
     written += list(model.visualize(
         (reference, approximation, reference - approximation),
-        legend=("fom", "rom", "error"), filename=OUTPUT,
-        times=np.linspace(0.0, T, len(reference)),
+        legend=("fom", "rom", "error"), filename=OUTPUT, times=times[levels],
     ))
 
     print("\nwrote " + "\n      ".join(written))

@@ -460,7 +460,13 @@ chosen before there is a solution.
 **Time series come out as a `.pvd`.** Both visualizers take a trajectory: one record per level plus
 a ParaView collection, `times=` optional. Written in Python -- `write_vtu_with_pvtu_record` appends a
 counter of its own, and a collection makes the record names irrelevant. `float()` the timestep or
-ParaView chokes on `np.float64(...)`.
+ParaView chokes on `np.float64(...)`. Write at a time interval, not per step:
+`binding.output_levels(times, interval)` picks the levels ExaDG's `TimeControl` would, and the
+transient examples take `U[levels]` *before* `reconstruct` (`VTU_INTERVAL`).
+
+**A view shares its `obj_id` with the whole array.** `basis[k]` sent to the ranks as `impl.obj_id`
+alone is all of `basis`. `MPIExaDGSaddlePointVisualizer` passes `ind` along; before it did, every
+POD mode was written as mode 0, bitwise.
 
 Status, order and the architecture for each are in
 `~/Documents/Dissertation/Literature/40-Reference/ExaDG ROM Next Steps.md`. **Read that first.**

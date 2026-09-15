@@ -78,6 +78,7 @@ from pymor.parameters.base import Mu
 from pymor.tools import mpi
 
 from exadg.mor.basis import chunk_count, streaming_basis, trajectory_chunks
+from exadg.mor.binding import output_levels
 from exadg.mor.models.instationary_saddle_point import (
     BDFTimeStepper,
     mpi_instationary_saddle_point_model,
@@ -88,8 +89,8 @@ from exadg.mor.models.saddle_point import exadg_model, exadg_models_id
 from exadg.mor.reductors import InstationaryECSWStokesReductor
 
 INPUT_FILE = "applications/incompressible_navier_stokes/flow_past_cylinder/input_rom.json"
-DEGREE, REFINEMENTS = 2, 0
-T, ORDER = 8.0, 2
+DEGREE, REFINEMENTS = 2, 1
+T, ORDER = 4.0, 2
 
 #: Courant number the step count is derived from, on whatever mesh is used.
 CFL = 8.0
@@ -100,13 +101,17 @@ TRAIN_REYNOLDS = (80.0, 110.0, 140.0, 170.0)
 TEST_REYNOLDS = (95.0, 155.0)
 
 #: Relative l2-mean projection error the basis is built to, and HAPOD's balance parameter.
-BASIS_TOLERANCE, OMEGA = 3.0e-3, 0.9
+BASIS_TOLERANCE, OMEGA = 3.0e-2, 0.9
 
 #: Relative residual at which the ECSW fit stops, and the rows kept of its training matrix.
-TOLERANCE, SKETCH = 1.0e-1, 128
+TOLERANCE, SKETCH = 1.0e-1, 0
 
 #: Levels compressed at a time. One keeps the peak at the running basis plus a single vector.
 CHUNK = 1
+
+#: Time between the records --vtu writes, independent of the step the CFL number sets: a fine mesh
+#: takes thousands of steps and cannot afford a record for each. None writes every level.
+VTU_INTERVAL = 0.02
 
 OUTPUT = "output/pymor/cylinder_transient_rom"
 
@@ -272,12 +277,7 @@ def trajectory_scales(model, mu, chunk):
 
 
 def visualise(model, reductor, momentum, basis_u, basis_p, reference, reduced):
-    """Everything worth opening in ParaView: the modes, the sampled faces, and the trajectories.
-
-    Colour a velocity mode by a *component*. Modes are orthogonal as vector fields, but their
-    magnitudes are correlated and their norms nearly equal, so ParaView's default for a vector
-    array makes them all look like the same picture.
-    """
+    """Everything worth opening in ParaView: the modes, the sampled faces, and the trajectories."""
     written = []
 
     modes = max(len(basis_u), len(basis_p))
@@ -294,11 +294,15 @@ def visualise(model, reductor, momentum, basis_u, basis_p, reference, reduced):
     ))
     written.append(momentum.write_selection(f"{OUTPUT}_faces"))
 
-    approximation = reductor.reconstruct(reduced)
+    # One record per VTU_INTERVAL, not per step. The levels are selected before reconstructing: a
+    # view of the reference costs nothing, a reconstructed trajectory is as large as the reference.
+    times = np.linspace(0.0, T, len(reference))
+    levels = output_levels(times, VTU_INTERVAL)
+    reference = reference[levels]
+    approximation = reductor.reconstruct(reduced[levels])
     written += list(model.visualize(
         (reference, approximation, reference - approximation),
-        legend=("fom", "rom", "error"), filename=OUTPUT,
-        times=np.linspace(0.0, T, len(reference)),
+        legend=("fom", "rom", "error"), filename=OUTPUT, times=times[levels],
     ))
 
     print("\nwrote " + "\n      ".join(written))
