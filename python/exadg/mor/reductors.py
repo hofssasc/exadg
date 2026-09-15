@@ -1083,7 +1083,7 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries, sketch_rows=No
         sketch_rows: If given, fit on ``S G`` rather than on ``G``, with ``S`` a Gaussian sketch
             of that many rows. The sketch is applied to each state's block **as it is assembled**,
             so ``G`` is never formed: memory falls from ``(n_train r) x n_faces`` to
-            ``sketch_rows x n_faces``. ``None`` fits on the matrix itself.
+            ``sketch_rows x n_faces``. ``None`` or ``0`` fits on the matrix itself.
         audit_rows: Rows of a *second, independent* sketch, used only to measure the residual.
             Never fitted against, which is the point -- see below.
         seed: Of the sketches. Fixed so that a fit is reproducible and identical across ranks.
@@ -1138,7 +1138,10 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries, sketch_rows=No
 
         return np.array(evaluator.contributions(state)).reshape(n_faces, n_modes).T
 
-    if sketch_rows is None:
+    # Zero rows and None both mean "do not sketch". A zero-row sketch is not a smaller fit, it is
+    # an empty one: the least-squares problem has no rows, every weight comes back zero, and the
+    # sampled term is silently dropped rather than approximated.
+    if not sketch_rows:
         local = np.vstack([contributions_at(i, state) for i, state in enumerate(states)])
         audit = None
     else:
@@ -1179,7 +1182,7 @@ def local_ecsw_weights(evaluator, states, tolerance, max_entries, sketch_rows=No
         witness, witness_target = audit, audit.sum(axis=1)
 
     kept = int((weights > 0.0).sum())
-    if sketch_rows is not None and 2 * kept > sketch_rows:
+    if sketch_rows and 2 * kept > sketch_rows:
         import warnings
 
         warnings.warn(

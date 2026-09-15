@@ -37,7 +37,18 @@ parameter of the operator has to go the other way, because the residual, the Jac
 solve all belong to the application. It is installed before each of them, and recovered for the
 reduced model by probing rather than by naming terms.
 
-An inflow is imposed weakly, and that changes two things every other example here could ignore.
+**The inflow is ramped, not switched on.** ``h(t)`` rises from zero over the first time unit, so
+the amplitude is a parameter of the model rather than a property of the application's clock -- the
+reduced model has to evaluate the operator at an amplitude of its choosing to recover the
+decomposition, and not at whatever the clock says. The momentum block is a *polynomial* in it:
+degree one where the prescribed value multiplies the interior velocity, degree two where it
+multiplies itself.
+
+Starting from rest under an impulsive inflow is the alternative, and a worse one. It puts a
+pressure spike two orders above the developed flow into the first step, and a proper orthogonal
+decomposition then spends its budget on a transient the reduced model never has to reproduce.
+
+An inflow imposed weakly changes two further things every other example here could ignore.
 
 **The convective term is quadratic plus affine, not quadratic.** The prescribed value is carried
 into the convective flux, so the polynomial half has a linear and a constant part that a plain
@@ -73,6 +84,7 @@ import sys
 import time
 
 import numpy as np
+from pymor.analyticalproblems.functions import ExpressionFunction
 from pymor.core.logger import set_log_levels
 from pymor.parameters.base import Mu
 from pymor.tools import mpi
@@ -130,15 +142,21 @@ def main(write_vtu=False):
         time_stepper=BDFTimeStepper(nt, order=ORDER, solver=model.time_stepper.solver)
     )
     scale = reynolds_scale(model)
-    train = [Mu(viscosity=scale / re) for re in TRAIN_REYNOLDS]
-    test = [Mu(viscosity=scale / re) for re in TEST_REYNOLDS]
+    ramp = inflow_schedule(model)
+    train = [Mu(viscosity=scale / re, inflow=ramp) for re in TRAIN_REYNOLDS]
+    test = [Mu(viscosity=scale / re, inflow=ramp) for re in TEST_REYNOLDS]
+
+    # One amplitude per training level, in the order the states are streamed: the sampled term
+    # carries the boundary data, so a state has to be evaluated where it came from.
+    times = np.linspace(0.0, T, nt + 1)
+    amplitudes = np.tile([ramp(np.array([t]))[0] for t in times], len(train))
 
     print(f"ranks              : {mpi.size}")
     print(f"dofs               : {velocity.dim} velocity, {pressure.dim} pressure")
     print(f"trajectory         : {nt} steps of BDF-{ORDER} over [0, {T}], "
           f"dt = {T / nt:.4e} at CFL {CFL} (limit {time_step_for_cfl(model, 1.0):.4e})")
-    print(f"parameter          : {model.parameters}, i.e. Reynolds "
-          f"{min(TRAIN_REYNOLDS):.0f} to {max(TRAIN_REYNOLDS):.0f}")
+    print(f"parameters         : {model.parameters}, i.e. Reynolds "
+          f"{min(TRAIN_REYNOLDS):.0f} to {max(TRAIN_REYNOLDS):.0f} and a ramped inflow")
     print(f"training           : {len(train)} trajectories = {len(train) * (nt + 1)} levels")
     print(f"tolerances         : basis {BASIS_TOLERANCE:.0e}, ECSW {TOLERANCE:.0e}, "
           f"sketch {SKETCH}, chunk {CHUNK}")
@@ -154,6 +172,7 @@ def main(write_vtu=False):
         model, RB_u=basis_u.copy(), RB_p=basis_p.copy(),
         u_product=model.u_product, p_product=model.p_product,
         tolerance=TOLERANCE, sketch_rows=SKETCH, training_snapshots=snapshots_u,
+        training_amplitudes=amplitudes,
     )
     rom = reductor.reduce()
     timings["reduce (total)"] = time.perf_counter() - started
@@ -201,11 +220,50 @@ def main(write_vtu=False):
         visualise(model, reductor, momentum, basis_u, basis_p, reference[0], reduced[0])
 
     print(
-        "\nThe Reynolds numbers tested were not trained at, and the reduced model reached them\n"
-        "without touching ExaDG: its momentum block is assembled from a base and a slope, which is\n"
-        "what insisting on affinity in the coefficient buys. The offline phase held a basis per\n"
-        "trajectory rather than every level, and the fit never saw a snapshot."
+        "\nThe Reynolds numbers tested were not trained at, and neither was any instant of the\n"
+        "ramp, yet the reduced model reached both without touching ExaDG: its momentum block is a\n"
+        "polynomial in the two coefficients, assembled online from one small matrix per monomial.\n"
+        "Degree one in the viscosity and two in the amplitude, because a Dirichlet value is part\n"
+        "of the velocity the convective flux is quadratic in.\n"
+        "\n"
+        "The offline phase held a basis per trajectory rather than every level, and the fit never\n"
+        "saw a snapshot. Compare the reduced error against the projection floor beside it: the gap\n"
+        "between them is what the reduced dynamics cost, and it is the part more modes do not\n"
+        "close."
     )
+
+
+def inflow_schedule(model):
+    """The fraction of the inflow profile applied at each time, as a parameter of the model.
+
+    Written here rather than left to the application, because the reduced model has to evaluate
+    the operator at an amplitude of its *choosing* -- that is how the decomposition is recovered
+    -- and not at whatever the clock says. Checked against the application's own schedule rather
+    than trusted, so the two cannot drift apart.
+    """
+    schedule = ExpressionFunction(
+        '[sin(pi/2*x[0]) * (x[0] < 1.0) + 1.0 * (x[0] >= 1.0)]', 1, name="inflow"
+    )
+
+    probes = np.linspace(0.0, model.T, 33)
+    worst = max(
+        abs(schedule(np.array([t]))[0] - scheduled_amplitude(model, t)) for t in probes
+    )
+    assert worst < 1.0e-12, f"the schedule here and the application's differ by {worst:.3e}"
+
+    return schedule
+
+
+def _local_scheduled_amplitude(model, time):
+    return exadg_model(model).scheduled_inflow_amplitude(time)
+
+
+def scheduled_amplitude(model, time):
+    """What the application would apply at that time, dispatched because it lives on the ranks."""
+    if not mpi.parallel:
+        return _local_scheduled_amplitude(model, time)
+
+    return mpi.call(mpi.function_call, _local_scheduled_amplitude, exadg_models_id(model), time)
 
 
 def _local_reynolds_scale(model):

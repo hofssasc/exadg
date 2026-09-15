@@ -48,7 +48,7 @@ Every application module must `py::module_::import("exadg._core")`.
 |---|---|---|---|
 | interface | `FullOrderModel` | `SaddlePointModel` | `SaddlePointModel` |
 | discretisation | CG, Dirichlet rows eliminated | DG (L2), nothing constrained | same |
-| parameters | in the operator, $P$ affine components | in the right-hand side only | in the operator (viscosity) |
+| parameters | in the operator, $P$ affine components | in the right-hand side only | in the operator: viscosity, and the inflow amplitude |
 | drive | body force | body force | inhomogeneous Dirichlet inflow |
 | equation | linear | Stokes or Navier–Stokes, by input file | Navier–Stokes |
 | dynamics | — | relaxes to steady | von Kármán shedding |
@@ -160,10 +160,25 @@ and every solve — before each, not on change, because two models can share one
 the last one to solve is the one whose value is installed. Under MPI the names are resolved once
 and a plain dict of numbers crosses to the ranks.
 
-**The operator must be affine in each declared coefficient**, which is what lets the reduced model
-project once per coefficient instead of once per parameter value. For the viscosity it holds
-exactly: the interior penalty parameter is geometric and every viscous flux carries the viscosity
-as a factor. Measured on the cylinder, the momentum residual is affine in it to **1.9e-14**.
+**The operator must be a polynomial of declared degree in each coefficient**, which is what lets
+the reduced model project once per monomial instead of once per parameter value.
+`coefficient_degree(name)` says which; one is the default.
+
+| coefficient | degree | why |
+|---|---|---|
+| viscosity | 1 | every viscous flux carries one factor of it (affine to **1.9e-14**) |
+| inflow amplitude | **2** | the convective flux is quadratic in the velocity, and prescribed Dirichlet data *is* part of that velocity — so the scalar appears in the flux's linear part and again, squared, in its constant |
+
+The reductor probes on a tensor-product grid with `degree + 1` nodes per coefficient and solves one
+Vandermonde. Declare too low and the fit is silently wrong away from the nodes; too high costs
+probes and is harmless. Verified on the cylinder at inflow 0.35 and 0.77 against nodes at 0, 1, 2:
+reduced residual **5e-16**.
+
+**One thing resists decomposition.** A Lax-Friedrichs λ is a maximum of absolute values of a
+velocity that *includes* the boundary data, so it is not a polynomial in the amplitude at all. The
+sampled operator is therefore compiled at an amplitude of one and told where on the schedule it is
+— `set_boundary_amplitude` on both halves, the detached one that evaluates and the builder that
+trains. `boundary_amplitude_coefficient()` names which coefficient that is.
 
 **Setting it reaches three copies**, and all three matter:
 
@@ -312,6 +327,15 @@ are never gathered. The compiled half is **not templated on a vector type** and 
   Take the deviation from the *time mean*, and get the frequency off a scalar probe of it — the
   norm of that deviation is nearly constant too, for the same reason, so counting its mean
   crossings measures nothing.
+- **pyMOR hides a time-dependent parameter value until `at_time()` is called.** `'inflow' in mu`
+  is `False` for one, and `mu['inflow']` raises — so code that installs coefficients by testing
+  membership skips it and solves at whatever was installed last, silently and with a plausible
+  answer. `install_coefficients` checks `mu.time_dependent_values` and refuses. The stepper passes
+  `mu.at_time(t)`; anything that does not has to be told.
+- **ECSW weights are fitted to a term that carries the boundary data.** Training every state at one
+  amplitude while the states came from a schedule fits a different operator — and converges, so
+  nothing looks wrong. The reductor now takes `training_amplitudes`, one per state, and refuses
+  without them when the application declares a boundary coefficient.
 - **A block-Jacobi multigrid smoother is serial-only.** It builds its block diagonal from separate
   cell and face loops, and ExaDG aborts in parallel asking for `use_cell_based_face_loops` instead
   — which is *not* a free switch here, because the hyper-reduction samples face batches directly
